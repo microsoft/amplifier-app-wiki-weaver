@@ -1,0 +1,6 @@
+# Evaluation run output is NOT source controlled — may contain provider keys,
+# prompts, responses, and absolute paths.
+.amplifier/evaluation/
+runs/
+wiki/        # generated wiki output from pipeline runs
+*.log

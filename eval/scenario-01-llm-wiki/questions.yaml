@@ -1,0 +1,140 @@
+# Scenario 01 — Ground-truth Q&A
+#
+# These questions are answered TWICE during the A/B eval:
+#   A) against the woven wiki produced by the wiki-weaver pipeline
+#   B) against a plain RAG baseline over the same 6 raw articles
+# A blind judge compares the two answers per question against `answer` here.
+#
+# `type: cross_source` is the real hypothesis test — the answer lives across
+#   >=2 articles, so naive per-doc RAG should answer worse.
+# `type: single_source` is calibration — RAG should do fine; if the wiki does
+#   WORSE here, that's a regression signal (weaving lost detail).
+# `type: contradiction_probe` tests flag-don't-confabulate behavior.
+#
+# Hold-out: keep `holdout: true` questions OUT of any pipeline tuning to guard
+#   against overfitting (eval-mode discipline).
+
+questions:
+  # ---- cross-source synthesis (the hypothesis test) ----
+  - id: D1
+    type: cross_source
+    holdout: false
+    q: "What problem does LLM Wiki solve, and is it the same problem that memory engines like Zep or Mem0 solve?"
+    sources: [1, 6]
+    answer: >
+      No — different gaps. LLM Wiki fixes RAG's lack of knowledge ACCUMULATION
+      (compilation at ingest vs. retrieval from scratch each query). Memory
+      engines (Zep, Mem0) fix RAG's lack of USER continuity (preferences,
+      history). Complementary, not competing.
+    must_not: "Conflate the two as the same 'RAG has no memory' claim."
+
+  - id: D2
+    type: cross_source
+    holdout: false
+    q: "How large can an LLM Wiki grow before the standard index.md approach breaks down, and what is the recommended fix?"
+    sources: [1, 2, 3]
+    answer: >
+      ~100–200 source docs / pages (Art 1 ~100, Art 3 ~200/100, Art 5 <200).
+      Recommended fix cited by Arts 1/2/3 is qmd (Tobi Lütke) — hybrid
+      BM25+vector search over markdown via an MCP server.
+
+  - id: D3
+    type: cross_source
+    holdout: false
+    q: "Should you use Obsidian to build an LLM Wiki?"
+    sources: [1, 3, 4]
+    answer: >
+      Depends on access pattern. Arts 1/2/3 recommend Obsidian as the natural
+      markdown viewing layer (graph view, backlinks). Art 4 deliberately
+      rejects it (desktop lock-in, maintenance debt) and uses VPS + Telegram +
+      web frontend. A good answer surfaces BOTH sides.
+
+  - id: D4
+    type: cross_source
+    holdout: false
+    q: "SKILL.md vs AGENTS.md+Hermes vs Python package — when should you choose each to implement Karpathy's pattern?"
+    sources: [3, 4, 5]
+    answer: >
+      SKILL.md (Art 3) = installable Claude Code plugin for personal/Obsidian
+      use. AGENTS.md+Hermes (Art 4) = always-on VPS agent, multi-device via
+      Telegram/web. Python wiki-llm (Art 5) = typed Pydantic stages +
+      markdown-hero guarantees, for large corpora/teams/downstream automation.
+
+  - id: D6
+    type: cross_source
+    holdout: true
+    q: "What are the enterprise-scale limitations of LLM Wiki, and what partial mitigations exist?"
+    sources: [1, 3, 5]
+    answer: >
+      Art 1 names four gaps: no RBAC, no ACID (write race conditions), no audit
+      trail, flat-file perf limits. Art 3 mitigates writes via single-session
+      or PR-review/human-approval. Art 5's programmatic package adds an audit
+      trail of every LLM call.
+
+  - id: D7
+    type: cross_source
+    holdout: false
+    q: "What was Vannevar Bush's Memex and why do LLMs succeed at it where humans failed?"
+    sources: [1, 2, 3]
+    answer: >
+      Memex (Bush, 1945 'As We May Think') = a personal knowledge store with
+      associative trails that grows more valuable with use. Its unsolved
+      problem was maintenance — humans abandon the bookkeeping. LLMs succeed
+      because they 'do not get bored' and reliably update cross-references.
+
+  - id: D9
+    type: cross_source
+    holdout: true
+    q: "Is LLM Wiki a good fit for team knowledge management, and what does it require beyond the solo pattern?"
+    sources: [1, 3, 4, 5]
+    answer: >
+      Yes, with additions: RBAC/audit/concurrency (Art 1 gap), git-branch +
+      human-review merge flow (Art 3), web/VPS access for multi-user reach
+      (Art 4), and the deterministic programmatic package when the same inputs
+      must yield the same wiki + audit trail (Art 5).
+
+  # ---- contradiction probes (flag, don't confabulate) ----
+  - id: C-FORKS
+    type: contradiction_probe
+    holdout: false
+    q: "How many stars and forks did Karpathy's LLM Wiki gist get, and how fast?"
+    sources: [1, 3]
+    answer: >
+      The corpus DISAGREES and a good wiki must flag it: Art 1 says '5,000+
+      stars, 1,294 forks, in 48 hours'; Art 3 says '5,000 stars in four days,
+      nearly 3,000 forks.' Correct behavior = report both with sources, not
+      pick one or average.
+    must_not: "Silently report a single fork number or a fabricated ~2000 average."
+
+  - id: C-RAGDEAD
+    type: contradiction_probe
+    holdout: false
+    q: "Do these articles claim RAG is dead / obsolete?"
+    sources: [1]
+    answer: >
+      No. 'RAG is dead' is only a rhetorical strawman in Art 1's title, which
+      Art 1 rejects: 'RAG is the search engine. LLM Wiki is the encyclopedia.
+      Both useful.' Asserting RAG is dead is a confabulation failure.
+    must_not: "State as a finding that RAG is dead/obsolete."
+
+  # ---- single-source calibration ----
+  - id: E2
+    type: single_source
+    holdout: false
+    q: "What is the 'fine-tuning endgame' for an LLM Wiki?"
+    sources: [1]
+    answer: "Generate synthetic training data from the wiki to fine-tune a personal model — knowledge moves from context window to model weights."
+
+  - id: E3
+    type: single_source
+    holdout: false
+    q: "What infrastructure does the Hermes-based wiki run on?"
+    sources: [4]
+    answer: "A small Hetzner VPS (2 vCPU / 4 GB RAM, Ubuntu), Hermes Agent, Telegram bot interface, and a static site generator serving the wiki on the web."
+
+  - id: E4
+    type: single_source
+    holdout: false
+    q: "What Python library does Article 5 publish to guarantee well-structured markdown?"
+    sources: [5]
+    answer: "markdown-hero — type-checked, section-aware markdown with a heading-aware chunker (pip install markdown-hero)."
