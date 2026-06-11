@@ -262,28 +262,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         _fail("ANTHROPIC_API_KEY is not set")
         ok = False
 
-    # Make engine modules importable, then probe.
+    # Engine runner imports cleanly (no engine cost yet).
     try:
         from cli.engine_runner import (
-            ATTRACTOR_MODULES,
-            PROFILE_LOCAL,
-            _ensure_engine_importable,
+            ATTRACTOR_PIPELINE_LOCAL,
+            load_ci_config,
         )
-
-        _ensure_engine_importable()
     except Exception as e:  # noqa: BLE001
         _fail(f"could not load engine_runner: {e}")
         return 1
 
-    try:
-        import amplifier_module_loop_pipeline  # noqa: F401
-
-        _ok("amplifier_module_loop_pipeline importable")
-    except Exception as e:  # noqa: BLE001
-        _fail(f"amplifier_module_loop_pipeline not importable: {e}")
-        _warn(f"  (attractor modules dir: {ATTRACTOR_MODULES})")
-        ok = False
-
+    # foundation is the only hard import requirement; prepare() resolves the
+    # loop-pipeline orchestrator and hook modules from the bundle on demand.
     try:
         import amplifier_foundation  # noqa: F401
 
@@ -291,13 +281,39 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         _fail(f"amplifier_foundation not importable: {e}")
         _warn("  run wiki-weaver under a python env that has amplifier-foundation")
+        _warn("  (e.g. the interpreter behind ~/.local/bin/amplifier)")
         ok = False
 
-    profile = Path(PROFILE_LOCAL)
-    if profile.is_file():
-        _ok(f"attractor profile found: {profile}")
+    pipeline_bundle = Path(ATTRACTOR_PIPELINE_LOCAL)
+    if pipeline_bundle.is_file():
+        _ok(f"attractor-pipeline bundle found: {pipeline_bundle}")
     else:
-        _warn(f"local profile missing ({profile}); will fall back to git URL")
+        _warn(
+            f"local attractor-pipeline missing ({pipeline_bundle}); will fall back to git URL"
+        )
+
+    # context-intelligence hook config (server_url + api_key) from settings.
+    ci_cfg = load_ci_config()
+    server_url = ci_cfg.get("context_intelligence_server_url")
+    if ci_cfg.get("context_intelligence_api_key"):
+        _ok("context-intelligence hook config found in settings (api_key + server_url)")
+    else:
+        _warn(
+            "no context-intelligence api_key in settings; hook composes but fails soft"
+        )
+
+    # Probe the CI server (GET, short timeout). DOWN is OK -- the hook fails soft
+    # and still writes local events.jsonl.
+    probe_url = server_url or "http://localhost:8100"
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(probe_url, timeout=3) as resp:  # noqa: S310
+            _ok(f"context-intelligence server UP at {probe_url} (HTTP {resp.status})")
+    except Exception as e:  # noqa: BLE001
+        _warn(
+            f"context-intelligence server DOWN/unreachable at {probe_url} ({type(e).__name__}); OK -- hook fails soft, local events.jsonl still written"
+        )
 
     if VALIDATE_PY.is_file():
         _ok(f"structural validator found: {VALIDATE_PY}")
