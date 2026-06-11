@@ -160,10 +160,19 @@ def build_dot(
 
     dot = INNER_DOT.read_text(encoding="utf-8")
 
-    validate_cmd = f"{sys.executable} {VALIDATE_PY} {wiki_dir}"
+    # The validator writes its structured PASS/FAIL result to this known file on
+    # EVERY run (--out). The feedback + refine-ingest nodes are told to READ it,
+    # so the deterministic failures are plumbed into the remediation path
+    # (PIPELINE_DESIGN.md §4). Dotted context keys are silently dropped in
+    # box-node prompts, so a file is the reliable hand-off channel.
+    validation_report = wiki_dir / ".ai" / "validation.md"
+    validate_cmd = (
+        f"{sys.executable} {VALIDATE_PY} {wiki_dir} --out {validation_report}"
+    )
     substitutions = {
         "$source_path": str(source_path),
         "$wiki_dir": str(wiki_dir),
+        "$validation_report": str(validation_report),
         "$schema_path": str(SCHEMA_PATH),
         # assess uses the PER-SOURCE convergence rubric, NOT the whole-corpus
         # eval rubric (which would vote `refine` forever on a single article).

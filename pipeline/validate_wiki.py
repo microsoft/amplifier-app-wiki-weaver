@@ -142,10 +142,39 @@ def validate(wiki_dir: Path) -> dict:
     return result
 
 
+def _render_report(r: dict) -> str:
+    """Human-readable report (the same text printed to stdout).
+
+    Reused for ``--out`` so downstream pipeline nodes can read the verbatim
+    validator result from a file.
+    """
+    lines = [f"Wiki: {r['wiki_dir']}  ({r['page_count']} pages)"]
+    for cid, c in r["checks"].items():
+        lines.append(f"  {cid}: {c}")
+    if r["passed"]:
+        lines.append("PASS — structurally valid")
+    else:
+        lines.append("FAIL:")
+        for f in r["failures"]:
+            lines.append(f"  - {f}")
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("wiki_dir", type=Path)
     ap.add_argument("--json", action="store_true")
+    # --out: ALWAYS write the structured result (PASS or FAIL) to this file so
+    # downstream pipeline nodes (feedback, refine-ingest) can READ the exact
+    # validator failures. Dotted context keys are silently dropped in box-node
+    # prompts, so a file is the reliable hand-off channel (PIPELINE_DESIGN.md
+    # §4). Exit code is unchanged: 0 on pass, 1 on fail.
+    ap.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="also write the structured result to this file (JSON if --json)",
+    )
     args = ap.parse_args()
 
     if not args.wiki_dir.is_dir():
@@ -154,17 +183,16 @@ def main() -> int:
 
     r = validate(args.wiki_dir)
     if args.json:
-        print(json.dumps(r, indent=2))
+        rendered = json.dumps(r, indent=2) + "\n"
+        print(rendered, end="")
     else:
-        print(f"Wiki: {r['wiki_dir']}  ({r['page_count']} pages)")
-        for cid, c in r["checks"].items():
-            print(f"  {cid}: {c}")
-        if r["passed"]:
-            print("PASS — structurally valid")
-        else:
-            print("FAIL:")
-            for f in r["failures"]:
-                print(f"  - {f}")
+        rendered = _render_report(r)
+        print(rendered, end="")
+
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(rendered, encoding="utf-8")
+
     return 0 if r["passed"] else 1
 
 
