@@ -64,6 +64,14 @@ digraph wiki_weaver_inner {
         prompt="You are assessing ONE question: has THIS single source -- $source_path (assigned id $source_id) -- been well integrated into the wiki at $wiki_dir?\n\nThis is a PER-SOURCE convergence gate, NOT a whole-corpus completeness grade. Judge ONLY the delta this source contributed and the pages it touched. Do NOT require other corpus sources to be present, do NOT demand whole-wiki completeness, and do NOT penalize the wiki for concepts THIS source never discussed. A small, honest, well-merged single-source contribution IS converged.\n\nApply the per-source rubric in $convergence_rubric, scoring each dimension 1-5 for THIS source only:\n  C1 synthesis -- the source was merged and pre-digested into the right concept pages, not dumped or concatenated as a raw blob.\n  C2 merge-correctness -- shared concepts updated EXISTING pages in place (one page per concept; no near-duplicate created).\n  C3 contradiction-handling -- genuine conflicts (with an existing page, or within the source) surfaced in an '## Open tensions' section citing BOTH sides, never averaged or overwritten.\n  C4 no-confabulation -- every non-trivial claim traces to THIS source or an existing page. A '> TODO-VERIFY:' blockquote for an ungrounded claim is the CORRECT, PREFERRED move and is NOT a failure; only invented facts or asserted strawman framings fail this dimension.\n  C5 provenance -- pages carrying this source's claims cite $source_id in their frontmatter.\n\nDo NOT re-litigate structural mechanics (link resolution, frontmatter, orphans). The deterministic validate node already gated those; if you reached this step, structure passed. Focus on integration QUALITY for THIS source.\n\nFirst write a brief assessment (per-dimension C1-C5 score + one-line evidence each) to .ai/assessment.md.\n\nThen DECIDE: if every dimension C1-C5 is >= 4/5 for THIS source, it has converged; otherwise it needs another refine cycle.\n\nYour FINAL message MUST be exactly one JSON object and NOTHING else (no prose, no code fence). It routes the pipeline:\n  - converged: {\"status\": \"success\", \"preferred_label\": \"converged\", \"notes\": \"<one line why>\"}\n  - refine:    {\"status\": \"success\", \"preferred_label\": \"refine\", \"notes\": \"<one line gap>\"}\nThe value of preferred_label MUST be exactly 'converged' or 'refine'.\n\nFINAL-MESSAGE CONTRACT (this is the rule that ROUTES the pipeline -- treat it as the single most important instruction): your VERY LAST message this turn MUST be exactly that one-line JSON object and NOTHING ELSE -- no prose before or after, no markdown, no code fence, no commentary. Writing .ai/assessment.md is a tool call, not your verdict. After you finish writing it -- or after ANY other tool call -- your most recent action will have been a tool call, so you MUST THEN emit the one-line JSON verdict as a fresh final message. Do NOT end the turn on a tool call, on a summary sentence, or on an empty message. If you are about to reply with prose, replace that prose with the JSON. A missing, prose, or fenced verdict mis-routes the pipeline and FALSELY reports non-convergence even when the wiki is clean."
     ]
 
+    // CHECK routes EXHAUSTIVELY (no dead-end). The engine's select_edge tries
+    // conditional edges FIRST (Step 1); only if none match does it fall through
+    // to the single UNCONDITIONAL edge (Step 4). So `done` is reachable ONLY via
+    // its explicit converged condition, while EVERYTHING ELSE -- refine, an unset
+    // preferred_label=None (the empty-spawn flake degrades assess to PROSE and
+    // _parse_outcome yields SUCCESS+label=None), prose, or any unrecognized label
+    // -- falls through to the unconditional `check -> feedback` fallback and the
+    // refine loop. The fail-safe direction is MORE work, never premature done.
     check [shape=diamond, label="Converged?"]
 
     // FEEDBACK (LLM): only on refine. Targeted guidance for next cycle.
@@ -91,6 +99,10 @@ digraph wiki_weaver_inner {
 
     check -> done     [label="converged", condition="context.preferred_label=converged"]
     check -> feedback [label="refine",    condition="context.preferred_label=refine"]
+    // ELSE (unconditional fallback): the ONLY unconditional edge out of `check`,
+    // so the engine's Step-4 lexical-tiebreak gotcha cannot bite. Catches None /
+    // prose / any non-converged label -> refine loop instead of no_matching_edge.
+    check -> feedback [label="else (unset/unknown -> refine)"]
 
     feedback -> ingest [loop_restart="true"]
 }
