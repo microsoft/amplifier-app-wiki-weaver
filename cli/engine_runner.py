@@ -81,7 +81,10 @@ PROVIDER = os.environ.get("WIKI_WEAVER_PROVIDER", "anthropic")
 # Explicit model for the LLM nodes. The attractor child agents intentionally
 # carry NO default_model ("no silent defaults"), so the spawning node must name
 # one. The engine forwards it as a provider_preference to the child session.
-MODEL = os.environ.get("WIKI_WEAVER_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("WIKI_WEAVER_MODEL", "claude-sonnet-4-6")
+# Optional per-node reasoning_effort (recognized stylesheet property). Unset =>
+# omitted entirely, so default behaviour (e.g. Wave 1 anthropic) is unchanged.
+REASONING_EFFORT = os.environ.get("WIKI_WEAVER_REASONING_EFFORT")
 
 # Attractor namespace root (repo that owns ``attractor:agents/...`` refs). The
 # per-provider agent bundles live under ``<root>/agents/<name>.yaml``.
@@ -193,7 +196,8 @@ def build_dot(
     # attractor child agents carry no default_model. Anchor on the line-leading
     # declaration so the [[wikilinks]] inside prompt strings are never mistaken
     # for attributes.
-    attrs = f'        llm_provider="{PROVIDER}", llm_model="{MODEL}",\n'
+    re_attr = f' reasoning_effort="{REASONING_EFFORT}",' if REASONING_EFFORT else ""
+    attrs = f'        llm_provider="{PROVIDER}", llm_model="{MODEL}",{re_attr}\n'
     for nid in LLM_NODE_IDS:
         opener = f"    {nid} [\n"
         if opener in dot and "llm_provider" not in dot.split(opener, 1)[1][:200]:

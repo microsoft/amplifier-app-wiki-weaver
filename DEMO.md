@@ -50,5 +50,8 @@ corpus, so it **scales** as the wiki grows. Full design: `docs/designs/PIPELINE_
   to `refine`, so it costs at most an extra cycle and never falsely converges. A deeper
   engine-level fix (`_parse_outcome` should not launder a missing verdict into success) is
   noted for upstream.
-- The pipeline currently runs on `claude-sonnet-4-20250514` (retires 2026-06-15); migrate
-  to a current model — it should also improve final-message (verdict) compliance.
+- Default model is `claude-sonnet-4-6` (set in `cli/engine_runner.py`, overridable via
+  `WIKI_WEAVER_MODEL`). Chosen by a model-swap eval (`eval/model_sweep.py`): it converged
+  3/3 with zero flakes, ~2× faster and ~5× cheaper than Opus-class. Use
+  `WIKI_WEAVER_MODEL=claude-opus-4-8` for the premium tier (richest synthesis). The old
+  `claude-sonnet-4-20250514` default retires 2026-06-15.
