@@ -98,7 +98,7 @@ These frozen states are the measuring sticks. Do not overwrite them — they are
 |---|---|---|---|---|
 | **2** | **overview.md as a synthesized map** | `overview.md` is a navigational map (themes → hub pages + orienting prose), NOT a per-source thread log. Grader **must stop skipping** overview/index pages. | current `runs/corpus/wiki/overview.md` (concatenated thread log) | overview grader FAIL→PASS on same corpus + `proof-rag-v2` held-out |
 | **3** | **Deepen provenance** | Every `[N]` resolves to real **author + source URL + date** (not just a filename); citations carry it. | current `.sources.json` (`{id, filename, hash}` only) | provenance grader FAIL→PASS; spot-check `[8]` → real URL/author/date |
-| **1** | **ask/query layer + answer-quality eval** | Given a question, the wiki answers **grounded + cited + correct**, and **fails loud when the answer is absent** (no confabulation). Beats naive RAG on cross-source synthesis. | a query harness over the current wiki (stub returns filename greps → FAILs grounded/cited/correct) | answer-quality eval FAIL→PASS; A/B vs RAG (wiki wins on synthesis, ties on single-source facts); absent-answer → loud "not in corpus" |
+| **1** | **ask/query layer + answer-quality eval** | Given a question, the wiki answers **grounded + cited + correct**, and **fails loud when the answer is absent** (no confabulation). **Better / more trustworthy than naive RAG** (synthesis + reliable refusal); cost/latency **comparable at this scale** (cheaper-at-scale untested). | a query harness over the current wiki (stub returns filename greps → FAILs grounded/cited/correct) | answer-quality eval FAIL→PASS; A/B vs RAG: **wiki-wins 6, raw-wins 0, tie 2, contested 1, never lost** (see "A/B results" below); absent-answer → loud "not in corpus" |
 | **4** | **Consolidation / holistic re-weave** | A periodic whole-corpus pass re-weaves hub pages across *all* sources and **guarantees no claim loss** (completeness guard). | current per-source-only healing (never re-weaves the whole corpus) | consolidation eval: hub integration ↑, completeness = 0 dropped claims, FAIL→PASS |
 | **5** | **Schema externalization** | Schema/validator/prompts are **project-supplied policy**, not hardcoded. Mechanism (engine) / policy (schema) split. | current hardcoded `SCHEMA.md` + validator + prompts | run an unmodified pipeline on a **2nd corpus** with a different supplied schema; both converge clean |
 
@@ -147,8 +147,11 @@ and emits, per article and as a run rollup:
 - pages-read, delegation hops,
 - node durations / failure reasons.
 
-**Built ALONGSIDE Item 1** — it supplies the real-event evidence for the "cheaper than
-RAG" thesis the `ask` layer claims.
+**Built ALONGSIDE Item 1** — it supplied the real-event cost/latency evidence for the
+A/B vs RAG. Result (see "A/B results" below): the wiki is **better / more trustworthy**,
+but **not cheaper** at this corpus scale (mean $0.55 vs $0.38, ~1.43x higher; latency
+tied). The "cheaper than RAG" thesis is **OPEN** — revisit only at much larger corpus
+scale and against an embedding-RAG baseline.
 
 **The one capture gap (optional).** The *outer corpus sweep* is a plain code loop with
 no AmplifierSession, so it doesn't appear in the event graph. Optionally wrap it in a CI
@@ -157,6 +160,50 @@ Observability only.
 
 **Explicit non-goals:** do **not** build hot-path event-reading into the running
 pipeline; do **not** make anything depend on the CI *server* being up.
+
+---
+
+## A/B results (2026-06-13)
+
+Phase B closed with a rigorous A/B holding **synthesis as the only variable**: the *same*
+`ask` agent pointed at the synthesized wiki vs. at the raw `~/medium_articles` pile (748
+files). 9 scenarios (3 single-page, 3 cross-source, 3 absent), blinded comparison agent,
+2-trial order-swap; cost/latency from real CI events on both sides.
+
+**Quality thesis: PROVEN. Cost thesis: REFUTED at this scale.**
+
+**Quality — the wiki never lost.**
+
+```
+wiki-wins=6  raw-wins=0  tie=2 (both correctly refused)  contested=1
+```
+
+Decisive on the two things synthesis is meant to buy:
+- **Cross-source synthesis.** S1 surfaced the MCP-vs-CLI tension as *unresolved* (matching
+  ground truth) where raw picked a side; S2 captured the single-turn-parallel-emission
+  mechanism raw missed entirely.
+- **Confabulation-resistance.** On the held-out **"Sourcegraph Cody"** trap (genuinely
+  absent, adjacent to an AI-coding-assistants page), **raw RAG fabricated** detailed Cody
+  claims as if sourced; the **wiki correctly refused**. The index makes "not covered"
+  *verifiable*; the raw pile invites invention.
+- Even **single-page lookups** went to the wiki — on provenance/citation quality (cites
+  source page + IDs; raw cites nothing). Phase A's provenance work paying off.
+
+**Cost / latency — "cheaper than RAG" NOT supported here.**
+- Wiki mean **$0.55** vs raw **$0.38** per query (**~1.43x HIGHER**); latency **TIED**
+  (~60s each). The wiki costs more *because* it does more synthesis / emits richer cited
+  answers — the same reason it wins quality. A real quality/cost tradeoff, not a defect.
+
+**Caveats / not-yet-proven.**
+- Baseline is **agentic RAG** (an agent greps/reads raw articles), **not** cheap
+  embedding-RAG. Against embedding-RAG the wiki would cost *more* still, but win
+  quality/refusal by even more.
+- **"Cheaper at scale" is untested** — 748 articles via grep isn't the scaling wall where
+  RAG blows up. The wiki's theoretical cost edge, if any, lives at much larger corpora.
+
+**Reframed positioning.** wiki-weaver's proven value is **QUALITY + TRUSTWORTHINESS**
+(synthesis, real provenance, reliable refusal), **not per-query cost**. The cost thesis
+is **OPEN** — revisit only with a much larger corpus **and** an embedding-RAG baseline.
 
 ---
 
@@ -170,7 +217,7 @@ stage minimizes a different efficiency target.
 | Stage | Quality gate (1st, hard) | Then minimize | Tolerate | Why |
 |---|---|---|---|---|
 | **Ingestion** | synthesis eval + structural valid | **cost_usd** | wall-time | background, runs on *every* new source, unattended — cheap matters, latency doesn't |
-| **Retrieval / ask** | answer-quality (grounded/cited/correct/**fail-loud**) | **wall-time / latency** | cost | interactive — a human is *blocked*. (cost_usd still matters here, but to *prove the cheaper-than-RAG thesis* — different audience than minimizing the user's bill.) |
+| **Retrieval / ask** | answer-quality (grounded/cited/correct/**fail-loud**) | **wall-time / latency** | cost | interactive — a human is *blocked*. (cost_usd is measured here, but A/B showed the wiki is **dearer, not cheaper** than agentic RAG at this scale — its proven edge is quality/trust, not the user's bill.) |
 | **Consolidation** | hub-integration + **completeness (no claim loss)** | **cost_usd** | wall-time | periodic, background, rare |
 
 ### The 3 knobs (ship as Item-5 policy)

@@ -699,6 +699,49 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# rag -- naive-RAG baseline: answer from raw source articles (Phase B A/B)
+# ---------------------------------------------------------------------------
+#
+# Variant B of the A/B comparison: the SAME mechanism as ask (bash/web removed,
+# writes denied, reads scoped) but pointed at the RAW article directory instead
+# of the compiled wiki. The only variable is synthesis.
+
+
+def cmd_rag(args: argparse.Namespace) -> int:
+    articles = Path(args.articles).expanduser().resolve()
+    if not articles.is_dir():
+        _fail(f"articles dir not found: {articles}")
+        return 1
+
+    question = args.question
+    from cli.engine_runner import run_rag
+
+    _warn(f"RAG baseline over articles at {articles!r}: {question!r}")
+    try:
+        result = run_rag(articles, question)
+    except Exception as e:  # noqa: BLE001
+        _fail(f"rag error: {type(e).__name__}: {e}")
+        return 1
+
+    if args.json_out:
+        print(
+            json.dumps(
+                {
+                    "answer": result.answer,
+                    "pages_used": result.pages_used,
+                    "refused": result.refused,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(result.answer)
+        if result.pages_used:
+            print(f"\nArticles consulted: {', '.join(result.pages_used)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -750,6 +793,23 @@ def main() -> None:
         help="output JSON: {answer, pages_used, refused}",
     )
 
+    p_rag = sub.add_parser(
+        "rag",
+        help="naive-RAG baseline: answer from raw source articles (A/B variant B)",
+    )
+    p_rag.add_argument("question", help="question to answer")
+    p_rag.add_argument(
+        "--articles",
+        default=str(Path.home() / "medium_articles"),
+        help="raw articles directory (default: ~/medium_articles)",
+    )
+    p_rag.add_argument(
+        "--json",
+        dest="json_out",
+        action="store_true",
+        help="output JSON: {answer, pages_used, refused}",
+    )
+
     args = parser.parse_args()
 
     dispatch = {
@@ -759,6 +819,7 @@ def main() -> None:
         "doctor": cmd_doctor,
         "query": cmd_query,
         "ask": cmd_ask,
+        "rag": cmd_rag,
     }
     if args.command is None:
         parser.print_help()
