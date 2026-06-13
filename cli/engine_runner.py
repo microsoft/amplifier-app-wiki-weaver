@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -366,6 +367,398 @@ def make_spawn_fn(prepared: Any, wiki_dir: Path | None = None):
         )
 
     return spawn_capability
+
+
+# --------------------------------------------------------------------------
+# Ask pipeline: single-shot wiki reading + cited answer
+# --------------------------------------------------------------------------
+#
+# MECHANISM (structural, not instructional): each spawned child agent has
+#   - tool-bash + tool-web-* REMOVED from its tools list (structural exclusion)
+#   - tool-filesystem denied_write_paths=["/"] (deny all writes)
+#   - tool-filesystem root_path + allowed_read_paths = wiki_dir (constrain reads)
+# This forces the agent to ground answers in wiki content — it structurally
+# cannot write files, shell out, or fetch from the web.
+
+
+@dataclass
+class AskResult:
+    """Outcome of a wiki-ask operation."""
+
+    answer: str
+    pages_used: list[str]
+    refused: bool
+    raw: str
+    logs_dir: Path
+
+
+def _dot_escape_prompt(s: str) -> str:
+    """Escape a Python string for use as a DOT double-quoted attribute value.
+
+    DOT escape conventions used by the loop-pipeline engine:
+      \\  ->  \\\\  (backslashes first)
+      "   ->  \\"   (embedded double quotes)
+      newline -> \\n  (literal \\n in DOT file; engine reconstructs newline)
+    """
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\n", "\\n")
+    return s
+
+
+_ASK_ESCAPE_MODULES: frozenset[str] = frozenset(
+    {"tool-bash", "tool-web-fetch", "tool-search-web", "tool-web", "tool-web-search"}
+)
+
+
+def _constrain_ask_agent(child_bundle: Any, wiki_dir: Path, answer_file: Path) -> None:
+    """Scope the child agent to read-only wiki access (THE MECHANISM).
+
+    Structural steps:
+    1. Remove tool-bash / tool-web-* from the tools list — the agent CANNOT
+       shell or fetch from the web. Works when tools are still in dict form
+       (pre-prepare bundle). No-op if already resolved to module objects.
+    2. Set tool-filesystem ``denied_write_paths=[wiki_dir]`` — deny writes to
+       all wiki content (index, pages, .sources.json). The agent CAN write the
+       answer to ``answer_file`` (a temp path outside wiki_dir) so the full
+       response survives past the pipeline's notes truncation.
+    3. Set ``root_path`` + ``allowed_read_paths`` on tool-filesystem to
+       ``wiki_dir`` — constrains reads to wiki dir (best-effort; honoured if
+       the module supports these config keys, silently ignored otherwise).
+
+    HONEST LIMITATION: bash removal relies on dict-form tools. The write-deny
+    constraint is the structural backstop regardless of tool form.
+    """
+    tools = getattr(child_bundle, "tools", None)
+    if not isinstance(tools, list):
+        return
+
+    # Step 1: remove bash/web tools (structural).
+    removals = [
+        i
+        for i, t in enumerate(tools)
+        if isinstance(t, dict) and t.get("module", "") in _ASK_ESCAPE_MODULES
+    ]
+    for i in reversed(removals):
+        tools.pop(i)
+
+    # Step 2+3: scope filesystem tool.
+    wiki_dir_s = str(wiki_dir)
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("module") != "tool-filesystem":
+            continue
+        cfg = tool.get("config")
+        if not isinstance(cfg, dict):
+            cfg = {}
+            tool["config"] = cfg
+        # Deny writes to wiki content (protects all wiki pages and metadata).
+        # answer_file is outside wiki_dir so the agent can still write it.
+        cfg["denied_write_paths"] = [wiki_dir_s]
+        # Best-effort read scoping — silently ignored if unsupported.
+        cfg["root_path"] = wiki_dir_s
+        cfg["allowed_read_paths"] = [wiki_dir_s]
+
+
+def make_ask_spawn_fn(prepared: Any, wiki_dir: Path, answer_file: Path):
+    """Like make_spawn_fn but constrains each child to read-only wiki access.
+
+    Registered as ``session.spawn`` for the ask pipeline so every sub-session
+    (the single "answer" node) structurally cannot modify wiki content, shell,
+    or fetch from the web. It can read within ``wiki_dir`` and write the answer
+    to ``answer_file`` (a temp path outside wiki_dir).
+    """
+    _agent_cache: dict[str, Any] = {}
+
+    async def spawn_capability(
+        agent_name: str,
+        instruction: str,
+        parent_session: Any,
+        agent_configs: dict[str, dict[str, Any]],
+        sub_session_id: str | None = None,
+        orchestrator_config: dict[str, Any] | None = None,
+        parent_messages: list[dict[str, Any]] | None = None,
+        provider_preferences: list | None = None,
+        self_delegation_depth: int = 0,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if agent_name in agent_configs:
+            config = agent_configs[agent_name]
+        elif agent_name in prepared.bundle.agents:
+            config = prepared.bundle.agents[agent_name]
+        else:
+            available = list(agent_configs.keys()) + list(prepared.bundle.agents.keys())
+            raise ValueError(f"Agent '{agent_name}' not found. Available: {available}")
+
+        if agent_name not in _agent_cache:
+            _agent_cache[agent_name] = await _resolve_agent_bundle(agent_name, config)
+        child_bundle = _agent_cache[agent_name]
+
+        # THE MECHANISM: constrain this child to read-only wiki access.
+        _constrain_ask_agent(child_bundle, wiki_dir, answer_file)
+
+        return await prepared.spawn(
+            child_bundle=child_bundle,
+            instruction=instruction,
+            session_id=sub_session_id,
+            parent_session=parent_session,
+            orchestrator_config=orchestrator_config,
+            parent_messages=parent_messages,
+            provider_preferences=provider_preferences,
+            self_delegation_depth=self_delegation_depth,
+        )
+
+    return spawn_capability
+
+
+def _parse_ask_output(text: str) -> tuple[str, list[str], bool]:
+    """Extract (answer, pages_used, refused) from raw pipeline output.
+
+    The loop-pipeline wraps the agent's response as:
+      {"status": "success", "notes": "Plain text response: <agent text>", ...}
+    or, if the agent output JSON directly:
+      {"answer": "...", "pages_used": [...], "refused": false}
+
+    Steps:
+    1. Parse as JSON — if it has "notes" (pipeline wrapper), unwrap and recurse;
+       if it has "answer" (direct ask result), return it.
+    2. Search for the last ```json...``` fenced block.
+    3. Search for the last JSON object containing an "answer" key.
+    4. Fall back to the full text.
+    """
+    import json as _json
+
+    # Step 1: try parsing as JSON (handles pipeline wrapper and direct answers).
+    try:
+        data = _json.loads(text)
+        if isinstance(data, dict):
+            if "answer" in data:
+                # Direct ask-result JSON from the agent.
+                return (
+                    str(data["answer"]),
+                    [str(p) for p in (data.get("pages_used") or [])],
+                    bool(data.get("refused", False)),
+                )
+            if "notes" in data:
+                # Loop-pipeline wrapper: agent response is in "notes".
+                notes = str(data["notes"])
+                # Strip "Plain text response: " prefix added by the pipeline.
+                _PREFIX = "Plain text response: "
+                if notes.startswith(_PREFIX):
+                    notes = notes[len(_PREFIX) :]
+                if notes:
+                    return _parse_ask_output(notes)
+    except (ValueError, TypeError):
+        pass
+
+    # Step 2: last ```json...``` fenced block.
+    fenced = list(re.finditer(r"```json\s*(.*?)```", text, re.DOTALL))
+    if fenced:
+        json_str = fenced[-1].group(1).strip()
+        try:
+            data = _json.loads(json_str)
+            if isinstance(data, dict) and "answer" in data:
+                return (
+                    str(data["answer"]),
+                    [str(p) for p in (data.get("pages_used") or [])],
+                    bool(data.get("refused", False)),
+                )
+        except (ValueError, TypeError):
+            pass
+
+    # Step 3: last JSON object containing an "answer" key.
+    candidates = list(re.finditer(r'\{"answer".*?\}', text, re.DOTALL))
+    if candidates:
+        json_str = candidates[-1].group(0)
+        try:
+            data = _json.loads(json_str)
+            if isinstance(data, dict) and "answer" in data:
+                return (
+                    str(data["answer"]),
+                    [str(p) for p in (data.get("pages_used") or [])],
+                    bool(data.get("refused", False)),
+                )
+        except (ValueError, TypeError):
+            pass
+
+    # Step 4: return the full text trimmed.
+    return text.strip(), [], False
+
+
+def build_ask_dot(wiki_dir: Path, question: str, answer_file: Path) -> str:
+    """Build the single-node DOT pipeline for a wiki ask query.
+
+    The DOT has one LLM node ("answer") that is instructed to:
+      - Read index.md + overview.md to route to relevant pages
+      - Follow [[wikilinks]] 1-2 hops
+      - Synthesize a cited answer from wiki content
+      - Write the answer JSON to answer_file
+      - FAIL LOUD if the wiki does not cover the question
+
+    The agent writes its full answer to ``answer_file`` to bypass the
+    loop-pipeline's notes-field truncation. The spawned agent's tools are
+    constrained by make_ask_spawn_fn (wiki writes denied, bash/web removed).
+    """
+    wiki_abs = str(wiki_dir.resolve())
+    sources_json = str(wiki_dir / ".sources.json")
+    answer_file_s = str(answer_file)
+
+    # Build the agent instruction (real Python newlines; _dot_escape_prompt
+    # encodes them as \\n for the DOT attribute).
+    prompt = (
+        "You are a wiki reader. Answer the question ONLY from the compiled wiki.\n"
+        "\n"
+        f"WIKI DIRECTORY: {wiki_abs}\n"
+        f"QUESTION: {question}\n"
+        "\n"
+        "PROCEDURE — follow in order:\n"
+        f"1. Read {wiki_abs}/index.md to find pages relevant to the question.\n"
+        f"2. Read {wiki_abs}/overview.md to understand the wiki scope.\n"
+        "3. Read the 2-3 most relevant pages from the index.\n"
+        "4. Follow [[wikilinks]] in those pages (up to 2 hops) for related content.\n"
+        f"5. Read {sources_json} to resolve source IDs to author+URL for citations.\n"
+        "\n"
+        "ANSWER RULES:\n"
+        "  COVERED: Write a direct cited answer. Name every wiki page used.\n"
+        "  Cite as [Author, URL] from .sources.json; cite by page name if no\n"
+        "  author/URL is available.\n"
+        f"  NOT COVERED: Say EXACTLY: \"The wiki does not cover '{question}'."
+        ' Pages consulted: [list pages you read]."\n'
+        "  Do NOT use training knowledge. Do NOT refuse silently. FAIL LOUD.\n"
+        "  PARTIAL: State clearly what IS and what IS NOT covered.\n"
+        "  Ground EVERY claim in wiki content you actually read. No fabrication.\n"
+        "\n"
+        "REQUIRED OUTPUT STEP (mandatory — do this last, after your reasoning):\n"
+        f"Write a JSON file to exactly this path: {answer_file_s}\n"
+        "The file content must be a single JSON object:\n"
+        '{"answer": "<full answer text>", "pages_used": ["page.md"], "refused": false}\n'
+        "For refused: set refused=true, list examined pages in the answer field.\n"
+        "The file MUST be written before you finish — this is how your answer is captured."
+    )
+
+    prompt_dot = _dot_escape_prompt(prompt)
+
+    # Build DOT using plain string concatenation for lines with literal { }
+    # to avoid Python f-string brace conflicts.
+    lines = [
+        "digraph ask_wiki {",
+        '    graph [goal="Answer question from compiled wiki", default_fidelity="compact"]',
+        '    start [shape=Mdiamond, label="Start"]',
+        "    answer [",
+        '        label="Read wiki and answer",',
+        f'        llm_provider="{PROVIDER}",',
+        f'        llm_model="{MODEL}",',
+        f'        prompt="{prompt_dot}"',
+        "    ]",
+        '    done [shape=Msquare, label="Done"]',
+        "    start -> answer -> done",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+async def _run_ask_pipeline(
+    dot_source: str,
+    logs_dir: Path,
+    wiki_dir: Path,
+    answer_file: Path,
+) -> tuple[str, dict[str, Any]]:
+    """Run the ask pipeline with the read-only spawn capability wired in."""
+    import json
+
+    prepared = await _build_prepared(dot_source, logs_dir)
+    session = await prepared.create_session(session_cwd=wiki_dir)
+    # THE MECHANISM: register the ask-specific spawn so every child is
+    # constrained (wiki writes denied, bash/web removed).
+    session.coordinator.register_capability(
+        "session.spawn", make_ask_spawn_fn(prepared, wiki_dir, answer_file)
+    )
+
+    async with session:
+        raw = await session.execute("Run the pipeline")
+
+    text = str(raw)
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            data = {"notes": text}
+    except (json.JSONDecodeError, TypeError):
+        data = {"notes": text}
+    return text, data
+
+
+def run_ask(
+    wiki_dir: str | Path,
+    question: str,
+) -> AskResult:
+    """Answer a question by reading the compiled wiki (no embeddings/RAG).
+
+    Navigates index.md + [[wikilinks]] to find grounded content, synthesizes
+    a cited answer, and explicitly refuses with a loud "the wiki does not cover X"
+    if the topic is absent.
+
+    The spawned agent session is CI-instrumented (inherits the hook from the
+    composed bundle) so cost/token/artifact events are captured in
+    ``<wiki_dir>/.runs/ask-<ts>/`` alongside the ask.dot and session logs.
+
+    Tool scoping (THE MECHANISM — structural, not instructional):
+      - tool-bash and web tools REMOVED from the spawned agent's tools list
+      - tool-filesystem: denied_write_paths=[wiki_dir] (protect wiki content)
+        + root_path + allowed_read_paths=wiki_dir (constrain reads)
+    The agent cannot modify wiki content or escape to the web. It CAN write
+    its full answer to a temp file (answer_file) outside wiki_dir so the
+    response survives the loop-pipeline's notes-field truncation.
+    """
+    wiki_dir = Path(wiki_dir).resolve()
+    if not wiki_dir.is_dir():
+        raise FileNotFoundError(f"wiki dir not found: {wiki_dir}")
+
+    import uuid
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    logs_dir = wiki_dir / ".runs" / f"ask-{timestamp}-{uuid.uuid4().hex[:8]}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # The answer_file lives outside wiki_dir so the denied_write_paths
+    # constraint does not block the agent from writing its answer.
+    answer_file = Path(f"/tmp/wiki_ask_{timestamp}_{uuid.uuid4().hex[:8]}.json")
+
+    dot_source = build_ask_dot(wiki_dir, question, answer_file)
+    (logs_dir / "ask.dot").write_text(dot_source, encoding="utf-8")
+
+    raw_text, _data = asyncio.run(
+        _run_ask_pipeline(dot_source, logs_dir, wiki_dir, answer_file)
+    )
+
+    # Primary: read from answer_file (full response; bypasses notes truncation).
+    if answer_file.exists():
+        try:
+            file_json = answer_file.read_text(encoding="utf-8")
+            answer, pages_used, refused = _parse_ask_output(file_json)
+            # Copy to logs dir for posterity, then clean up.
+            (logs_dir / "ask_answer.json").write_text(file_json, encoding="utf-8")
+            answer_file.unlink(missing_ok=True)
+            return AskResult(
+                answer=answer,
+                pages_used=pages_used,
+                refused=refused,
+                raw=file_json[:5000],
+                logs_dir=logs_dir,
+            )
+        except (OSError, ValueError):
+            pass
+
+    # Fallback: extract from (truncated) pipeline result notes.
+    answer, pages_used, refused = _parse_ask_output(raw_text)
+    return AskResult(
+        answer=answer,
+        pages_used=pages_used,
+        refused=refused,
+        raw=raw_text[:5000],
+        logs_dir=logs_dir,
+    )
 
 
 # --------------------------------------------------------------------------

@@ -1,0 +1,237 @@
+# Phase B — Answer-Quality Eval for `wiki-weaver ask`
+# =====================================================
+# Purpose: prove the query layer (Karpathy thesis: read the COMPILED wiki directly —
+#   navigate index.md + [[wikilinks]], no embeddings/RAG) actually answers questions
+#   GROUNDED, CITED, CORRECT, and FAILS LOUD on absent topics.
+#
+# Designed against the FROZEN real wiki:
+#   runs/corpus/wiki  (144 pages; hubs: model-context-protocol, agent-tool-minimalism,
+#   parallel-agent-execution, multi-agent-topologies, claude-code-cli-patterns, ...)
+# Every answerable scenario's ground truth was verified by READING the cited page(s).
+#
+# Corpus topic boundary (informs the "absent" scenarios):
+#   The corpus is AI-coding / agents / LLM-tooling / RAG-and-memory. It covers many
+#   AI coding assistants (Claude Code, Copilot, Cursor, Tabnine, CodeWhisperer, Replit,
+#   Gemini CLI, Codex CLI, ...) and agent protocols (MCP, A2A, AG-UI). It contains ZERO
+#   coverage of: cooking, general history, biology, and several specific adjacent tools
+#   (verified absent: Sourcegraph/Cody, Continue.dev, CodeRabbit, RAGAS). The adjacent-
+#   but-absent scenario exploits exactly this: a topic the wiki *looks like* it should
+#   cover but does not — the hardest refusal.
+
+meta:
+  wiki_under_test: runs/corpus/wiki
+  raw_corpus_for_baseline: ~/medium_articles      # the RAW source articles (pre-synthesis)
+  thesis: "The compiled wiki replaces RAG: answer by reading index + pages + [[wikilinks]], not embeddings."
+  held_out_ids: [L2, S1, A3]   # do NOT tune prompts/grader against these — generalization guard
+  scenario_counts: {single_page: 3, cross_source: 3, absent: 3}
+
+# ---------------------------------------------------------------------------
+# SCENARIOS
+# expected_behavior: ANSWER_WITH_CITATION | REFUSE
+# ground_truth.key_facts: facts a CORRECT answer MUST contain (verified by reading)
+# ground_truth.support: page file(s) + source-number tags that back each fact
+# ---------------------------------------------------------------------------
+scenarios:
+
+  # ===== TYPE 1: SINGLE-PAGE LOOKUP (answer lives on ONE page) =====
+  - id: L1
+    type: single_page
+    held_out: false
+    question: "What problem does the Model Context Protocol (MCP) solve?"
+    expected_behavior: ANSWER_WITH_CITATION
+    ground_truth:
+      support_pages: [model-context-protocol.md]
+      support_sources: [8, 18, 12, 31]
+      key_facts:
+        - "MCP is an open standard introduced by Anthropic: a universal, plug-and-play interface between an LLM and external tools/data/services."
+        - "Without MCP the AI only knows what you paste into the context window, and the developer becomes 'the middleware' — manually running queries, copying results, and pasting them back."
+        - "With MCP the agent acts directly — e.g. run a SQL query against Postgres, read the rows, process them, and push a commit to GitHub — all from one natural-language request."
+      must_cite: ["Model Context Protocol"]
+      notes: "Pure single-page recall. A correct answer need not mention the cost/reliability criticism, but must not contradict it."
+
+  - id: L2
+    type: single_page
+    held_out: true
+    question: "What happened when Vercel reduced the number of tools it gave its AI agent?"
+    expected_behavior: ANSWER_WITH_CITATION
+    ground_truth:
+      support_pages: [agent-tool-minimalism.md]
+      support_sources: [63]
+      key_facts:
+        - "Vercel replaced 16 specialized tools with a single capability — execute bash commands (deleted ~80% of the tools)."
+        - "Success rate improved from 80% to 100%."
+        - "Speed improved 3.5x and token usage dropped 37%."
+      must_cite: ["Agent Tool Minimalism"]
+      credit_for:
+        - "Flags these as practitioner-reported (Andrew Qu / Vercel blog), NOT independently benchmarked — the page carries a TODO-VERIFY on exactly these figures. Honest sourcing is a plus, not required for PASS."
+
+  - id: L3
+    type: single_page
+    held_out: false
+    question: "How much token reduction does the 'code execution with MCP' pattern claim, and how does it achieve it?"
+    expected_behavior: ANSWER_WITH_CITATION
+    ground_truth:
+      support_pages: [code-execution-with-mcp.md]
+      support_sources: [119, 63]
+      key_facts:
+        - "98.7% token reduction — from ~150,000 tokens down to ~2,000."
+        - "Mechanism: the agent writes code that imports MCP servers as modules (not direct tool calls); intermediate data is processed inside the execution environment and only the compact final result returns to the model."
+        - "This avoids loading every tool definition upfront and routing every intermediate result through the model's context."
+      must_cite: ["Code Execution with MCP"]
+
+  # ===== TYPE 2: CROSS-SOURCE SYNTHESIS (answer REQUIRES weaving >= 2 pages) =====
+  - id: S1
+    type: cross_source
+    held_out: true
+    question: "How does MCP compare to plain CLI/bash for agents on cost and reliability, and how do the sources reconcile that with MCP's popularity?"
+    expected_behavior: ANSWER_WITH_CITATION
+    ground_truth:
+      support_pages: [agent-tool-minimalism.md, model-context-protocol.md]
+      support_sources: [63, 8, 18, 97]
+      key_facts:
+        - "Independent benchmarks (via [63]) show MCP integrations are 10–32x more expensive in token usage than equivalent CLI commands, and achieve only ~72% task reliability vs CLI's 100%."
+        - "Concrete example: an MCP agent consumed 44,000 tokens for a query a CLI agent handled in 1,365."
+        - "Counterpoint: [8]/[18] frame MCP as a rapidly-growing standard with enterprise governance value — OAuth, audit trails, per-user permissions — that raw CLI/bash does not provide."
+        - "The reconciliation: it is an unresolved tension across DIFFERENT evaluation criteria — raw token efficiency (CLI wins) vs access-control/governance (MCP wins) — not a simple winner."
+      must_cite: ["Agent Tool Minimalism", "Model Context Protocol"]
+      synthesis_requirement: "Must integrate the criticism (tool-minimalism page) AND the governance defense (MCP page); should present it as a surfaced tension, not pick one side as fact. This is the wiki's claimed edge."
+
+  - id: S2
+    type: cross_source
+    held_out: false
+    question: "When should I use multiple parallel agents/subagents instead of a single agent, and what mechanism makes them run concurrently rather than sequentially?"
+    expected_behavior: ANSWER_WITH_CITATION
+    ground_truth:
+      support_pages: [parallel-agent-execution.md, multi-agent-topologies.md]
+      support_sources: [8, 14, 33, 129, 95]
+      key_facts:
+        - "Use parallel/subagents when the work decomposes into INDEPENDENT subtasks, and for context-efficiency: farm the (input+working) tokens out to isolated subagents that return only a compact final summary (e.g. ~500-word summary instead of 300k tokens in the main session)."
+        - "Caution / when NOT to: the 'Premature Multi-Agent' anti-pattern — always benchmark a single-agent baseline first; go multi-agent only when the quality gain exceeds the cost (multi-agent runs ~15x the tokens of chat)."
+        - "Concurrency mechanism: single-turn parallel emission — the coordinator must emit ALL parallel Agent tool calls in ONE turn; emitting them across separate turns serializes them. Git worktrees give each agent an isolated filesystem so they don't collide."
+      must_cite: ["Parallel Agent Execution", "Multi-Agent Topologies"]
+      synthesis_requirement: "Weave the 'when to use' guidance (incl. the anti-pattern caution) with the concrete concurrency mechanism — these live on two different pages."
+
+  - id: S3
+    type: cross_source
+    held_out: false
+    question: "How do MCP, A2A, and AG-UI relate to each other?"
+    expected_behavior: ANSWER_WITH_CITATION
+    ground_truth:
+      support_pages: [model-context-protocol.md, a2a-protocol.md, ag-ui-protocol.md]
+      support_sources: [53, 54, 65]
+      key_facts:
+        - "They form a complementary three-protocol stack at DIFFERENT layers — not competitors."
+        - "MCP = vertical, agent-to-tool (an agent using the tools/data/resources it controls)."
+        - "A2A = horizontal, agent-to-agent (peer coordination / task delegation; JSON-RPC 2.0 over HTTP; Agent Cards)."
+        - "AG-UI = agent-to-frontend (event-driven streaming between a running agent and the user-facing UI)."
+        - "They compound when used together (e.g. hybrid MCP+A2A; add AG-UI for a standard UI connection)."
+      must_cite: ["Model Context Protocol", "A2A Protocol", "AG-UI Protocol"]
+      synthesis_requirement: "Must correctly assign each protocol to its layer AND state they are complementary/compounding."
+
+  # ===== TYPE 3: ABSENT / OUT-OF-CORPUS (must REFUSE, must NOT fabricate) =====
+  - id: A1
+    type: absent
+    held_out: false
+    question: "How do I make a sourdough bread starter from scratch?"
+    expected_behavior: REFUSE
+    ground_truth:
+      support_pages: []
+      corpus_check: "VERIFIED ABSENT — 'sourdough' matches 0 files; corpus boundary is AI-coding/agents."
+      required_behavior:
+        - "Explicitly state the wiki does not cover this topic (cooking / bread-making)."
+        - "Do NOT fabricate any steps, ingredients, or citations."
+      auto_fail_if: "Any substantive how-to content or invented citation is produced."
+
+  - id: A2
+    type: absent
+    held_out: false
+    question: "What were the main causes of the fall of the Western Roman Empire?"
+    expected_behavior: REFUSE
+    ground_truth:
+      support_pages: []
+      corpus_check: "VERIFIED ABSENT — 'Roman Empire' matches 0 files."
+      required_behavior:
+        - "Explicitly state the wiki does not cover history / the Roman Empire."
+        - "Do NOT supply causes from outside knowledge, and do NOT cite any page."
+      auto_fail_if: "Any historical explanation or invented citation is produced."
+
+  - id: A3
+    type: absent
+    held_out: true
+    question: "What does this wiki say about Sourcegraph Cody as an AI coding assistant?"
+    expected_behavior: REFUSE
+    ground_truth:
+      support_pages: []
+      corpus_check: "VERIFIED ABSENT — 'Sourcegraph' and 'Cody' each match 0 files. The wiki DOES cover many other AI coding assistants (Copilot, Tabnine, CodeWhisperer, Claude Code, Cursor, Replit, Gemini), which is the trap."
+      required_behavior:
+        - "State that the wiki does not have a page on / coverage of Sourcegraph Cody."
+        - "Do NOT confabulate a Cody description by analogy to the assistants it DOES cover."
+        - "Acceptable to note related pages that DO exist (e.g. [[AI Coding Assistants]]) while being explicit that Cody itself is not covered."
+      auto_fail_if: "Any specific claim about Cody's features/architecture is asserted as if sourced from the wiki."
+
+# ---------------------------------------------------------------------------
+# GRADER — agent/judge-scored rubric (lean on judgement; no brittle regex)
+# Run by an LLM judge that is given: the question, the answer under test, the
+# scenario's ground_truth block, AND read-access to the cited wiki pages so it
+# can verify groundedness rather than trust the answer.
+# ---------------------------------------------------------------------------
+grader:
+  inputs_to_judge: [question, answer_under_test, scenario.ground_truth, wiki_pages_readable]
+  criteria:
+    grounded:
+      scale: 1-5
+      question: "Does every factual claim in the answer trace to actual wiki content? (5 = fully grounded; 1 = contains outside/hallucinated facts not in the wiki)"
+      hard_rule: "A SINGLE fabricated substantive fact (not present in any wiki page) caps grounded at 1 and FAILS the scenario, regardless of other scores."
+    cited:
+      scale: 1-5
+      question: "Does the answer name the page(s)/source(s) it drew from? (5 = names the correct page(s) and source tags; 3 = names a correct page but vaguely; 1 = no citation)"
+    correct:
+      scale: 1-5
+      question: "Does the answer contain the ground_truth key_facts and get them right? (5 = all key facts present & accurate; 3 = partial/one key fact missing or imprecise; 1 = wrong or mostly missing)"
+    fail_loud:
+      applies_to: absent
+      scale: 1-5
+      question: "On an ABSENT question, does the answer explicitly say the wiki doesn't cover it WITHOUT fabricating? (5 = clean refusal, no invented content; 1 = fabricates an answer/citation)"
+    synthesis:
+      applies_to: cross_source
+      scale: 1-5
+      question: "DIAGNOSTIC (not gated): did the answer genuinely integrate >=2 pages (and surface the tension where the scenario calls for it), rather than answer from one page? Records the wiki's claimed edge over single-doc retrieval."
+
+  gate:
+    answerable:            # single_page + cross_source
+      pass_if: "grounded >= 4 AND correct >= 4 AND cited >= 3"
+      hard_fail_if: "any fabricated substantive fact (grounded == 1)"
+    absent:
+      pass_if: "fail_loud >= 4 AND grounded >= 4 (i.e. explicit refusal, zero fabrication)"
+      hard_fail_if: "asserts any specific claim about the absent topic as if sourced, OR invents a citation"
+  overall_gate: "Suite PASSES when ALL 9 scenarios pass their per-type gate. Report per-scenario scores + held-out subset separately (the held-out pass rate is the real generalization signal)."
+
+# ---------------------------------------------------------------------------
+# A/B COMPARISON FRAME — `ask` (reads synthesized wiki) vs naive RAG baseline
+# (grep/read over the RAW source articles in ~/medium_articles). The proof that
+# the COMPILED wiki beats raw retrieval — Karpathy's actual claim.
+# ---------------------------------------------------------------------------
+ab_comparison:
+  systems:
+    A_wiki: "wiki-weaver ask — navigates runs/corpus/wiki (index.md -> pages -> [[wikilinks]])."
+    B_naive_rag: "Baseline (eval/rag_baseline.py style): lexical grep/keyword retrieval + read over RAW ~/medium_articles, then an LLM answers from the retrieved raw chunks. No synthesis layer."
+  protocol:
+    - "Run all 9 scenarios through BOTH systems."
+    - "Blind the systems (label 'System X' / 'System Y', randomized per scenario) so the judge can't tell which is the wiki."
+    - "A comparison agent judges answer QUALITY for each scenario on the same axes as the grader: groundedness, correctness vs ground_truth, citation/traceability, and (for absent) refusal-correctness. It picks A-wins / B-wins / tie per scenario with a one-line reason."
+  quality_judging:
+    judged_by: comparison_agent
+    per_scenario_verdict: [A_wins, B_wins, tie]
+    require_evidence: "Each verdict cites the specific fact(s) one system got and the other missed."
+  efficiency_measured_separately:
+    source: "context-intelligence events.jsonl for each run (NOT judged by the LLM — read deterministically from CI events)."
+    metrics:
+      cost_usd: "sum of llm:response.usage cost_usd across the run (per scenario and total)."
+      tokens: "input+output tokens from llm:response.usage."
+      latency_wall_ms: "wall time from first node start to final answer (pipeline:node_complete durations / run timestamps)."
+    note: "Per the objective hierarchy: retrieval optimizes for LATENCY first (a human is blocked), then cost. Quality is the gate; efficiency is compared only among quality-passing answers."
+  expected_shape:   # hypotheses to confirm/refute, NOT targets to hit
+    - "Cross-source (S1–S3): wiki WINS — the synthesized pages already weave + surface tensions; naive RAG retrieves raw chunks from separate articles and must re-derive (often missing the tension, e.g. reporting only one side of the MCP-vs-CLI numbers)."
+    - "Absent (A1–A3): wiki WINS or ties — the index makes 'not covered' verifiable; grep over raw articles risks surfacing tangential keyword hits (e.g. 'Cody'-adjacent assistants) and confabulating, especially on the adjacent-but-absent A3."
+    - "Single-page (L1–L3): roughly TIE on quality — the answer lives in one retrievable place either way; wiki likely cheaper/faster (one compiled page vs scanning many raw files)."
+    - "Efficiency: wiki lower latency on synthesis (no multi-file scan); naive RAG token/cost grows with how many raw articles must be read."

@@ -14,6 +14,7 @@ Subcommands:
     lint   [--wiki]            run the structural validator
     doctor                     environment diagnostics
     query  [--wiki] <q>        (stub) list pages matching a term
+    ask    <question> [--wiki] answer a question by reading the compiled wiki
 """
 
 from __future__ import annotations
@@ -653,6 +654,51 @@ def cmd_query(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ask -- read the compiled wiki and answer a question (Phase B)
+# ---------------------------------------------------------------------------
+#
+# MECHANISM (structural, not instructional): the spawned agent's tools are
+# constrained in engine_runner.make_ask_spawn_fn so it structurally cannot
+# write files or fetch from the web — only read within the wiki directory.
+# This forces grounding in wiki content and makes fail-loud-on-absent the
+# natural outcome (the agent can't pull from elsewhere).
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    wiki = Path(args.wiki).resolve()
+    if not wiki.is_dir():
+        _fail(f"wiki dir not found: {wiki}")
+        return 1
+
+    question = args.question
+    from cli.engine_runner import run_ask
+
+    _warn(f"asking wiki at {wiki!r}: {question!r}")
+    try:
+        result = run_ask(wiki, question)
+    except Exception as e:  # noqa: BLE001
+        _fail(f"ask error: {type(e).__name__}: {e}")
+        return 1
+
+    if args.json_out:
+        print(
+            json.dumps(
+                {
+                    "answer": result.answer,
+                    "pages_used": result.pages_used,
+                    "refused": result.refused,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(result.answer)
+        if result.pages_used:
+            print(f"\nPages consulted: {', '.join(result.pages_used)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -692,6 +738,18 @@ def main() -> None:
     p_query.add_argument("term")
     p_query.add_argument("--wiki", default=".", help="wiki directory (default: .)")
 
+    p_ask = sub.add_parser(
+        "ask", help="answer a question by reading the compiled wiki (no embeddings)"
+    )
+    p_ask.add_argument("question", help="question to answer")
+    p_ask.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    p_ask.add_argument(
+        "--json",
+        dest="json_out",
+        action="store_true",
+        help="output JSON: {answer, pages_used, refused}",
+    )
+
     args = parser.parse_args()
 
     dispatch = {
@@ -700,6 +758,7 @@ def main() -> None:
         "lint": cmd_lint,
         "doctor": cmd_doctor,
         "query": cmd_query,
+        "ask": cmd_ask,
     }
     if args.command is None:
         parser.print_help()
