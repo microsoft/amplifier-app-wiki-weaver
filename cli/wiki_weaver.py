@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import date, datetime
@@ -154,6 +155,60 @@ def _append_ledger(wiki: Path, entry: dict) -> None:
 REGISTRY_NAME = ".sources.json"
 
 
+def _read_source_frontmatter(src: Path) -> dict:
+    """Extract author, url, and date from YAML frontmatter of a source article.
+
+    Reads the ``---`` … ``---`` frontmatter block and returns a dict with keys
+    ``author``, ``url``, and ``date`` (all defaulting to ``None`` when absent).
+
+    Handles simple single-line string fields only (quoted or unquoted). Fails
+    silently on any parse error — provenance is best-effort; missing fields are
+    stored as ``None`` in the registry, never as fabrications.
+
+    Recognises both ``source:`` and ``url:`` as the URL field (medium-tools
+    writes ``source:``, other producers may write ``url:``).
+    """
+    result: dict = {"author": None, "url": None, "date": None}
+    try:
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return result
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return result
+
+    end_idx = None
+    for i, line in enumerate(lines[1:], 1):
+        if line.strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return result
+
+    # Regex for `key: "quoted value"` or `key: 'quoted value'` or `key: plain value`
+    _quoted = re.compile(r'^(\w+):\s*["\'](.+)["\']$')
+    _plain = re.compile(r"^(\w+):\s*(.+)$")
+
+    for line in lines[1:end_idx]:
+        line = line.strip()
+        m = _quoted.match(line) or _plain.match(line)
+        if not m:
+            continue
+        key = m.group(1).lower()
+        val = m.group(2).strip().strip("\"'")
+        if not val:
+            continue
+        if key == "author":
+            result["author"] = val
+        elif key in ("source", "url"):
+            result["url"] = val
+        elif key == "date":
+            result["date"] = val
+
+    return result
+
+
 def _source_hash(src: Path) -> str:
     """Stable content hash (sha256) of a source file."""
     h = hashlib.sha256()
@@ -198,6 +253,11 @@ def _assign_source_id(wiki: Path, src: Path) -> tuple[dict, bool]:
     Returns ``(entry, is_new)``. ``entry`` always has id/filename/hash/ingested.
     On a new source the registry is persisted immediately so the id is stable
     even if the ingest run later fails or is retried.
+
+    Provenance fields (author, url, date) are read from the source file's YAML
+    frontmatter and stored alongside id/filename/hash so citation ``[N]`` can
+    resolve to a real author + URL.  Missing fields are stored as ``None``
+    (or omitted) — never fabricated.
     """
     file_hash = _source_hash(src)
     registry = _load_registry(wiki)
@@ -205,13 +265,23 @@ def _assign_source_id(wiki: Path, src: Path) -> tuple[dict, bool]:
     if existing is not None:
         return existing, False
 
-    entry = {
+    fm = _read_source_frontmatter(src)
+    entry: dict = {
         "id": int(registry["next_id"]),
         "filename": src.name,
         "hash": file_hash,
         "first_seen": datetime.now().isoformat(timespec="seconds"),
         "ingested": False,
     }
+    # Provenance from frontmatter — store only fields that are present so the
+    # registry stays clean (no null-value noise for articles without metadata).
+    if fm.get("author"):
+        entry["author"] = fm["author"]
+    if fm.get("url"):
+        entry["url"] = fm["url"]
+    if fm.get("date"):
+        entry["date"] = fm["date"]
+
     registry["sources"].append(entry)
     registry["next_id"] = int(registry["next_id"]) + 1
     _save_registry(wiki, registry)

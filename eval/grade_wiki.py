@@ -102,7 +102,7 @@ LABELED_HEADER: list[re.Pattern[str]] = [
 
 # Sentence openers that narrate by source rather than by topic.
 # "Source [N] describes…" / "Source N notes…" etc.
-NARRATION_OPENER = re.compile(
+NARRATION_OPENER = re.compile(  # used by grade_synthesis (multi-source pages)
     r"(?:^|(?<=\. ))"
     r"Source[s]?\s+(?:\[\d+\]|\d+)(?:\s*[,&]\s*(?:\[\d+\]|\d+))*"
     r"\s+(?:also\s+)?"
@@ -113,6 +113,41 @@ NARRATION_OPENER = re.compile(
     r"|calls?|distinguishes?|traces?|addresses?|attributes?)\b",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+# ---------------------------------------------------------------------------
+# Overview-quality constants  (grade_overview)
+# ---------------------------------------------------------------------------
+
+# Parenthetical source reference in prose: "(source N)", "(sources N, M, …)".
+# This is the PRIMARY concatenation signal in overview.md — each source gets a
+# prose paragraph that names its source number parenthetically.
+_OVERVIEW_SOURCE_REF = re.compile(
+    r"\(source[s]?\s+\d+",
+    re.IGNORECASE,
+)
+
+# Thread-ordinal opener: "A fifth thread …", "An eleventh thread …".
+# Secondary / diagnostic — detects ordinal-based per-source organisation.
+_OVERVIEW_THREAD_OPENER = re.compile(
+    r"\bA[n]?\s+\w+(?:-\w+)?\s+thread\b",
+    re.IGNORECASE,
+)
+
+# Wikilinks [[Page Name]] — expected in a navigational synthesis overview.
+_WIKILINK = re.compile(r"\[\[[^\]]+\]\]")
+
+# ATX section headers h2+ — thematic structure indicator; absent = flat log.
+_SECTION_HEADER_H2 = re.compile(r"(?m)^#{2,}\s+")
+
+OVERVIEW_OPENER_THRESHOLD: int = 2  # max source-narration openers → PASS
+OVERVIEW_WIKILINK_MIN: int = 5  # min wikilinks for a navigational overview
+
+# ---------------------------------------------------------------------------
+# Provenance constants  (grade_provenance)
+# ---------------------------------------------------------------------------
+
+PROVENANCE_MIN_PCT: float = 0.80  # >= 80 % of sources must carry author + url
 
 
 class GradeResult:
@@ -885,6 +920,206 @@ def grade_synthesis(wiki: Path, judge_fn=None) -> GradeResult:
 
 
 # ---------------------------------------------------------------------------
+# Overview-quality grader  (deterministic primary; LLM judge secondary)
+# ---------------------------------------------------------------------------
+
+_OVERVIEW_JUDGE_RUBRIC = """\
+You are grading the OVERVIEW PAGE of a woven wiki.
+
+Score whether it is a SYNTHESIZED NAVIGATIONAL MAP (themes→hubs, orienting prose
+with [[wikilinks]], thematic ## sections) or a CONCATENATED PER-SOURCE LOG (one
+paragraph per source article, source numbers in prose such as "(source N)") on 1-5:
+
+  5 = Thematic ## sections, [[wikilinks]] as primary navigation, zero or near-zero
+      per-source paragraph enumeration. A reader learns the THEMES, not the article list.
+  4 = Mostly thematic; minor source enumeration present (1-2 openers).
+  3 = Mixed — some thematic grouping, many per-source paragraphs.
+  2 = Mostly per-source paragraphs but some thematic grouping.
+  1 = Pure per-source log — each source article gets its own numbered paragraph.
+
+Return ONLY valid JSON:
+{"score": <1-5>, "rationale": "<one sentence>"}
+
+OVERVIEW:
+"""
+
+
+def grade_overview(wiki: Path, judge_fn=None) -> GradeResult:
+    """Grade whether overview.md is a synthesized navigational map vs. a per-source log.
+
+    Hard gates (deterministic — pass judge_fn=None for fully offline run):
+        OV1  source_narration_openers <= OVERVIEW_OPENER_THRESHOLD (2)
+             Counts "(source N)" / "(sources N, M)" parenthetical openers.
+             A synthesized overview has ~0; a concatenation log has one per source.
+        OV2  wikilink_count >= OVERVIEW_WIKILINK_MIN (5)
+             A navigational map links to pages; a flat log may not.
+
+    Diagnostics (reported but NOT gated):
+        thread_openers        "A X-th thread …" sentence count (secondary signal)
+        section_headers_h2    ## header count (0 = flat log; good overview is sectioned)
+
+    Also inspects any ``type: index`` page in the wiki and reports its stats.
+
+    Optional gate (requires judge_fn):
+        OV-J  LLM synthesis score >= 4/5.  The deterministic gates OV1/OV2 stand
+              alone and are sufficient to catch concatenation; the judge adds a
+              qualitative corroboration but is NOT a hard gate.
+
+    Pass judge_fn=None for a fully offline, zero-network run.
+    CLI: ``python grade_wiki.py overview <wiki_dir> [--judge]``
+    Exit 0 == pass; non-zero == fail (hard gate violated).
+    """
+    res = GradeResult("overview-quality")
+
+    ov_path = wiki / "overview.md"
+    if not ov_path.is_file():
+        res.check(False, "overview.md not found in wiki")
+        return res
+
+    ov_text = ov_path.read_text(encoding="utf-8", errors="replace")
+
+    # --- Deterministic metrics ---
+    opener_count = len(_OVERVIEW_SOURCE_REF.findall(ov_text))
+    thread_opener_count = len(_OVERVIEW_THREAD_OPENER.findall(ov_text))
+    wikilink_count = len(_WIKILINK.findall(ov_text))
+    section_count = len(_SECTION_HEADER_H2.findall(ov_text))
+
+    # OV1 — hard gate: too many per-source parenthetical openers
+    res.check(
+        opener_count <= OVERVIEW_OPENER_THRESHOLD,
+        f"OV1 FAIL: {opener_count} source-narration openers "
+        f"(threshold <= {OVERVIEW_OPENER_THRESHOLD}; "
+        f"0 expected in a synthesized overview)",
+        f"OV1 source-narration openers: {opener_count} "
+        f"(<= {OVERVIEW_OPENER_THRESHOLD})",
+    )
+
+    # OV2 — hard gate: too few wikilinks → not a navigational document
+    res.check(
+        wikilink_count >= OVERVIEW_WIKILINK_MIN,
+        f"OV2 FAIL: {wikilink_count} wikilinks "
+        f"(need >= {OVERVIEW_WIKILINK_MIN} for a navigational overview)",
+        f"OV2 wikilinks: {wikilink_count} (>= {OVERVIEW_WIKILINK_MIN})",
+    )
+
+    # Diagnostics
+    res.notes += [
+        f"[diag] thread_openers: {thread_opener_count}",
+        f"[diag] section_headers_h2plus: {section_count} "
+        f"(0 = flat log; good overview has thematic ## sections)",
+    ]
+
+    # --- Inspect type:index pages as additional diagnostic ---
+    _TYPE_FM = re.compile(r"^type:\s*(\S+)", re.MULTILINE)
+    for p in sorted(wiki.glob("*.md")):
+        if p.name == "overview.md":
+            continue
+        page_text = p.read_text(encoding="utf-8", errors="replace")
+        tm = _TYPE_FM.search(page_text)
+        if tm and tm.group(1).strip() == "index":
+            idx_openers = len(_OVERVIEW_SOURCE_REF.findall(page_text))
+            idx_wl = len(_WIKILINK.findall(page_text))
+            idx_sec = len(_SECTION_HEADER_H2.findall(page_text))
+            res.notes.append(
+                f"[index:{p.name}] source_openers={idx_openers} "
+                f"wikilinks={idx_wl} sections_h2={idx_sec}"
+            )
+
+    # --- Optional LLM judge (OV-J, corroborating signal only) ---
+    if judge_fn is not None:
+        prompt = _OVERVIEW_JUDGE_RUBRIC + ov_text[:6000]
+        try:
+            raw = judge_fn(prompt)
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                j = json.loads(m.group(0))
+                score = j.get("score", 3)
+                rationale = j.get("rationale", "")
+                res.notes.append(
+                    f"[OV-J] overview_synthesis_score: {score}/5 — {rationale}"
+                )
+                # OV-J is a corroborating diagnostic; it is NOT an independent hard gate.
+        except Exception:
+            pass
+    else:
+        res.notes.append(
+            "llm_judge: disabled (OV-J skipped; deterministic gates OV1/OV2 only)"
+        )
+
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Provenance-quality grader
+# ---------------------------------------------------------------------------
+
+
+def grade_provenance(wiki: Path) -> GradeResult:
+    """Grade whether the source registry carries rich provenance (author + url).
+
+    The pipeline currently stores only ``id``, ``filename``, and ``hash`` in
+    ``.sources.json``.  Citation ``[N]`` therefore resolves to a filename, not
+    a URL, author, or date.  Rich provenance means each entry also carries
+    ``author`` and ``url`` (or ``source``).
+
+    Hard gate (deterministic, no LLM, no network):
+        PR1  pct_sources_with_author_and_url >= PROVENANCE_MIN_PCT (0.80)
+
+    Diagnostics (reported but NOT gated):
+        pct_with_date          fraction of entries that carry a ``date`` field
+        total_sources          total source count in registry
+        missing_author_url     count of entries without both author + url
+
+    CLI: ``python grade_wiki.py provenance <wiki_dir>``
+    Exit 0 == pass; non-zero == fail (PR1 gate violated).
+    """
+    res = GradeResult("provenance-quality")
+
+    reg_path = wiki / REGISTRY_NAME
+    if not reg_path.is_file():
+        res.check(False, f"{REGISTRY_NAME} not found in wiki")
+        return res
+
+    try:
+        data = json.loads(reg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        res.check(False, f"{REGISTRY_NAME} is not valid JSON: {exc}")
+        return res
+
+    sources = data.get("sources", [])
+    total = len(sources)
+
+    if total == 0:
+        res.check(False, "registry has zero source entries")
+        return res
+
+    has_author_and_url = sum(
+        1 for s in sources if s.get("author") and (s.get("url") or s.get("source"))
+    )
+    has_date = sum(1 for s in sources if s.get("date"))
+
+    pct = has_author_and_url / total
+
+    # PR1 — hard gate
+    res.check(
+        pct >= PROVENANCE_MIN_PCT,
+        f"PR1 FAIL: {pct:.1%} sources have author+url "
+        f"(need >= {PROVENANCE_MIN_PCT:.0%}; "
+        f"registry currently stores only filename+hash)",
+        f"PR1 pct_sources_with_author_url: {pct:.1%} (>= {PROVENANCE_MIN_PCT:.0%})",
+    )
+
+    res.notes += [
+        f"total_sources: {total}",
+        f"with_author_and_url: {has_author_and_url}/{total}",
+        f"missing_author_url: {total - has_author_and_url}/{total}",
+        f"[diag] with_date: {has_date}/{total} ({has_date / total:.1%})",
+    ]
+
+    return res
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -916,6 +1151,21 @@ def main() -> int:
         help="add LLM corroboration via unified_llm (requires attractor venv)",
     )
 
+    p_ov = sub.add_parser(
+        "overview", help="overview-quality grader: synthesis vs. per-source log"
+    )
+    p_ov.add_argument("wiki_dir", type=Path)
+    p_ov.add_argument(
+        "--judge",
+        action="store_true",
+        help="add LLM corroboration via unified_llm (requires attractor venv)",
+    )
+
+    p_pv = sub.add_parser(
+        "provenance", help="provenance-quality grader: registry author+url richness"
+    )
+    p_pv.add_argument("wiki_dir", type=Path)
+
     args = ap.parse_args()
     if not args.wiki_dir.is_dir():
         print(f"FAIL: wiki dir not found: {args.wiki_dir}", file=sys.stderr)
@@ -925,6 +1175,11 @@ def main() -> int:
         res = grade_converge(args.wiki_dir, args.sources)
     elif args.cmd == "integrity":
         res = ledger_integrity(args.wiki_dir)
+    elif args.cmd == "overview":
+        judge_fn = _build_judge_fn() if getattr(args, "judge", False) else None
+        res = grade_overview(args.wiki_dir, judge_fn=judge_fn)
+    elif args.cmd == "provenance":
+        res = grade_provenance(args.wiki_dir)
     else:  # synthesis
         judge_fn = _build_judge_fn() if getattr(args, "judge", False) else None
         res = grade_synthesis(args.wiki_dir, judge_fn=judge_fn)

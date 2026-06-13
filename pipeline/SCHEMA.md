@@ -57,7 +57,40 @@ flagged with both values and their sources — never collapsed to one or average
 ## Required navigation pages
 
 - `index.md` (type: index) — catalog of all pages, grouped by type.
-- `overview.md` (type: overview) — 1-paragraph orientation to the whole wiki.
+- `overview.md` (type: overview) — **SYNTHESIZED NAVIGATIONAL MAP** of the whole wiki.
+  Structure rules (enforced by the eval grader):
+  - Organized by **THEME/subtopic** with `##` section headers — NOT by source, NOT by ingest
+    order. Themes are the reader's entry points (e.g. "## Agent Orchestration", "## LLM APIs").
+  - Each theme section links to its hub/concept pages with `[[wikilinks]]` and a one-line
+    orientation of what's there.
+  - **NEVER** write `(source N)` parentheticals, `(sources N, M, …)`, or per-source prose
+    openers such as "A fifth thread (source 23)…". The overview describes the KNOWLEDGE THEMES,
+    not the ingest history.
+  - Short and navigational: a reader learns the TOPICS covered and how to navigate to them —
+    not a summarised list of each article.
+  - **Update it every ingest cycle**: add new theme sections or `[[wikilinks]]` for pages
+    created this cycle; consolidate or remove stale entries. Never append a new per-source
+    summary paragraph; fold new knowledge into existing or new theme sections.
+
+## Provenance: tracing citations to author + URL
+
+Each source article is assigned a stable integer id stored in `<wiki>/.sources.json`.
+That registry now carries `author`, `url`, and `date` (read from the source's YAML
+frontmatter), so citation `[N]` can resolve to a full bibliographic record.
+
+Pages that draw from external sources SHOULD include a `## Sources` footer listing
+the source ids they cite and, where known, the author/title/URL:
+
+```markdown
+## Sources
+
+- [1] Jane Doe — "Article Title" — https://example.com/article
+- [3] Bob Smith — "Another Article" — https://example.com/other
+```
+
+The registry is the authoritative store; the footer is a reader convenience.
+When writing or updating a page, list every id that appears in the page's
+`sources:` frontmatter field. You can read `.sources.json` to resolve id → author/url.
 
 ## Never confabulate
 
