@@ -1,0 +1,26 @@
+# Project validator config for the board-games wiki.
+#
+# Overrides validate_wiki.py's built-in module constants so that the
+# board-games taxonomy (catalog/landing nav pages, catalog/landing meta types)
+# is recognised correctly.
+#
+# Without this override, running the DEFAULT validator against a board-games
+# wiki would flag 'catalog' and 'landing' as orphans (not in NAV_PAGES) and
+# as pages that must cite a source (not in META_TYPES).  This file flips both
+# to PASS, proving the validator-seam is real and not bypassed.
+
+# Nav pages: exempt from the orphan check (entry-point pages, not content)
+nav_pages:
+  - catalog
+  - landing
+
+# Meta types: exempt from the "must cite a source" check
+meta_types:
+  - catalog
+  - landing
+
+# Required frontmatter: every page must carry these keys
+required_frontmatter:
+  - title
+  - type
+  - sources

@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .policy import WikiPolicy, load_policy
+
 # --------------------------------------------------------------------------
 # Static asset locations (this repo).
 # --------------------------------------------------------------------------
@@ -150,11 +152,15 @@ def load_ci_config() -> dict[str, Any]:
 def build_dot(
     source_path: Path,
     wiki_dir: Path,
-    max_cycles: int,
+    policy: WikiPolicy,
     source_id: int | str = "",
 ) -> str:
     """Read the inner DOT, substitute its required context variables with
     concrete ABSOLUTE paths, then inject ``llm_provider`` on each LLM node.
+
+    ``policy`` — the resolved WikiPolicy for this wiki (from load_policy).
+    Default policy (no project policy/ dir) produces byte-identical output
+    to the pre-Phase-D code that used module-level constants.
 
     ``source_id`` is the stable id the CLI assigned to this source BEFORE
     ingest (Fix 3). It is injected as ``$source_id`` so the ingest node uses
@@ -162,7 +168,8 @@ def build_dot(
     """
     import sys
 
-    dot = INNER_DOT.read_text(encoding="utf-8")
+    # Inner DOT source: project override when present, else engine default.
+    dot = policy.inner_dot_path.read_text(encoding="utf-8")
 
     # The validator writes its structured PASS/FAIL result to this known file on
     # EVERY run (--out). The feedback + refine-ingest nodes are told to READ it,
@@ -173,19 +180,26 @@ def build_dot(
     validate_cmd = (
         f"{sys.executable} {VALIDATE_PY} {wiki_dir} --out {validation_report}"
     )
+    # Append --config when the wiki supplies a project validator config so that
+    # the in-pipeline validate node uses the same constants as cmd_lint.
+    if policy.validator_config_path is not None:
+        validate_cmd += f" --config {policy.validator_config_path}"
+
     substitutions = {
         "$source_path": str(source_path),
         "$wiki_dir": str(wiki_dir),
         "$validation_report": str(validation_report),
-        "$schema_path": str(SCHEMA_PATH),
+        # Schema / rubric: project override or engine default (byte-identical
+        # for default wikis because policy defaults == the original constants).
+        "$schema_path": str(policy.schema_path),
         # assess uses the PER-SOURCE convergence rubric, NOT the whole-corpus
         # eval rubric (which would vote `refine` forever on a single article).
-        "$convergence_rubric": str(CONVERGENCE_RUBRIC_PATH),
+        "$convergence_rubric": str(policy.convergence_rubric_path),
         # $rubric_path retained for any eval-grading reuse; no longer referenced
         # by the inner pipeline's assess node (kept reserved for the eval grader).
         "$rubric_path": str(RUBRIC_PATH),
         "$validate_cmd": validate_cmd,
-        "$max_cycles": str(max_cycles),
+        "$max_cycles": str(policy.max_cycles),
         "$source_id": str(source_id),
     }
     for var, value in substitutions.items():
@@ -197,9 +211,17 @@ def build_dot(
     # attractor child agents carry no default_model. Anchor on the line-leading
     # declaration so the [[wikilinks]] inside prompt strings are never mistaken
     # for attributes.
+    #
+    # Per-node model: policy.model_for(nid) allows stage-level model tiering
+    # (e.g. cheap model for feedback, strong model for assess).  For default
+    # policy all stages resolve to the same model — byte-identical to pre-Phase-D.
     re_attr = f' reasoning_effort="{REASONING_EFFORT}",' if REASONING_EFFORT else ""
-    attrs = f'        llm_provider="{PROVIDER}", llm_model="{MODEL}",{re_attr}\n'
     for nid in LLM_NODE_IDS:
+        nid_model = policy.model_for(nid)
+        attrs = (
+            f'        llm_provider="{policy.provider}", '
+            f'llm_model="{nid_model}",{re_attr}\n'
+        )
         opener = f"    {nid} [\n"
         if opener in dot and "llm_provider" not in dot.split(opener, 1)[1][:200]:
             dot = dot.replace(opener, opener + attrs, 1)
@@ -586,7 +608,14 @@ def _parse_ask_output(text: str) -> tuple[str, list[str], bool]:
     return text.strip(), [], False
 
 
-def build_ask_dot(wiki_dir: Path, question: str, answer_file: Path) -> str:
+def build_ask_dot(
+    wiki_dir: Path,
+    question: str,
+    answer_file: Path,
+    *,
+    provider: str = PROVIDER,
+    model: str = MODEL,
+) -> str:
     """Build the single-node DOT pipeline for a wiki ask query.
 
     The DOT has one LLM node ("answer") that is instructed to:
@@ -595,6 +624,11 @@ def build_ask_dot(wiki_dir: Path, question: str, answer_file: Path) -> str:
       - Synthesize a cited answer from wiki content
       - Write the answer JSON to answer_file
       - FAIL LOUD if the wiki does not cover the question
+
+    ``provider`` / ``model`` — resolved from load_policy(wiki_dir) by the
+    caller so the wiki's model-tier knob (``models.ask`` / ``models.default``)
+    applies to retrieval too.  Defaults are the module-level constants;
+    byte-identical for default wikis.
 
     The agent writes its full answer to ``answer_file`` to bypass the
     loop-pipeline's notes-field truncation. The spawned agent's tools are
@@ -647,8 +681,8 @@ def build_ask_dot(wiki_dir: Path, question: str, answer_file: Path) -> str:
         '    start [shape=Mdiamond, label="Start"]',
         "    answer [",
         '        label="Read wiki and answer",',
-        f'        llm_provider="{PROVIDER}",',
-        f'        llm_model="{MODEL}",',
+        f'        llm_provider="{provider}",',
+        f'        llm_model="{model}",',
         f'        prompt="{prompt_dot}"',
         "    ]",
         '    done [shape=Msquare, label="Done"]',
@@ -725,7 +759,16 @@ def run_ask(
     # constraint does not block the agent from writing its answer.
     answer_file = Path(f"/tmp/wiki_ask_{timestamp}_{uuid.uuid4().hex[:8]}.json")
 
-    dot_source = build_ask_dot(wiki_dir, question, answer_file)
+    # Resolve provider/model from the wiki's policy so the model-tier knob
+    # (models.ask / models.default) applies to retrieval too.
+    _ask_policy = load_policy(wiki_dir)
+    dot_source = build_ask_dot(
+        wiki_dir,
+        question,
+        answer_file,
+        provider=_ask_policy.provider,
+        model=_ask_policy.model_for("ask"),
+    )
     (logs_dir / "ask.dot").write_text(dot_source, encoding="utf-8")
 
     raw_text, _data = asyncio.run(
@@ -881,10 +924,14 @@ def run_inner(
     source_path: str | Path,
     wiki_dir: str | Path,
     *,
-    max_cycles: int = 3,
+    max_cycles: int | None = None,
     source_id: int | str = "",
 ) -> InnerResult:
     """Run the inner convergence pipeline for ONE source through the engine.
+
+    ``max_cycles`` — when set, overrides the wiki's wiki.config.yaml value
+    (CLI flag beats config file).  When None, the policy resolves from config
+    (default 3 if not configured).
 
     ``source_id`` is the stable id the CLI assigned to this source (Fix 3); it
     is threaded into the ingest node as ``$source_id``.
@@ -896,11 +943,13 @@ def run_inner(
     if not wiki_dir.is_dir():
         raise FileNotFoundError(f"wiki dir not found: {wiki_dir}")
 
+    policy = load_policy(wiki_dir, cli_max_cycles=max_cycles)
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     logs_dir = wiki_dir / ".runs" / timestamp
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    dot_source = build_dot(source_path, wiki_dir, max_cycles, source_id=source_id)
+    dot_source = build_dot(source_path, wiki_dir, policy, source_id=source_id)
     (logs_dir / "inner.dot").write_text(dot_source, encoding="utf-8")
 
     _text, data = asyncio.run(
@@ -978,12 +1027,22 @@ def run_thin_slice(
 # delta is attributable to the compiled wiki vs the raw article pile — nothing else.
 
 
-def build_rag_dot(articles_dir: Path, question: str, answer_file: Path) -> str:
+def build_rag_dot(
+    articles_dir: Path,
+    question: str,
+    answer_file: Path,
+    *,
+    provider: str = PROVIDER,
+    model: str = MODEL,
+) -> str:
     """Build the single-node DOT pipeline for a naive-RAG query over raw articles.
 
     The agent has no index.md, no [[wikilinks]], and no pre-compiled structure.
     It must FIND relevant articles by exploring the raw pile via glob/read, then
     synthesize an answer from what it finds — mirroring lexical retrieval + generate.
+
+    ``provider`` / ``model`` — optional overrides (default: module-level constants).
+    Byte-identical for callers that don't pass them.
 
     The spawned agent's tools are constrained by make_ask_spawn_fn (same as ask):
     bash/web removed, writes denied, reads scoped to articles_dir.
@@ -1032,8 +1091,8 @@ def build_rag_dot(articles_dir: Path, question: str, answer_file: Path) -> str:
         '    start [shape=Mdiamond, label="Start"]',
         "    answer [",
         '        label="Search articles and answer",',
-        f'        llm_provider="{PROVIDER}",',
-        f'        llm_model="{MODEL}",',
+        f'        llm_provider="{provider}",',
+        f'        llm_model="{model}",',
         f'        prompt="{prompt_dot}"',
         "    ]",
         '    done [shape=Msquare, label="Done"]',

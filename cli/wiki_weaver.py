@@ -508,8 +508,14 @@ def cmd_lint(args: argparse.Namespace) -> int:
     if not wiki.is_dir():
         _fail(f"wiki dir not found: {wiki}")
         return 1
+    # Use the same validator config as the in-pipeline validate node so that
+    # `wiki-weaver lint` and the pipeline `validate` step always agree.
+    argv = [sys.executable, str(VALIDATE_PY), str(wiki)]
+    validator_cfg = wiki / "policy" / "validator.yaml"
+    if validator_cfg.is_file():
+        argv += ["--config", str(validator_cfg)]
     proc = subprocess.run(
-        [sys.executable, str(VALIDATE_PY), str(wiki)],
+        argv,
         capture_output=True,
         text=True,
     )
@@ -623,6 +629,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             _fail(f"wiki structure incomplete at {wiki} (missing: {missing})")
             ok = False
+
+        # Policy echo: show the resolved paths + model knobs for this wiki so the
+        # user can verify that project overrides are being picked up correctly.
+        if wiki.is_dir():
+            try:
+                from cli.policy import load_policy
+
+                policy = load_policy(wiki)
+                _ok(f"  policy.schema:          {policy.schema_path}")
+                _ok(f"  policy.rubric:          {policy.convergence_rubric_path}")
+                _ok(f"  policy.inner_dot:       {policy.inner_dot_path}")
+                _ok(
+                    f"  policy.validator_cfg:   "
+                    f"{policy.validator_config_path or '(built-in defaults)'}"
+                )
+                _ok(f"  policy.provider:        {policy.provider}")
+                _ok(f"  policy.models:          {policy.models}")
+                _ok(f"  policy.max_cycles:      {policy.max_cycles}")
+                _warn(
+                    f"  policy.parallelism:     {policy.parallelism}"
+                    " (RESERVED \u2014 within-wiki ingest is sequential;"
+                    " parallelism key accepted but always honored as 1)"
+                )
+            except Exception as e:  # noqa: BLE001
+                _warn(f"  could not resolve policy for {wiki}: {e}")
 
     print()
     if ok:
@@ -762,7 +793,12 @@ def main() -> None:
     p_ingest = sub.add_parser("ingest", help="integrate inbox sources via the engine")
     p_ingest.add_argument("--wiki", default=".", help="wiki directory (default: .)")
     p_ingest.add_argument("--source", default=None, help="ingest a single source file")
-    p_ingest.add_argument("--max-cycles", type=int, default=3)
+    p_ingest.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="convergence budget (default: from wiki.config.yaml or 3)",
+    )
     p_ingest.add_argument(
         "--keep-going",
         action="store_true",

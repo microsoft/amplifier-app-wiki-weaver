@@ -1,0 +1,7 @@
+{
+  "sources": [
+    {"id": 1, "filename": "a.md", "hash": "abc1234567890abc", "author": "Alice Chen",  "url": "https://example.com/alice/a"},
+    {"id": 2, "filename": "b.md", "hash": "def4567890defdef", "author": "Bob Smith",   "url": "https://example.com/bob/b"},
+    {"id": 3, "filename": "c.md", "hash": "ghi7890abcghi789", "author": "Carol Wang",  "url": "https://example.com/carol/c"}
+  ]
+}

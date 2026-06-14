@@ -53,7 +53,29 @@ def _parse_frontmatter(text: str) -> dict | None:
     return fm
 
 
-def validate(wiki_dir: Path) -> dict:
+def validate(wiki_dir: Path, *, config: dict | None = None) -> dict:
+    """Validate the structural integrity of a wiki directory.
+
+    ``config`` — optional dict overriding the built-in policy constants:
+      ``nav_pages``            list[str] — orphan-exempt page slugs
+      ``required_frontmatter`` list[str] — keys every page must carry
+      ``meta_types``           list[str] — types exempt from source-citation check
+
+    When ``config`` is None (the default), the built-in module-level constants
+    (NAV_PAGES, REQUIRED_FM, META_TYPES) are used unchanged — backward-compatible.
+    """
+    # Resolve policy-driven constants: project config overrides built-in defaults.
+    if config:
+        nav_pages: set[str] = set(config.get("nav_pages") or NAV_PAGES)
+        required_fm: tuple[str, ...] = tuple(
+            config.get("required_frontmatter") or REQUIRED_FM
+        )
+        meta_types: set[str] = set(config.get("meta_types") or META_TYPES)
+    else:
+        nav_pages = NAV_PAGES
+        required_fm = REQUIRED_FM
+        meta_types = META_TYPES
+
     pages = sorted(wiki_dir.glob("*.md"))
     result: dict = {
         "wiki_dir": str(wiki_dir),
@@ -95,12 +117,12 @@ def validate(wiki_dir: Path) -> dict:
         if fm is None:
             missing_fm.append(p.name)
         else:
-            missing = [k for k in REQUIRED_FM if k not in fm]
+            missing = [k for k in required_fm if k not in fm]
             if missing:
                 bad_fm.append(f"{p.name} (missing: {', '.join(missing)})")
             ptype = fm.get("type", "").strip().lower()
             srcs = fm.get("sources", "").strip().strip("[]").strip()
-            if ptype not in META_TYPES and not srcs:
+            if ptype not in meta_types and not srcs:
                 no_source.append(p.name)
 
         # Link resolution: count inbound (by canonical page id), flag unresolved.
@@ -111,7 +133,7 @@ def validate(wiki_dir: Path) -> dict:
             else:
                 broken_links.append(f"{p.name} -> [[{tgt}]]")
 
-    orphans = [k for k, n in inbound.items() if n == 0 and k not in NAV_PAGES]
+    orphans = [k for k, n in inbound.items() if n == 0 and k not in nav_pages]
 
     result["checks"] = {
         "S1_link_integrity": {
@@ -175,13 +197,31 @@ def main() -> int:
         default=None,
         help="also write the structured result to this file (JSON if --json)",
     )
+    # --config: project-supplied YAML overriding nav_pages/required_frontmatter/
+    # meta_types.  When absent, the built-in module defaults are used unchanged.
+    ap.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="YAML file overriding nav_pages, required_frontmatter, meta_types",
+    )
     args = ap.parse_args()
 
     if not args.wiki_dir.is_dir():
         print(f"FAIL: wiki dir not found: {args.wiki_dir}", file=sys.stderr)
         return 1
 
-    r = validate(args.wiki_dir)
+    # Load project validator config if given (tolerant: empty dict on any failure).
+    config: dict | None = None
+    if args.config is not None:
+        try:
+            import yaml  # pyright: ignore[reportMissingModuleSource]
+
+            config = yaml.safe_load(args.config.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            config = {}
+
+    r = validate(args.wiki_dir, config=config)
     if args.json:
         rendered = json.dumps(r, indent=2) + "\n"
         print(rendered, end="")

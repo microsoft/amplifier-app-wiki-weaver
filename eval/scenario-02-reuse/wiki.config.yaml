@@ -1,0 +1,25 @@
+# wiki.config.yaml for the board-games reuse scenario (eval/scenario-02-reuse/).
+#
+# Purpose: proves that wiki.config.yaml knobs (max_cycles, per-stage model
+# overrides) are loaded correctly by load_policy and threaded through the engine.
+#
+# Convergence budget: 2 cycles is enough for a 3-source board-games wiki and
+# reduces CI cost for the end-to-end scenario validation run.
+
+max_cycles: 2
+
+# Provider: use the default (anthropic). Listed here explicitly to verify the
+# provider key is parsed and honored.
+provider: anthropic
+
+# Per-stage model overrides — proves the model-tier knob wires through build_dot.
+# The feedback stage uses claude-haiku-4-5 (cheaper, lighter judgment);
+# ingest/assess/default use claude-sonnet-4-6 (stronger synthesis).
+models:
+  default: claude-sonnet-4-6
+  feedback: claude-haiku-4-5
+
+# parallelism: RESERVED — accepted here to prove the key loads without error,
+# but honored as 1 (within-wiki ingest must be sequential to avoid write races
+# on shared hub pages, .sources.json, and the ledger).
+parallelism: 1

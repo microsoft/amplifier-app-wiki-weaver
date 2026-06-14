@@ -1,26 +1,32 @@
-"""Calibration tests for Phase A graders against the FROZEN corpus wiki.
+"""Calibration tests for Phase A graders — static known-bad and known-good fixtures.
 
-Pins grade_overview and grade_provenance against runs/corpus/wiki (144 converged
-pages, frozen 2026-06-13) so that a future pipeline fix cannot silently produce a
-passing score on the old output.
+Decoupled from runs/corpus/wiki (live, mutable) onto deterministic static fixtures
+under eval/fixtures/ so calibration tests stay green regardless of corpus state.
 
-CALIBRATION FACTS measured 2026-06-13 on runs/corpus/wiki:
+KNOWN-BAD FIXTURE: eval/fixtures/known-bad-wiki/
+  Represents the pre-Phase-A concatenation state (per-source parenthetical openers
+  in overview.md, registry entries without author/url).
 
-  grade_overview (overview.md — 236 KB, one giant paragraph per source):
-    source_narration_openers  : 111  (threshold <= 2  → OV1 FAILS)
-    wikilink_count            : 388  (threshold >= 5  → OV2 passes)
-    section_header_count      : 0    (diagnostic only — no thematic ## sections)
+CALIBRATION FACTS (deterministic — fixed by fixture content):
+
+  grade_overview (overview.md — 10 source-narration openers):
+    source_narration_openers  : 10  (threshold <= 2  → OV1 FAILS)
+    wikilink_count            : 6   (threshold >= 5  → OV2 passes)
+    section_header_count      : 0   (diagnostic only — no thematic ## sections)
     result.passed             : False  (OV1 violates the hard gate)
 
-  grade_provenance (.sources.json — 145 entries, id/filename/hash only):
+  grade_provenance (.sources.json — 5 entries, id/filename/hash only):
     pct_sources_with_author_url : 0.0%  (threshold >= 80% → PR1 FAILS)
-    total_sources               : 145
+    total_sources               : 5
     result.passed               : False  (PR1 violates the hard gate)
 
-Both graders MUST continue to FAIL on this frozen corpus. They MUST pass once the
-corresponding pipeline fixes land (synthesized overview / enriched registry).
+KNOWN-GOOD FIXTURE: eval/fixtures/good-wiki/
+  Represents the post-Phase-A synthesized state (thematic ## sections, wikilinks,
+  registry entries with author+url — the targets the Phase A fixes achieve).
 
-Tests are skipped if the frozen corpus is not present (CI without fixture data).
+Both graders MUST FAIL on the known-bad fixture and PASS on the known-good fixture.
+Tests are skipped if the fixture directory is not present (guards against accidental
+deletion; fixtures should always be present since they are committed).
 """
 
 from __future__ import annotations
@@ -36,35 +42,33 @@ sys.path.insert(0, str(_REPO / "pipeline"))
 
 from grade_wiki import grade_overview, grade_provenance  # noqa: E402
 
-_WIKI = _REPO / "runs" / "corpus" / "wiki"
-pytestmark = pytest.mark.skipif(
-    not _WIKI.is_dir(),
-    reason=f"frozen corpus wiki not found at {_WIKI}",
-)
+_BAD_WIKI = _REPO / "eval" / "fixtures" / "known-bad-wiki"
+_GOOD_WIKI = _REPO / "eval" / "fixtures" / "good-wiki"
 
 
 # ---------------------------------------------------------------------------
-# grade_overview calibration — frozen corpus MUST FAIL
+# grade_overview calibration — known-bad fixture MUST FAIL
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def overview_result():
-    """grade_overview result — deterministic-only (no judge_fn)."""
-    return grade_overview(_WIKI, judge_fn=None)
+    """grade_overview result on known-bad fixture — deterministic-only (no judge_fn)."""
+    if not _BAD_WIKI.is_dir():
+        pytest.skip(f"known-bad wiki fixture not found at {_BAD_WIKI}")
+    return grade_overview(_BAD_WIKI, judge_fn=None)
 
 
-def test_overview_fails_frozen_corpus(overview_result):
-    """grade_overview must FAIL on the frozen concatenation corpus.
+def test_overview_fails_known_bad(overview_result):
+    """grade_overview must FAIL on the known-bad fixture.
 
-    overview.md is a per-source log (one paragraph per source article with
-    parenthetical source references like "(source 84)").  OV1 hard gate must
-    fire.  If this test starts PASSING it means either the overview was fixed
-    (great — delete this calibration test and add a passing one) or the
-    grader regressed and no longer catches the concatenation pattern.
+    overview.md contains 10 per-source parenthetical openers like '(source N)'.
+    OV1 hard gate must fire (10 > threshold of 2).  If this test starts PASSING
+    it means either the grader regressed and no longer catches the concatenation
+    pattern, or the fixture was accidentally modified.
     """
     assert not overview_result.passed, (
-        "grade_overview should FAIL on the frozen corpus (OV1 gate must fire); "
+        "grade_overview should FAIL on the known-bad fixture (OV1 gate must fire); "
         "if it passes, _OVERVIEW_SOURCE_REF regex is no longer detecting the "
         "per-source concatenation pattern in overview.md"
     )
@@ -80,63 +84,64 @@ def test_overview_ov1_gate_present_in_failures(overview_result):
 
 
 def test_overview_opener_count_high(overview_result):
-    """source_narration_openers must be >= 50 on the frozen corpus (observed: 111).
+    """source_narration_openers must be >= 3 on the known-bad fixture (fixture has 10).
 
-    A drop below 50 means the _OVERVIEW_SOURCE_REF regex has been weakened.
-    The frozen overview.md has 111 '(source N)' parenthetical openers — one
-    per source-article description paragraph.
+    A drop below 3 means the _OVERVIEW_SOURCE_REF regex has been weakened or
+    the fixture was changed.  The static fixture contains 10 explicit '(source N)'
+    parenthetical openers — well above the <= 2 pass threshold.
     """
     count = _extract_opener_count(overview_result)
     assert count != -1, (
         "Could not parse opener count from OV1 messages; "
         f"failures={overview_result.failures!r}, notes={overview_result.notes!r}"
     )
-    assert count >= 50, (
-        f"expected >= 50 source-narration openers on frozen corpus (observed: 111), "
-        f"got {count}; _OVERVIEW_SOURCE_REF regex may have been weakened"
+    assert count >= 3, (
+        f"expected >= 3 source-narration openers on known-bad fixture (fixture has 10), "
+        f"got {count}; _OVERVIEW_SOURCE_REF regex may have been weakened or fixture modified"
     )
 
 
 def test_overview_opener_count_pinned(overview_result):
-    """source_narration_openers must match the frozen-corpus count within ±15.
+    """source_narration_openers must match the fixture count within ±2 (fixture has 10).
 
-    Pins the observed value (111) so an unexpected change in overview.md or
-    the regex is caught.  ±15 tolerance allows for minor corpus edits without
-    false-positives.
+    Pins the known-bad fixture value so an unexpected change in overview.md or
+    the regex is caught.  Tight tolerance since the fixture is static and deterministic.
     """
     count = _extract_opener_count(overview_result)
     assert count != -1, (
         "Could not parse opener count from OV1 messages; "
         f"failures={overview_result.failures!r}"
     )
-    assert 96 <= count <= 126, (
-        f"expected source_narration_openers in range [96, 126] on frozen corpus "
-        f"(observed: 111), got {count}; "
-        "either overview.md changed or _OVERVIEW_SOURCE_REF was modified"
+    assert 8 <= count <= 12, (
+        f"expected source_narration_openers in range [8, 12] on known-bad fixture "
+        f"(fixture has exactly 10 explicit openers), got {count}; "
+        "either the fixture was modified or _OVERVIEW_SOURCE_REF was changed"
     )
 
 
 # ---------------------------------------------------------------------------
-# grade_provenance calibration — frozen corpus MUST FAIL
+# grade_provenance calibration — known-bad fixture MUST FAIL
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def provenance_result():
-    """grade_provenance result — deterministic (no LLM)."""
-    return grade_provenance(_WIKI)
+    """grade_provenance result on known-bad fixture — deterministic (no LLM)."""
+    if not _BAD_WIKI.is_dir():
+        pytest.skip(f"known-bad wiki fixture not found at {_BAD_WIKI}")
+    return grade_provenance(_BAD_WIKI)
 
 
-def test_provenance_fails_frozen_corpus(provenance_result):
-    """grade_provenance must FAIL on the frozen corpus.
+def test_provenance_fails_known_bad(provenance_result):
+    """grade_provenance must FAIL on the known-bad fixture.
 
     .sources.json stores only id/filename/hash — no author or url fields.
-    PR1 hard gate must fire (0% < 80% threshold).  If this test starts
-    PASSING it means either the registry was enriched (great — the fix
-    landed) or the grader stopped checking correctly.
+    PR1 hard gate must fire (0% < 80% threshold).  If this test starts PASSING
+    it means either the fixture was modified (check .sources.json) or the grader
+    stopped checking correctly.
     """
     assert not provenance_result.passed, (
-        "grade_provenance should FAIL on the frozen corpus (PR1 gate must fire); "
+        "grade_provenance should FAIL on the known-bad fixture (PR1 gate must fire); "
         "if it passes, either .sources.json unexpectedly gained author/url fields "
         "or the PR1 gate was broken"
     )
@@ -152,11 +157,11 @@ def test_provenance_pr1_gate_present_in_failures(provenance_result):
 
 
 def test_provenance_pct_is_zero(provenance_result):
-    """pct_sources_with_author_url must be 0.0% on the frozen corpus.
+    """pct_sources_with_author_url must be 0.0% on the known-bad fixture.
 
-    The registry only stores filename + hash.  Any non-zero value means
-    either (a) the registry was enriched (the fix we want — update this
-    test), or (b) the grader is miscounting fields.
+    The known-bad registry stores only filename + hash (no author, no url).
+    Any non-zero value means either (a) the fixture was modified or
+    (b) the grader is miscounting fields.
     """
     pct = _extract_provenance_pct(provenance_result)
     assert pct != -1.0, (
@@ -164,40 +169,87 @@ def test_provenance_pct_is_zero(provenance_result):
         f"failures={provenance_result.failures!r}, notes={provenance_result.notes!r}"
     )
     assert pct == pytest.approx(0.0, abs=0.01), (
-        f"expected 0.0% sources with author+url on frozen corpus, got {pct:.1%}; "
-        "registry may have gained author/url fields (fix landed!) "
-        "OR the grader is counting wrong fields"
+        f"expected 0.0% sources with author+url on known-bad fixture, got {pct:.1%}; "
+        "fixture .sources.json may have been modified OR the grader is counting wrong fields"
     )
 
 
 def test_provenance_total_sources(provenance_result):
-    """Registry must have >= 100 entries on the frozen corpus (observed: 145).
+    """Registry must have >= 3 entries on the known-bad fixture (fixture has 5).
 
-    Pins the source count so a silent registry truncation is caught.
+    Guards against silent registry truncation or fixture deletion.
     """
     total = _extract_total_sources(provenance_result)
     assert total != -1, (
         f"Could not parse total_sources from notes; notes={provenance_result.notes!r}"
     )
-    assert total >= 100, (
-        f"expected >= 100 sources in registry on frozen corpus (observed: 145), "
-        f"got {total}; registry may be empty or the path is wrong"
+    assert total >= 3, (
+        f"expected >= 3 sources in registry on known-bad fixture (fixture has 5), "
+        f"got {total}; fixture .sources.json may be empty or the path is wrong"
     )
 
 
 def test_provenance_total_sources_pinned(provenance_result):
-    """Total source count must be in range [135, 155] (observed: 145).
+    """Total source count must be in range [3, 8] (fixture has exactly 5).
 
-    Pins the frozen-corpus size.  A count outside this range means the
-    corpus was extended or the registry file changed.
+    Tight tolerance since the fixture is static and deterministic.  A count
+    outside this range means the fixture file was modified.
     """
     total = _extract_total_sources(provenance_result)
     assert total != -1, (
         f"Could not parse total_sources; notes={provenance_result.notes!r}"
     )
-    assert 135 <= total <= 155, (
-        f"expected total_sources in [135, 155] on frozen corpus (observed: 145), "
-        f"got {total}"
+    assert 3 <= total <= 8, (
+        f"expected total_sources in [3, 8] on known-bad fixture (fixture has 5), "
+        f"got {total}; fixture .sources.json was likely modified"
+    )
+
+
+# ---------------------------------------------------------------------------
+# grade_overview + grade_provenance — known-good fixture MUST PASS
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def good_overview_result():
+    """grade_overview result on known-good fixture — deterministic-only (no judge_fn)."""
+    if not _GOOD_WIKI.is_dir():
+        pytest.skip(f"known-good wiki fixture not found at {_GOOD_WIKI}")
+    return grade_overview(_GOOD_WIKI, judge_fn=None)
+
+
+@pytest.fixture(scope="module")
+def good_provenance_result():
+    """grade_provenance result on known-good fixture — deterministic (no LLM)."""
+    if not _GOOD_WIKI.is_dir():
+        pytest.skip(f"known-good wiki fixture not found at {_GOOD_WIKI}")
+    return grade_provenance(_GOOD_WIKI)
+
+
+def test_overview_passes_known_good(good_overview_result):
+    """grade_overview must PASS on the known-good fixture.
+
+    The known-good overview.md has thematic ## sections, >= 5 [[wikilinks]],
+    and zero source-narration openers — the target state Phase A aimed for.
+    If this test FAILS it means the grader is too strict or the fixture was
+    corrupted.
+    """
+    assert good_overview_result.passed, (
+        "grade_overview should PASS on the known-good fixture; "
+        f"failures: {good_overview_result.failures}"
+    )
+
+
+def test_provenance_passes_known_good(good_provenance_result):
+    """grade_provenance must PASS on the known-good fixture.
+
+    The known-good .sources.json has all entries with author + url (100% >= 80%
+    threshold) — the target state Phase A aimed for.  If this test FAILS it
+    means the grader is too strict or the fixture was corrupted.
+    """
+    assert good_provenance_result.passed, (
+        "grade_provenance should PASS on the known-good fixture; "
+        f"failures: {good_provenance_result.failures}"
     )
 
 
@@ -210,8 +262,8 @@ def _extract_opener_count(result) -> int:
     """Parse source-narration opener count from OV1 gate messages.
 
     Handles both:
-      FAIL state:  "OV1 FAIL: 111 source-narration openers ..."  (in failures)
-      PASS state:  "OV1 source-narration openers: 111 ..."        (in notes)
+      FAIL state:  "OV1 FAIL: 10 source-narration openers ..."  (in failures)
+      PASS state:  "OV1 source-narration openers: 10 ..."        (in notes)
     Returns -1 if not found.
     """
     # FAIL message format: "OV1 FAIL: <count> source-narration openers"
