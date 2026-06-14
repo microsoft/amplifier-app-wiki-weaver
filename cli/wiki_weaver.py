@@ -156,6 +156,95 @@ def _append_ledger(wiki: Path, entry: dict) -> None:
 REGISTRY_NAME = ".sources.json"
 
 
+def _parse_transcript_header(text: str) -> dict:
+    """Parse provenance from a meeting-transcript header block (no YAML frontmatter).
+
+    Handles the format produced by Teams/Zoom/calendar export tools::
+
+        # Transcript: Team Pulse Weekly Planning
+
+        Source: https://microsoft-my.sharepoint.com/...
+        Duration: 1:00:50
+        Speakers: Chris Park, Brian Krabach, Samuel Lee
+        Date: 5/29/2026, 11:07:43 AM
+        Chat type: Meeting
+        Attendees: Samuel Lee, Chris Park, Brian Krabach
+
+        ---
+
+        [0:00:04] Chris Park: ...
+
+    Returns a dict with keys ``author``, ``url``, ``date``, ``title`` (all
+    default to ``None``). Returns all-None for files that are not recognised
+    as transcripts — graceful fallback, no crash, no fabrication.
+
+    Detection: at least one of ``Speakers:`` or ``Attendees:`` must appear in
+    the header block (lines before the first ``---`` separator, or the first
+    50 lines when no separator is present). Labelled-field matching is
+    case-insensitive. ``Source:`` is only accepted when the value starts with
+    ``http://`` or ``https://`` to avoid false positives on prose fragments.
+    """
+    result: dict = {"author": None, "url": None, "date": None, "title": None}
+    lines = text.splitlines()
+
+    # Locate the header block: up to the first "---" separator (the thematic
+    # break that ends the metadata preamble) or a 50-line cap.
+    sep_idx: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            sep_idx = i
+            break
+    header_lines = lines[: sep_idx if sep_idx is not None else min(50, len(lines))]
+
+    # Labelled-field regex: "Label Name: value" (multi-word keys allowed)
+    _labeled = re.compile(r"^([A-Za-z][A-Za-z0-9 ]*?):\s*(.+)$")
+
+    has_speaker_marker = False  # True when Speakers: or Attendees: found
+    attendees_val: str | None = None
+
+    for line in header_lines:
+        stripped = line.strip()
+
+        # Extract title from the first markdown heading
+        if stripped.startswith("#") and result["title"] is None:
+            heading = re.sub(r"^#+\s*", "", stripped)
+            heading = re.sub(r"(?i)^Transcript:\s*", "", heading).strip()
+            if heading:
+                result["title"] = heading
+            continue
+
+        m = _labeled.match(stripped)
+        if not m:
+            continue
+        key = m.group(1).strip().lower()
+        val = m.group(2).strip()
+        if not val:
+            continue
+
+        if key == "source":
+            # Accept only URLs to avoid false positives on prose like "Source: Smith 2024"
+            if val.startswith(("http://", "https://")):
+                result["url"] = val
+        elif key == "speakers":
+            result["author"] = val
+            has_speaker_marker = True
+        elif key == "date":
+            result["date"] = val
+        elif key == "attendees":
+            attendees_val = val
+            has_speaker_marker = True
+
+    # Speakers: takes priority; Attendees: is the fallback author
+    if result["author"] is None and attendees_val is not None:
+        result["author"] = attendees_val
+
+    # If no speaker/attendee marker found this is not a transcript — return all-None
+    if not has_speaker_marker:
+        return {"author": None, "url": None, "date": None, "title": None}
+
+    return result
+
+
 def _read_source_frontmatter(src: Path) -> dict:
     """Extract author, url, and date from YAML frontmatter of a source article.
 
@@ -168,6 +257,11 @@ def _read_source_frontmatter(src: Path) -> dict:
 
     Recognises both ``source:`` and ``url:`` as the URL field (medium-tools
     writes ``source:``, other producers may write ``url:``).
+
+    Fallback: when no YAML frontmatter is found, attempts to parse a
+    meeting-transcript header block via :func:`_parse_transcript_header`.
+    Sources with neither frontmatter nor transcript markers are unchanged
+    (returns all-None). The medium-article path is byte-identical.
     """
     result: dict = {"author": None, "url": None, "date": None}
     try:
@@ -177,6 +271,14 @@ def _read_source_frontmatter(src: Path) -> dict:
 
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
+        # No YAML frontmatter — try transcript header as graceful fallback.
+        fm = _parse_transcript_header(text)
+        if fm.get("author"):
+            result["author"] = fm["author"]
+        if fm.get("url"):
+            result["url"] = fm["url"]
+        if fm.get("date"):
+            result["date"] = fm["date"]
         return result
 
     end_idx = None
