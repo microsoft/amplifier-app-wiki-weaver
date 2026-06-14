@@ -149,6 +149,15 @@ OVERVIEW_WIKILINK_MIN: int = 5  # min wikilinks for a navigational overview
 
 PROVENANCE_MIN_PCT: float = 0.80  # >= 80 % of sources must carry author + url
 
+# ---------------------------------------------------------------------------
+# Hub-integration constants  (grade_hub_integration)
+# ---------------------------------------------------------------------------
+
+# sections_per_source above this → FAIL (one-section-per-source accretion)
+HUB_SECTIONS_PER_SOURCE_THRESHOLD: float = 1.5
+# fraction of sections involved in near-dup heading pairs above this → FAIL
+HUB_REDUNDANCY_THRESHOLD: float = 0.30
+
 
 class GradeResult:
     """Tiny PASS/FAIL accumulator (one per scenario)."""
@@ -1120,6 +1129,198 @@ def grade_provenance(wiki: Path) -> GradeResult:
 
 
 # ---------------------------------------------------------------------------
+# Hub-integration grader  (deterministic primary; LLM judge secondary)
+# ---------------------------------------------------------------------------
+
+_HUB_INTEGRATION_JUDGE_RUBRIC = """\
+You are grading a single hub/concept page from a woven wiki to decide whether it is a
+COHERENT SYNTHESIS or an ACCRETED PILE built by stacking one-source-per-section chunks.
+
+Score 1–5:
+  5 = Single coherent synthesis: sections are organised by CONCEPT, not by source.
+      Topics appear once, merged and integrated. No paragraph "belongs" to a single source.
+  4 = Mostly coherent; minor traces of accretion (a section duplicated topic, slight
+      per-source feel in 1-2 spots).
+  3 = Mixed: roughly half the sections are well-integrated, half read as isolated
+      source summaries stacked together.
+  2 = Mostly accreted: the majority of sections obviously come from a single source
+      event, topics are repeated across sections, little cross-source synthesis.
+  1 = Pure pile: each section (or subsection) is a standalone chunk from one source.
+      The page reads like a list of article summaries, not a synthesized concept page.
+
+Return ONLY valid JSON:
+{"score": <1-5>, "rationale": "<one sentence explaining the verdict>"}
+
+PAGE TEXT (first 6000 chars):
+"""
+
+
+def _redundant_section_fraction(page_text: str) -> tuple[float, int, int]:
+    """Fraction of sections involved in at least one near-dup heading pair.
+
+    Two sections are "near-dup" when they are the same heading depth AND their
+    title tokens share Jaccard similarity >= 0.5.  This detects the accretion
+    pattern "same topic written twice under slightly different headers."
+
+    Returns:
+        (redundancy_score, n_redundant_sections, n_total_sections)
+    """
+    _STOPWORDS = frozenset(
+        "the a an and or of in to for is are with from by on at as its"
+        " it this that these those be been was were".split()
+    )
+
+    def _tokens(title: str) -> frozenset[str]:
+        toks = re.split(r"[^a-z0-9]+", title.lower())
+        return frozenset(t for t in toks if len(t) > 2 and t not in _STOPWORDS)
+
+    def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+        union = a | b
+        return len(a & b) / len(union) if union else 1.0
+
+    headers = [(len(d), t) for d, t in SECTION_HEADER.findall(page_text)]
+    n_total = len(headers)
+    if n_total == 0:
+        return 0.0, 0, 0
+
+    redundant_indices: set[int] = set()
+    for i in range(n_total):
+        for j in range(i + 1, n_total):
+            di, ti = headers[i]
+            dj, tj = headers[j]
+            if di != dj:
+                continue
+            t1, t2 = _tokens(ti), _tokens(tj)
+            if not t1 and not t2:
+                continue
+            if _jaccard(t1, t2) >= 0.5:
+                redundant_indices.add(i)
+                redundant_indices.add(j)
+
+    n_redundant = len(redundant_indices)
+    return n_redundant / n_total, n_redundant, n_total
+
+
+def grade_hub_integration(wiki: Path, page: str, judge_fn=None) -> GradeResult:
+    """Grade a single hub/concept page: coherent synthesis vs accreted pile.
+
+    Measures whether the page is organised by CONCEPT (synthesis) or by SOURCE
+    (accretion from one-source-at-a-time ingest events).
+
+    Hard gates (deterministic, no LLM — pass judge_fn=None for offline run):
+        HI1  sections_per_source <= HUB_SECTIONS_PER_SOURCE_THRESHOLD (1.5)
+             A synthesised page consolidates many sources into fewer conceptual
+             sections.  sections/source >> 1 means each source added its own
+             section rather than being merged into existing content.
+        HI2  source_labeled_sections == 0
+             Section headings that explicitly name a source number are the
+             direct fingerprint of concatenation, not synthesis.  Zero is
+             the pass condition.
+        HI3  redundancy_score < HUB_REDUNDANCY_THRESHOLD (0.30)
+             Fraction of section headings involved in a near-dup pair
+             (same depth, Jaccard >= 0.5).  Duplicate / restated headings
+             reveal the same topic was re-written on successive ingest events.
+
+    Diagnostics (reported but NOT gated):
+        n_sources             frontmatter ``sources:`` count
+        n_sections            total ## / ### headers
+        sections_per_source   ratio (the main accretion signal)
+        source_labeled_sections  count of headers that name a source
+        redundancy_score      fraction of sections involved in a near-dup pair
+
+    Optional gate (requires judge_fn):
+        HI-J  LLM synthesis score >= 4/5.
+              The judge sees the page text and scores "coherent synthesis" vs
+              "accreted pile" on 1-5.  The deterministic gates stand alone;
+              HI-J is a corroborating qualitative signal.
+
+    CLI: ``python grade_wiki.py hub-integration <wiki_dir> <page.md> [--judge]``
+    Exit 0 == pass (hub looks synthesised); non-zero == at least one gate fails.
+    """
+    res = GradeResult(f"hub-integration: {page}")
+
+    page_path = wiki / page
+    if not page_path.is_file():
+        res.check(False, f"page not found: {page_path}")
+        return res
+
+    text = page_path.read_text(encoding="utf-8", errors="replace")
+
+    # --- Deterministic metrics ---
+    n_sources = len(_sources_from_text(text))
+    n_sections = len(SECTION_HEADER.findall(text))
+    sections_per_source = n_sections / max(1, n_sources)
+
+    redundancy_score, n_redundant, _ = _redundant_section_fraction(text)
+
+    labeled_lines = source_labeled_sections(text)  # reuses existing function
+    n_labeled = len(labeled_lines)
+
+    # --- Notes (always reported, even on pass) ---
+    res.notes += [
+        f"n_sources: {n_sources}",
+        f"n_sections: {n_sections}",
+        f"sections_per_source: {sections_per_source:.2f}"
+        f" (gate threshold > {HUB_SECTIONS_PER_SOURCE_THRESHOLD})",
+        f"source_labeled_sections: {n_labeled}",
+        f"redundancy_score: {redundancy_score:.2f}"
+        f" ({n_redundant}/{n_sections} sections in a near-dup heading pair;"
+        f" gate threshold >= {HUB_REDUNDANCY_THRESHOLD})",
+    ]
+
+    # --- Hard gate HI1: sections_per_source ---
+    res.check(
+        sections_per_source <= HUB_SECTIONS_PER_SOURCE_THRESHOLD,
+        f"HI1 FAIL: sections_per_source={sections_per_source:.2f}"
+        f" > {HUB_SECTIONS_PER_SOURCE_THRESHOLD}"
+        f" ({n_sections} sections / {n_sources} sources)"
+        " — each source appears to have added its own section rather than"
+        " merging into existing conceptual structure (accretion signature)",
+        f"HI1 sections_per_source={sections_per_source:.2f}"
+        f" (<= {HUB_SECTIONS_PER_SOURCE_THRESHOLD})",
+    )
+
+    # --- Hard gate HI2: source-labeled headers ---
+    res.check(
+        n_labeled == 0,
+        f"HI2 FAIL: {n_labeled} source-labeled section header(s)"
+        " — direct concatenation fingerprint:"
+        + (" " + "; ".join(labeled_lines[:3]) if labeled_lines else ""),
+        "HI2 source_labeled_sections: 0",
+    )
+
+    # --- Hard gate HI3: intra-page header redundancy ---
+    res.check(
+        redundancy_score < HUB_REDUNDANCY_THRESHOLD,
+        f"HI3 FAIL: redundancy_score={redundancy_score:.2f}"
+        f" >= {HUB_REDUNDANCY_THRESHOLD}"
+        f" ({n_redundant} sections share a near-duplicate heading"
+        " — the same topic was restated across ingest events)",
+        f"HI3 redundancy_score={redundancy_score:.2f} (< {HUB_REDUNDANCY_THRESHOLD})",
+    )
+
+    # --- Optional LLM judge (HI-J, corroborating signal) ---
+    if judge_fn is not None:
+        prompt = _HUB_INTEGRATION_JUDGE_RUBRIC + text[:6000]
+        try:
+            raw = judge_fn(prompt)
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                j = json.loads(m.group(0))
+                score = j.get("score", 3)
+                rationale = j.get("rationale", "")
+                res.notes.append(f"[HI-J] hub_synthesis_score: {score}/5 — {rationale}")
+        except Exception:
+            pass
+    else:
+        res.notes.append(
+            "llm_judge: disabled (HI-J skipped; deterministic gates HI1/HI2/HI3 only)"
+        )
+
+    return res
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1166,6 +1367,21 @@ def main() -> int:
     )
     p_pv.add_argument("wiki_dir", type=Path)
 
+    p_hi = sub.add_parser(
+        "hub-integration",
+        help="hub-integration grader: coherent synthesis vs accreted pile",
+    )
+    p_hi.add_argument("wiki_dir", type=Path)
+    p_hi.add_argument(
+        "page",
+        help="page filename relative to wiki_dir (e.g. claude-code-cli-patterns.md)",
+    )
+    p_hi.add_argument(
+        "--judge",
+        action="store_true",
+        help="add LLM corroboration via unified_llm (requires attractor venv)",
+    )
+
     args = ap.parse_args()
     if not args.wiki_dir.is_dir():
         print(f"FAIL: wiki dir not found: {args.wiki_dir}", file=sys.stderr)
@@ -1180,6 +1396,9 @@ def main() -> int:
         res = grade_overview(args.wiki_dir, judge_fn=judge_fn)
     elif args.cmd == "provenance":
         res = grade_provenance(args.wiki_dir)
+    elif args.cmd == "hub-integration":
+        judge_fn = _build_judge_fn() if getattr(args, "judge", False) else None
+        res = grade_hub_integration(args.wiki_dir, args.page, judge_fn=judge_fn)
     else:  # synthesis
         judge_fn = _build_judge_fn() if getattr(args, "judge", False) else None
         res = grade_synthesis(args.wiki_dir, judge_fn=judge_fn)
