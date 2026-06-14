@@ -212,19 +212,24 @@ is **OPEN** — revisit only with a much larger corpus **and** an embedding-RAG 
 Quality = the gate (first, never traded). *Within* the quality-passing region, each
 stage minimizes a different efficiency target.
 
-### Strawman per-stage objectives — **DRAFT — redline me**
+### Per-stage objectives — **ACCEPTED 2026-06-13** (redlined & locked)
 
 | Stage | Quality gate (1st, hard) | Then minimize | Tolerate | Why |
 |---|---|---|---|---|
 | **Ingestion** | synthesis eval + structural valid | **cost_usd** | wall-time | background, runs on *every* new source, unattended — cheap matters, latency doesn't |
 | **Retrieval / ask** | answer-quality (grounded/cited/correct/**fail-loud**) | **wall-time / latency** | cost | interactive — a human is *blocked*. (cost_usd is measured here, but A/B showed the wiki is **dearer, not cheaper** than agentic RAG at this scale — its proven edge is quality/trust, not the user's bill.) |
-| **Consolidation** | hub-integration + **completeness (no claim loss)** | **cost_usd** | wall-time | periodic, background, rare |
+| **Consolidation** *(PARKED)* | hub-integration + **completeness (no claim loss)** | **cost_usd** | wall-time | periodic, background, rare |
 
-### The 3 knobs (ship as Item-5 policy)
+**Accepted calls (2026-06-13):**
+- **Ingestion** — minimize cost, tolerate wall-time; **no hard cost ceiling** (the convergence gate + `max_cycles` already bound per-article spend).
+- **Retrieval/ask** — latency is a **soft target (~30–60s), not a hard gate**: we measured ~26–110s/ask (mean ~60s) and have no proven latency-reduction lever yet, so a hard gate would just fail without offering a fix. Revisit if real users find it sluggish. Cost is tolerated (pennies/query).
+- **Consolidation** — objective retained but **PARKED**: Phase C's hub-integration grader showed accretion fingerprints (source-labeled headers, redundancy) are zero corpus-wide, so no consolidation pass is built. Re-open only if the grader flags real accretion as the corpus grows.
 
-- **Model tier per stage** (cheap for background ingest, stronger where judgment is hard)
-- **Parallelism**
-- **`max_cycles` budget**
+### The 3 knobs (ship as Item-5 policy) — **ACCEPTED defaults**
+
+- **Model tier per stage** — **default: all-sonnet** (proven safe/reliable); `haiku` for the feedback stage is a documented **opt-in** for cost-sensitive runs (the board-games reuse scenario uses it).
+- **Parallelism** — **reserved = 1** (within-wiki concurrency races on shared hub pages / `.sources.json` / ledger — proven unsafe; cross-wiki batching is a future sweep-level concern).
+- **`max_cycles` budget** — **default: 3** (general balance); overridable per-run (the corpus run uses `5`; tiny wikis use `2`).
 
 ### Two evals this creates
 
