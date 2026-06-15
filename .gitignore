@@ -1,6 +1,7 @@
 # Evaluation run output is NOT source controlled — may contain provider keys,
 # prompts, responses, and absolute paths.
 .amplifier/evaluation/
+.ai/          # per-source convergence assessments and run artifacts
 runs/
 wiki/        # generated wiki output from pipeline runs
 *.log
