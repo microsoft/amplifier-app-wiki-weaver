@@ -316,7 +316,7 @@ rejection**.
 - Engine fixes (spawn-outcome capture, AsyncClient lifecycle, fallback removal,
   packaging direct-ref) merged to `microsoft/amplifier-bundle-attractor` main.
 - Synthesis pipeline + recalibrated eval published to
-  `bkrabach/amplifier-wiki-weaver` (private) + Microsoft-OSS compliance files added.
+  `microsoft/amplifier-wiki-weaver` (private) + Microsoft-OSS compliance files added.
 - Full 748 corpus run STOPPED at 144 converged pages → frozen as `runs/corpus/wiki`
   (resume in Phase E).
 - Phase A is the next execution step: graders first, calibrated to FAIL the frozen corpus.

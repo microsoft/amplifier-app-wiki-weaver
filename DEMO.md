@@ -8,7 +8,7 @@ organized, error-free, provenance-tracked** wiki — the Karpathy LLM-wiki / sec
 ## Demo it (any pile of articles → a wiki)
 
 ```bash
-PY=/home/bkrabach/.local/share/uv/tools/amplifier/bin/python3
+PY=/path/to/amplifier/bin/python3  # python3 from your Amplifier install
 cd wiki-weaver
 
 $PY -m cli doctor                       # env preflight (all green)

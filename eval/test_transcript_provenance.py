@@ -64,16 +64,16 @@ _TRANSCRIPT_FULL = """\
 
 Source: https://microsoft-my.sharepoint.com/:v:/p/cspark/IQCy_example123
 Duration: 1:00:50
-Speakers: Chris Park, Brian Krabach, Samuel Lee
+Speakers: Chris Park, Alex Rivera, Samuel Lee
 Date: 5/29/2026, 11:07:43 AM
 Chat type: Meeting
 Call ID: d36fb9d2-dead-beef-cafe-0123456789ab
-Attendees: Samuel Lee, Chris Park, Brian Krabach
+Attendees: Samuel Lee, Chris Park, Alex Rivera
 
 ---
 
 [0:00:04] Chris Park: Good morning everyone, let's get started.
-[0:00:15] Brian Krabach: Morning. Should we jump into the backlog first?
+[0:00:15] Alex Rivera: Morning. Should we jump into the backlog first?
 """
 
 # Transcript with only Attendees: (no Speakers:) — tests fallback author
@@ -138,7 +138,7 @@ class TestParseTranscriptHeader:
     def test_full_transcript_extracts_all_fields(self):
         """Full transcript header → author (Speakers), url (Source), date, title."""
         result = _parse_transcript_header(_TRANSCRIPT_FULL)
-        assert result["author"] == "Chris Park, Brian Krabach, Samuel Lee"
+        assert result["author"] == "Chris Park, Alex Rivera, Samuel Lee"
         assert (
             result["url"]
             == "https://microsoft-my.sharepoint.com/:v:/p/cspark/IQCy_example123"
@@ -200,7 +200,7 @@ class TestReadSourceFrontmatterWithTranscriptFallback:
         src = tmp_path / "transcript.md"
         src.write_text(_TRANSCRIPT_FULL, encoding="utf-8")
         result = _read_source_frontmatter(src)
-        assert result["author"] == "Chris Park, Brian Krabach, Samuel Lee"
+        assert result["author"] == "Chris Park, Alex Rivera, Samuel Lee"
         assert (
             result["url"]
             == "https://microsoft-my.sharepoint.com/:v:/p/cspark/IQCy_example123"

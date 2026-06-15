@@ -55,11 +55,11 @@ CONVERGENCE_RUBRIC_PATH = PIPELINE_DIR / "CONVERGENCE_RUBRIC.md"
 # per-provider child agents the engine spawns. Local checkout preferred; the
 # bundle's ``attractor:`` namespace resolves to the cached microsoft repo via
 # the user registry. Falls back to the canonical git URL.
-ATTRACTOR_PIPELINE_LOCAL = os.environ.get(
-    "WIKI_WEAVER_ATTRACTOR_PIPELINE",
-    "/home/bkrabach/dev/medium-tools-wiki/amplifier-bundle-attractor/"
-    "bundles/attractor-pipeline.yaml",
-)
+# Set WIKI_WEAVER_ATTRACTOR_PIPELINE to point at a local checkout of the
+# attractor-pipeline bundle (e.g. the bundles/attractor-pipeline.yaml inside a
+# local clone of amplifier-bundle-attractor). When the env var is absent the
+# loader falls through to ATTRACTOR_PIPELINE_GIT below.
+ATTRACTOR_PIPELINE_LOCAL = os.environ.get("WIKI_WEAVER_ATTRACTOR_PIPELINE")
 ATTRACTOR_PIPELINE_GIT = (
     "git+https://github.com/microsoft/amplifier-bundle-attractor@main"
     "#subdirectory=bundles/attractor-pipeline.yaml"
@@ -91,7 +91,12 @@ REASONING_EFFORT = os.environ.get("WIKI_WEAVER_REASONING_EFFORT")
 
 # Attractor namespace root (repo that owns ``attractor:agents/...`` refs). The
 # per-provider agent bundles live under ``<root>/agents/<name>.yaml``.
-_ATTRACTOR_REPO_ROOT = Path(ATTRACTOR_PIPELINE_LOCAL).resolve().parent.parent
+# Set only when WIKI_WEAVER_ATTRACTOR_PIPELINE points at a local checkout.
+_ATTRACTOR_REPO_ROOT: Path | None = (
+    Path(ATTRACTOR_PIPELINE_LOCAL).resolve().parent.parent
+    if ATTRACTOR_PIPELINE_LOCAL
+    else None
+)
 
 # LLM-driven node ids in the inner DOT (need an explicit llm_provider so the
 # engine routes them to a child agent). Tool nodes (validate) and routing nodes
@@ -254,12 +259,14 @@ async def _resolve_agent_bundle(agent_name: str, config: dict[str, Any]) -> Any:
         # e.g. "attractor:agents/attractor-agent-anthropic"
         ns, _, rel = str(ref).partition(":")
         if rel:
-            local = (_ATTRACTOR_REPO_ROOT / rel).with_suffix(".yaml")
-            candidates = [
-                str(local),
+            candidates: list[str] = []
+            if _ATTRACTOR_REPO_ROOT is not None:
+                local = (_ATTRACTOR_REPO_ROOT / rel).with_suffix(".yaml")
+                candidates.append(str(local))
+            candidates.append(
                 f"git+https://github.com/microsoft/amplifier-bundle-attractor@main"
-                f"#subdirectory={rel}.yaml",
-            ]
+                f"#subdirectory={rel}.yaml"
+            )
         else:
             candidates = [str(ref)]
         last_err: Exception | None = None
@@ -821,7 +828,8 @@ async def _load_base() -> Any:
     from amplifier_foundation import load_bundle
 
     last_err: Exception | None = None
-    for src in (ATTRACTOR_PIPELINE_LOCAL, ATTRACTOR_PIPELINE_GIT):
+    candidates = [s for s in (ATTRACTOR_PIPELINE_LOCAL, ATTRACTOR_PIPELINE_GIT) if s]
+    for src in candidates:
         try:
             _BASE_BUNDLE = await load_bundle(src)
             return _BASE_BUNDLE

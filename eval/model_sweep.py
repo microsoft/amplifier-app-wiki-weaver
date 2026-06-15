@@ -17,11 +17,11 @@ Two subcommands:
             Pure-deterministic: imports the existing graders/validator. No LLM.
 
 Usage:
-  PY=/home/bkrabach/.local/share/uv/tools/amplifier/bin/python3
+  PY=/path/to/amplifier/bin/python3
   $PY eval/model_sweep.py variant \
       --provider anthropic --model claude-sonnet-4-6 \
       --outroot /.../<TS> --slug claude-sonnet-4-6 \
-      --repo /home/bkrabach/dev/medium-tools-wiki/wiki-weaver
+      --repo /path/to/wiki-weaver
   $PY eval/model_sweep.py grade --outroot /.../<TS>
 """
 

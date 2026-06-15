@@ -7,7 +7,16 @@ name = "wiki-weaver"
 version = "0.1.0"
 description = "LLM-wiki ingest pipeline driven by the attractor engine."
 requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Microsoft Corporation"}]
+# NOTE: amplifier_foundation and unified_llm are RUNTIME prerequisites supplied
+# by an Amplifier installation (https://github.com/microsoft/amplifier). They are
+# not pip-installable dependencies — run wiki-weaver under the Amplifier Python
+# interpreter (e.g. ~/.local/share/uv/tools/amplifier/bin/python3).
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/microsoft/amplifier-wiki-weaver"
 
 [project.scripts]
 wiki-weaver = "cli.wiki_weaver:main"

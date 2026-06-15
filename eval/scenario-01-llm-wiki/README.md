@@ -4,15 +4,20 @@
 **cross-source synthesis** — and flags contradictions instead of confabulating.
 This is Karpathy's actual LLM-Wiki claim, made measurable.
 
-**Why this corpus:** 6 real Medium articles (in `sources/`) that genuinely
-overlap *and disagree* — LLM Wiki implementations, second brain, RAG-vs-memory.
-Synthesis and contradiction-handling are the whole point, so a fresh 1-source
-wiki wouldn't test anything; this set forces real weaving.
+**Why this corpus:** 6 synthetic articles (in `sources/`) that cover the same thematic
+space — LLM Wiki implementations, second brain, RAG-vs-memory — and embed deliberate
+overlaps and contradictions. Contradictions include: RAG-is-dead vs still-useful,
+full-automation vs manual-curation-required, and differing star-count figures for a
+reference implementation. Synthesis and contradiction-handling are the whole point, so a
+fresh 1-source wiki wouldn't test anything; this set forces real weaving.
+
+The `sources/` articles are purpose-written test fixtures. They are not third-party
+copyrighted works.
 
 ## Files
 | file | role |
 |---|---|
-| `sources/` | the 6 input articles (the pipeline ingests these) |
+| `sources/` | the 6 synthetic input articles (the pipeline ingests these) |
 | `ground-truth.md` | answer key: entities to merge, contradictions to surface, the verified star/fork discrepancy, the "RAG is dead" strawman trap |
 | `questions.yaml` | Q&A graded A/B (cross-source vs single-source vs contradiction-probe; 2 held out) |
 | `rubric.md` | the shared rubric — used BOTH as the pipeline's converge/refine gate AND the eval grader |
