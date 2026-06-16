@@ -1,0 +1,48 @@
+digraph wiki_weaver_pipelines {
+  rankdir=TB; fontname="Helvetica"; labelloc=t; fontsize=18;
+  label="Inside the .dot pipelines — real attractor node vocabulary\nexact work = tool/conditional nodes (0 LLM)  |  judgment = LLM box nodes  |  reuse = subgraph folders\n";
+  node [fontname="Helvetica", fontsize=10];
+  edge [fontname="Helvetica", fontsize=9];
+
+  subgraph cluster_legend {
+    label="NODE VOCABULARY (verified in amplifier-bundle-attractor)"; style=filled; color="#f2f2f2"; fontsize=12;
+    l1 [shape=Mdiamond, label="start"];
+    l2 [shape=box, style="filled", fillcolor="#ffd9d9", label="LLM agent\n(judgment)"];
+    l3 [shape=parallelogram, style="filled", fillcolor="#d9f0ff", label="tool / shell\n(exact, 0 LLM)"];
+    l4 [shape=diamond, style="filled", fillcolor="#fff2cc", label="conditional\n(routing)"];
+    l5 [shape=folder, style="filled", fillcolor="#e2d9ff", label="subgraph\n(reuse)"];
+    l6 [shape=Msquare, label="exit"];
+    l1->l2->l3->l4->l5->l6 [style=invis];
+  }
+
+  subgraph cluster_ingest {
+    label="ingest.dot   (init / ask / lint follow the same shape)"; style=filled; color="#fcfcfc"; fontsize=13;
+    s   [shape=Mdiamond, label="start"];
+    scan[shape=parallelogram, style="filled", fillcolor="#d9f0ff", label="scan raw/ inbox\nlist | hash-dedup | text-sniff"];
+    rte [shape=diamond, style="filled", fillcolor="#fff2cc", label="text? binary? dup?"];
+    syn [shape=folder, style="filled", fillcolor="#e2d9ff", label="synthesize\n(subgraph)"];
+    val [shape=parallelogram, style="filled", fillcolor="#d9f0ff", label="validate\n(deterministic checker)"];
+    conv[shape=diamond, style="filled", fillcolor="#fff2cc", label="converged?"];
+    arch[shape=parallelogram, style="filled", fillcolor="#d9f0ff", label="move -> _archive"];
+    fail[shape=parallelogram, style="filled", fillcolor="#d9f0ff", label="move -> _failed"];
+    e   [shape=Msquare, label="exit"];
+
+    s -> scan -> rte;
+    rte -> syn  [label="text"];
+    rte -> fail [label="binary / no handler"];
+    rte -> arch [label="duplicate"];
+    syn -> val -> conv;
+    conv -> arch [label="yes"];
+    conv -> syn  [label="no  (retry_target)", style=dashed];
+    arch -> e; fail -> e;
+  }
+
+  subgraph cluster_subs {
+    label="SHARED SUBGRAPHS (folder nodes, reused across pipelines)"; style=filled; color="#f3effb"; fontsize=12;
+    sg1 [shape=folder, style="filled", fillcolor="#e2d9ff", label="synthesize.dot\n(box: write/heal a page)"];
+    sg2 [shape=folder, style="filled", fillcolor="#e2d9ff", label="retrieve.dot\n(pick relevant pages)\nused by ask + ingest + lint"];
+    sg3 [shape=folder, style="filled", fillcolor="#e2d9ff", label="heal-page.dot\n(converge one page)"];
+    sg1 -> sg3 [label="uses", style=dotted, color="#7a5"];
+  }
+  syn -> sg1 [label="includes (dot_file=)", style=dotted, color="#7a5"];
+}

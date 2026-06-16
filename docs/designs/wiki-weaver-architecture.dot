@@ -1,0 +1,41 @@
+digraph wiki_weaver_architecture {
+  rankdir=TB; fontname="Helvetica"; labelloc=t; fontsize=20;
+  label="wiki-weaver — target architecture: ONE product (.dot pipelines), many surfaces\n";
+  node [fontname="Helvetica", fontsize=11, style="filled,rounded", shape=box];
+  edge [fontname="Helvetica", fontsize=9];
+
+  subgraph cluster_consumers {
+    label="WHO USES IT"; style=filled; color="#eef2f7"; fontsize=13;
+    host  [label="Attractor-native host\n(app-cli + attractor bundle,\nresolver-dot-graph)", fillcolor="#cfe8cf"];
+    other [label="Other codebase\n(attractor NOT wired up)", fillcolor="#cfe8cf"];
+    agent [label="You / an AI agent\n(via bash)", fillcolor="#cfe8cf"];
+    insess[label="In an Amplifier session\n(/wiki-init, /wiki-ingest ...)", fillcolor="#cfe8cf"];
+  }
+
+  subgraph cluster_surfaces {
+    label="SURFACES — each usable on its own"; style=filled; color="#f7f3ea"; fontsize=13;
+    dots [label="THE .dot PIPELINES\ninit | ingest | ask | lint\n(+ shared subgraphs)\n— THE PRODUCT —", fillcolor="#ffd966", penwidth=3];
+    lib  [label="lib\nthin attractor shim\nparse_dot -> PipelineEngine.run()", fillcolor="#dbe9ff"];
+    cli  [label="CLI\nthin click wrapper\n(wiki-weaver ingest/ask/lint)", fillcolor="#dbe9ff"];
+    skill[label="wiki-weaver skill\nteaches an agent to drive the CLI", fillcolor="#dbe9ff"];
+    bundle[label="llm-wiki bundle\nprompt-driven /wiki-* modes\n(zero engine, in-session)", fillcolor="#e9dbff"];
+  }
+
+  engine [label="Attractor engine (loop-pipeline)", fillcolor="#bbbbbb", penwidth=2];
+
+  host  -> dots [label="runs .dot DIRECTLY\n(no wiki-weaver code)", color="#1a8f1a", penwidth=2.5];
+  other -> lib  [label="imports"];
+  lib   -> dots [label="loads + runs"];
+  agent -> cli  [label="bash"];
+  cli   -> lib  [label="calls"];
+  insess-> bundle;
+  bundle-> cli  [label="/wiki-ingest shells out\n(if installed)", style=dashed];
+  bundle-> skill [label="references", style=dashed];
+  skill -> cli  [label="drives", style=dashed];
+
+  dots -> engine [label="executed by", color="#777"];
+  lib  -> engine [label="wraps", style=dashed, color="#777"];
+  host -> engine [label="already has", style=dotted, color="#777"];
+
+  { rank=same; lib; cli; skill }
+}
