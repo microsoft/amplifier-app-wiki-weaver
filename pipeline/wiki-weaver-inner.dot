@@ -1,7 +1,7 @@
 // wiki-weaver-inner.dot -- Integrate ONE source into the wiki, until coherent.
 //
 // The inner attractor loop: ingest -> normalize (deterministic) ->
-// complete_bib (deterministic) -> validate (structural, code) ->
+// footnotes (deterministic) -> validate (structural, code) ->
 // assess (quality, LLM, against the shared rubric) ->
 // converged? -> (refine) feedback -> loop_restart.
 // Specialized clone of convergence-factory.dot.
@@ -18,7 +18,7 @@
 //                          whole-corpus eval rubric, which votes refine forever on
 //                          a single freshly-ingested article)
 //   $normalize_cmd    -- link normalizer command (normalize_links.py $wiki_dir)
-//   $complete_bib_cmd -- bibliography completer command (complete_bib.py $wiki_dir)
+//   $footnotes_cmd    -- footnote converter command (footnotes.py $wiki_dir)
 //   $validate_cmd     -- structural validator command (validate_wiki.py $wiki_dir)
 //   $max_cycles       -- hard iteration bound (LLM-judged loops MUST be bounded)
 //
@@ -54,14 +54,14 @@ digraph wiki_weaver_inner {
         tool_command="$normalize_cmd"
     ]
 
-    // COMPLETE_BIB (code, deterministic): backfill any bibliography entry that a
-    // page cites inline but is missing from its ## Sources section. Harvests the
-    // best entry from the corpus; falls back to the registry filename title.
-    // Always exits 0 (idempotent completer — no backup in pipeline mode).
-    complete_bib [
+    // FOOTNOTES (code, deterministic): convert inline [N] citations to [^N]
+    // Obsidian footnote refs and bibliography bullets to [^N]: footnote defs.
+    // Backfills any missing defs from the corpus harvest; falls back to the
+    // registry filename title. Always exits 0 (idempotent — no backup in pipeline mode).
+    footnotes [
         shape=parallelogram,
-        label="Complete Bibliography",
-        tool_command="$complete_bib_cmd"
+        label="Footnote Citations",
+        tool_command="$footnotes_cmd"
     ]
 
     // VALIDATE (code, deterministic): the Tier-1 structural graders.
@@ -107,8 +107,8 @@ digraph wiki_weaver_inner {
 
     start -> ingest
     ingest -> normalize
-    normalize -> complete_bib
-    complete_bib -> validate
+    normalize -> footnotes
+    footnotes -> validate
 
     // VALIDATE routes BOTH outcomes explicitly. A tool node that exits non-zero
     // produces outcome=fail; the engine's fail-fast rule means it will ONLY
