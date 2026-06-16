@@ -1,7 +1,8 @@
 // wiki-weaver-inner.dot -- Integrate ONE source into the wiki, until coherent.
 //
-// The inner attractor loop: ingest -> normalize (deterministic) -> validate
-// (structural, code) -> assess (quality, LLM, against the shared rubric) ->
+// The inner attractor loop: ingest -> normalize (deterministic) ->
+// complete_bib (deterministic) -> validate (structural, code) ->
+// assess (quality, LLM, against the shared rubric) ->
 // converged? -> (refine) feedback -> loop_restart.
 // Specialized clone of convergence-factory.dot.
 //
@@ -9,16 +10,17 @@
 // wraps this as a folder sub-pipeline once this is proven on real sources.
 //
 // Required context variables (inject via parent context.* or --context):
-//   $source_path   -- the raw source article to integrate this cycle
-//   $wiki_dir      -- the wiki directory (persistent artifact, survives loop_restart)
-//   $schema_path   -- path to SCHEMA.md (the page contract)
+//   $source_path      -- the raw source article to integrate this cycle
+//   $wiki_dir         -- the wiki directory (persistent artifact, survives loop_restart)
+//   $schema_path      -- path to SCHEMA.md (the page contract)
 //   $convergence_rubric -- path to CONVERGENCE_RUBRIC.md (assess's per-SOURCE
 //                          gate: "is THIS one source well integrated?" -- NOT the
 //                          whole-corpus eval rubric, which votes refine forever on
 //                          a single freshly-ingested article)
-//   $normalize_cmd -- link normalizer command (normalize_links.py $wiki_dir)
-//   $validate_cmd  -- structural validator command (validate_wiki.py $wiki_dir)
-//   $max_cycles    -- hard iteration bound (LLM-judged loops MUST be bounded)
+//   $normalize_cmd    -- link normalizer command (normalize_links.py $wiki_dir)
+//   $complete_bib_cmd -- bibliography completer command (complete_bib.py $wiki_dir)
+//   $validate_cmd     -- structural validator command (validate_wiki.py $wiki_dir)
+//   $max_cycles       -- hard iteration bound (LLM-judged loops MUST be bounded)
 //
 // State lives on the FILESYSTEM ($wiki_dir, .ai/feedback/, .ai/assessment.md)
 // because loop_restart resets context.
@@ -50,6 +52,16 @@ digraph wiki_weaver_inner {
         shape=parallelogram,
         label="Normalize Links",
         tool_command="$normalize_cmd"
+    ]
+
+    // COMPLETE_BIB (code, deterministic): backfill any bibliography entry that a
+    // page cites inline but is missing from its ## Sources section. Harvests the
+    // best entry from the corpus; falls back to the registry filename title.
+    // Always exits 0 (idempotent completer — no backup in pipeline mode).
+    complete_bib [
+        shape=parallelogram,
+        label="Complete Bibliography",
+        tool_command="$complete_bib_cmd"
     ]
 
     // VALIDATE (code, deterministic): the Tier-1 structural graders.
@@ -95,7 +107,8 @@ digraph wiki_weaver_inner {
 
     start -> ingest
     ingest -> normalize
-    normalize -> validate
+    normalize -> complete_bib
+    complete_bib -> validate
 
     // VALIDATE routes BOTH outcomes explicitly. A tool node that exits non-zero
     // produces outcome=fail; the engine's fail-fast rule means it will ONLY

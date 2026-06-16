@@ -41,6 +41,7 @@ INNER_DOT = PIPELINE_DIR / "wiki-weaver-inner.dot"
 SCHEMA_PATH = PIPELINE_DIR / "SCHEMA.md"
 VALIDATE_PY = PIPELINE_DIR / "validate_wiki.py"
 NORMALIZE_PY = PIPELINE_DIR / "normalize_links.py"
+COMPLETE_BIB_PY = PIPELINE_DIR / "complete_bib.py"
 # RESERVED FOR EVAL GRADING ONLY. The scenario rubric grades the WHOLE finished
 # corpus wiki (all sources, the A/B test). It is the WRONG bar for the inner
 # per-source loop: a single freshly-ingested article can never satisfy
@@ -192,6 +193,7 @@ def build_dot(
         validate_cmd += f" --config {policy.validator_config_path}"
 
     normalize_cmd = f"{sys.executable} {NORMALIZE_PY} {wiki_dir}"
+    complete_bib_cmd = f"{sys.executable} {COMPLETE_BIB_PY} {wiki_dir}"
 
     substitutions = {
         "$source_path": str(source_path),
@@ -207,6 +209,7 @@ def build_dot(
         # by the inner pipeline's assess node (kept reserved for the eval grader).
         "$rubric_path": str(RUBRIC_PATH),
         "$normalize_cmd": normalize_cmd,
+        "$complete_bib_cmd": complete_bib_cmd,
         "$validate_cmd": validate_cmd,
         "$max_cycles": str(policy.max_cycles),
         "$source_id": str(source_id),
