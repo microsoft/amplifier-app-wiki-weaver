@@ -39,10 +39,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# Absolute paths to the archive and fail CLI scripts (sibling scripts in cli/).
+# Absolute paths to the archive, fail, and tamper-check CLI scripts (sibling scripts in cli/).
 _CLI_DIR = Path(__file__).resolve().parent
 INGEST_ARCHIVE_PY = _CLI_DIR / "ingest_archive.py"
 INGEST_FAIL_PY = _CLI_DIR / "ingest_fail.py"
+INGEST_TAMPER_CHECK_PY = _CLI_DIR / "ingest_tamper_check.py"
 
 
 def main() -> int:
@@ -74,7 +75,12 @@ def main() -> int:
     # Import the library functions and engine constants lazily so
     # init/lint/doctor do not pay the cost of loading them.
     from cli.engine_runner import FOOTNOTES_PY, NORMALIZE_PY, VALIDATE_PY
-    from cli.lib import _assign_source_id, _looks_like_text, _processed_sources
+    from cli.lib import (
+        _assign_source_id,
+        _looks_like_text,
+        _processed_sources,
+        _snapshot_process_state,
+    )
     from cli.policy import load_policy
 
     policy = load_policy(wiki_dir)
@@ -125,6 +131,27 @@ def main() -> int:
     archive_cmd = f"{sys.executable} {INGEST_ARCHIVE_PY} {wiki_dir} {src} {source_id}"
     fail_cmd = f"{sys.executable} {INGEST_FAIL_PY} {wiki_dir} {src}"
 
+    # Snapshot process state BEFORE synthesis so the tamper-check node can
+    # detect any ledger lines or archive moves the LLM performed during synthesis
+    # (which are CLI-exclusive operations).  The snapshot is serialised to a
+    # per-source JSON file and its path is embedded in tamper_check_cmd so the
+    # tamper_check node can read it without any additional context keys.
+    ledger_lines_before, archive_files_before = _snapshot_process_state(wiki_dir)
+    snapshot_path = wiki_dir / ".ai" / f".tamper_snapshot_{source_id}.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "ledger_lines": ledger_lines_before,
+                "archive_files": sorted(archive_files_before),
+            }
+        ),
+        encoding="utf-8",
+    )
+    tamper_check_cmd = (
+        f"{sys.executable} {INGEST_TAMPER_CHECK_PY} {wiki_dir} {snapshot_path}"
+    )
+
     result = {
         "has_source": "true",
         "source_path": str(src),
@@ -139,6 +166,7 @@ def main() -> int:
         "validate_cmd": validate_cmd,
         "archive_cmd": archive_cmd,
         "fail_cmd": fail_cmd,
+        "tamper_check_cmd": tamper_check_cmd,
     }
     # Single JSON object, exactly as parse_json="true" expects.
     print(json.dumps(result))

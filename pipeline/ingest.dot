@@ -1,7 +1,8 @@
 // ingest.dot -- Full inbox DRAIN loop via synthesize.dot.
 //
 // Drains the _inbox/ in a single run: picks one source, synthesizes it,
-// archives or fails it, then loops back to setup until the inbox is empty.
+// tamper-checks it, archives or fails it, then loops back to setup until
+// the inbox is empty.
 //
 // Compile-time tokens substituted by run_ingest() before handing to the engine:
 //   $setup_cmd         -- absolute path command to cli/ingest_setup.py
@@ -10,16 +11,19 @@
 //                         if this limit trips the engine fails loud, which is
 //                         the correct behaviour -- a bug would spin forever
 //                         otherwise.
+//   $clear_synthesize_cmd -- rm -f for the child synthesize checkpoint
 //
 // Context keys produced by the setup node (via parse_json="true") and consumed
-// by synthesize.dot as $var references:
+// by subsequent nodes via $var references:
 //   has_source, source_path, source_id, wiki_dir, validation_report,
 //   schema_path, convergence_rubric, max_cycles,
-//   normalize_cmd, footnotes_cmd, validate_cmd, archive_cmd, fail_cmd
+//   normalize_cmd, footnotes_cmd, validate_cmd,
+//   archive_cmd, fail_cmd, tamper_check_cmd
 //
 // Drain-loop semantics:
 //   setup emits has_source=false  -> done (inbox drained, clean exit)
-//   setup emits has_source=true   -> synthesize -> archive or fail_handler
+//   setup emits has_source=true   -> synthesize -> tamper_check -> archive or fail_handler
+//   tamper detected               -> fail_handler (source -> _failed/, undo tamper)
 //   archive/fail_handler          -> setup (loop_restart="true")
 
 digraph ingest {
@@ -31,7 +35,8 @@ digraph ingest {
     start [shape=Mdiamond, label="Start"]
 
     // SETUP (deterministic tool): pick next inbox source, assign stable id,
-    // emit JSON context keys for synthesize.dot and the archive/fail commands.
+    // snapshot process state (for tamper detection), emit JSON context keys for
+    // synthesize.dot and the archive/fail/tamper_check commands.
     // Emits has_source=false (inbox empty) or has_source=true (source ready).
     // ALWAYS exits 0 -- inbox empty is the normal drain-complete signal.
     setup [
@@ -67,6 +72,28 @@ digraph ingest {
         dot_file="$synthesize_dot"
     ]
 
+    // TAMPER_CHECK (deterministic tool): reads the before-synthesis snapshot
+    // written by setup (path embedded in $tamper_check_cmd), calls
+    // _detect_and_undo_tamper from cli/lib.py, and emits {"tampered":"false"}
+    // or {"tampered":"true"}.
+    //
+    // Invariant: the ledger (.processed.jsonl) and _archive/ are CLI-exclusive.
+    // The LLM is FORBIDDEN from writing either during synthesis.  If it did,
+    // _detect_and_undo_tamper undoes the damage (truncates fabricated ledger
+    // lines, returns falsely-archived files to the inbox), prints a loud error
+    // to stderr, and emits tampered=true so the router sends this source to
+    // _failed/ instead of _archive/.
+    //
+    // Only fires on the converged path (outcome=success from run_synthesize).
+    // Non-converged sources go directly to fail_handler -- tamper check is
+    // irrelevant when synthesis did not complete.
+    tamper_check [
+        shape=parallelogram,
+        label="Tamper check",
+        tool_command="$tamper_check_cmd",
+        parse_json="true"
+    ]
+
     // ARCHIVE (deterministic tool): move source -> _archive/, append ledger,
     // mark ingested in .sources.json. Uses $archive_cmd from context (set by
     // setup for the current source).
@@ -76,8 +103,8 @@ digraph ingest {
         tool_command="$archive_cmd"
     ]
 
-    // FAIL_HANDLER (deterministic tool): move non-converged source -> _failed/
-    // so the inbox shrinks and the drain loop continues cleanly.
+    // FAIL_HANDLER (deterministic tool): move non-converged or tampered source
+    // -> _failed/ so the inbox shrinks and the drain loop continues cleanly.
     // Uses $fail_cmd from context (set by setup for the current source).
     fail_handler [
         shape=parallelogram,
@@ -99,12 +126,19 @@ digraph ingest {
     clear_synthesize_state -> run_synthesize
 
     // RUN_SYNTHESIZE routes:
-    //   converged  -> archive (write process state, then loop back)
+    //   converged  -> tamper_check (verify LLM did not write process state)
     //   everything else -> fail_handler (non-convergence, error, unset)
     // The unconditional fallback is the fail-safe direction -- more drain,
     // never premature done.
-    run_synthesize -> archive      [label="converged",           condition="outcome=success"]
+    run_synthesize -> tamper_check [label="converged",           condition="outcome=success"]
     run_synthesize -> fail_handler [label="else (non-converged)"]
+
+    // TAMPER_CHECK routes EXHAUSTIVELY.
+    // Clean path: archive (write process state, then loop back).
+    // Tamper path: fail_handler (source goes to _failed/, tamper already undone).
+    tamper_check -> archive      [label="clean",               condition="context.tampered=false"]
+    tamper_check -> fail_handler [label="tampered",            condition="context.tampered=true"]
+    tamper_check -> fail_handler [label="else (unexpected -> fail)"]
 
     // Loop back to drain the next source.
     // Both edges use loop_restart="true" so the engine restarts the outer
