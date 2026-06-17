@@ -32,9 +32,11 @@ sys.path.insert(0, str(_REPO / "pipeline"))
 from cli.policy import WikiPolicy, _DEF_MODEL, _DEF_PROVIDER, load_policy  # noqa: E402
 from cli.engine_runner import (  # noqa: E402
     CONVERGENCE_RUBRIC_PATH,
+    FOOTNOTES_PY,
     INNER_DOT,
     LLM_NODE_IDS,
     MODEL,
+    NORMALIZE_PY,
     PROVIDER,
     REASONING_EFFORT,
     RUBRIC_PATH,
@@ -99,6 +101,8 @@ def _build_dot_pre_phase_d(
     validate_cmd = (
         f"{_sys.executable} {VALIDATE_PY} {wiki_dir} --out {validation_report}"
     )
+    normalize_cmd = f"{_sys.executable} {NORMALIZE_PY} {wiki_dir}"
+    footnotes_cmd = f"{_sys.executable} {FOOTNOTES_PY} {wiki_dir}"
     substitutions = {
         "$source_path": str(source_path),
         "$wiki_dir": str(wiki_dir),
@@ -106,6 +110,8 @@ def _build_dot_pre_phase_d(
         "$schema_path": str(SCHEMA_PATH),
         "$convergence_rubric": str(CONVERGENCE_RUBRIC_PATH),
         "$rubric_path": str(RUBRIC_PATH),
+        "$normalize_cmd": normalize_cmd,
+        "$footnotes_cmd": footnotes_cmd,
         "$validate_cmd": validate_cmd,
         "$max_cycles": str(max_cycles),
         "$source_id": str(source_id),
