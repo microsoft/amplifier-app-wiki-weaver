@@ -40,6 +40,8 @@ PIPELINE_DIR = WIKI_WEAVER_ROOT / "pipeline"
 INNER_DOT = PIPELINE_DIR / "synthesize.dot"
 # ingest.dot: the parent DAG that invokes synthesize.dot as a folder sub-pipeline.
 INGEST_DOT = PIPELINE_DIR / "ingest.dot"
+# ask.dot: the single-node ask pipeline (static DOT with $var tokens).
+ASK_DOT = PIPELINE_DIR / "ask.dot"
 # ingest_setup.py: the tool node that picks the next inbox source + assigns a
 # stable id before the synthesize.dot folder sub-pipeline runs.
 INGEST_SETUP_PY = Path(__file__).resolve().parent / "ingest_setup.py"
@@ -701,6 +703,50 @@ def build_ask_dot(
     return "\n".join(lines)
 
 
+def build_ask_dot_from_file(
+    wiki_dir: Path,
+    question: str,
+    answer_file: Path,
+    *,
+    provider: str = PROVIDER,
+    model: str = MODEL,
+) -> str:
+    """Build the ask DOT pipeline by reading pipeline/ask.dot and substituting tokens.
+
+    Mirrors build_ask_dot() but reads the static ASK_DOT template rather than
+    building the DOT as a Python string.  The two functions are byte-identical for
+    the same inputs.
+
+    Token substitution:
+      $wiki_dir    -> str(wiki_dir.resolve())
+      $sources_json -> str(wiki_dir / ".sources.json")
+      $answer_file -> str(answer_file)
+      $question    -> _dot_escape_prompt(question)   (DOT-escaping for the prompt context)
+
+    The template bakes llm_provider="anthropic" / llm_model="claude-sonnet-4-6".
+    If policy differs, those values are replaced with the supplied provider/model.
+    """
+    wiki_abs = str(wiki_dir.resolve())
+    sources_json = str(wiki_dir / ".sources.json")
+    answer_file_s = str(answer_file)
+
+    dot = ASK_DOT.read_text(encoding="utf-8")
+
+    # Substitute path tokens — plain Linux paths, no DOT-escaping needed.
+    dot = dot.replace("$wiki_dir", wiki_abs)
+    dot = dot.replace("$sources_json", sources_json)
+    dot = dot.replace("$answer_file", answer_file_s)
+    # Question is user-supplied and may contain DOT-special chars; escape before injecting.
+    dot = dot.replace("$question", _dot_escape_prompt(question))
+
+    # Apply provider/model override — replace the baked defaults unconditionally so
+    # the call is always correct regardless of env-var PROVIDER/MODEL values.
+    dot = dot.replace('llm_provider="anthropic"', f'llm_provider="{provider}"')
+    dot = dot.replace('llm_model="claude-sonnet-4-6"', f'llm_model="{model}"')
+
+    return dot
+
+
 async def _run_ask_pipeline(
     dot_source: str,
     logs_dir: Path,
@@ -770,7 +816,7 @@ def run_ask(
     # Resolve provider/model from the wiki's policy so the model-tier knob
     # (models.ask / models.default) applies to retrieval too.
     _ask_policy = load_policy(wiki_dir)
-    dot_source = build_ask_dot(
+    dot_source = build_ask_dot_from_file(
         wiki_dir,
         question,
         answer_file,

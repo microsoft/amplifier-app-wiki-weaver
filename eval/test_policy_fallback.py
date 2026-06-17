@@ -42,6 +42,8 @@ from cli.engine_runner import (  # noqa: E402
     RUBRIC_PATH,
     SCHEMA_PATH,
     VALIDATE_PY,
+    build_ask_dot,
+    build_ask_dot_from_file,
     build_dot,
 )
 from validate_wiki import (  # noqa: E402
@@ -326,6 +328,56 @@ class TestBuildDotByteIdentical:
         dot = build_dot(src, wiki, policy)
         assert f"--config {vcfg}" in dot, (
             "Project policy must inject --config <validator.yaml> into validate_cmd"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Group 2b — ask DOT byte-identical
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAskDotByteIdentical:
+    """build_ask_dot_from_file must be BYTE-IDENTICAL to build_ask_dot for the
+    same inputs.  All tests are deterministic — no LLM, no network, no API key."""
+
+    def test_default_inputs_byte_identical(self, tmp_path: Path) -> None:
+        """Simple question, default provider/model."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        af = tmp_path / "ans.json"
+        question = "what is a wiki?"
+        assert build_ask_dot(wiki, question, af) == build_ask_dot_from_file(
+            wiki, question, af
+        ), "build_ask_dot_from_file must be byte-identical to build_ask_dot"
+
+    def test_question_with_double_quotes_byte_identical(self, tmp_path: Path) -> None:
+        """Question containing double-quotes (DOT-special) must be escaped identically."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        af = tmp_path / "ans.json"
+        question = 'what does "idempotent" mean in this context?'
+        assert build_ask_dot(wiki, question, af) == build_ask_dot_from_file(
+            wiki, question, af
+        )
+
+    def test_question_with_newline_byte_identical(self, tmp_path: Path) -> None:
+        """Question containing a literal newline (DOT-special) must be escaped identically."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        af = tmp_path / "ans.json"
+        question = "first line\nsecond line of the question"
+        assert build_ask_dot(wiki, question, af) == build_ask_dot_from_file(
+            wiki, question, af
+        )
+
+    def test_question_with_backslash_byte_identical(self, tmp_path: Path) -> None:
+        """Question containing a backslash (DOT-special) must be escaped identically."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        af = tmp_path / "ans.json"
+        question = r"what is path\to\knowledge?"
+        assert build_ask_dot(wiki, question, af) == build_ask_dot_from_file(
+            wiki, question, af
         )
 
 

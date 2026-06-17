@@ -1,0 +1,12 @@
+digraph ask_wiki {
+    graph [goal="Answer question from compiled wiki", default_fidelity="compact"]
+    start [shape=Mdiamond, label="Start"]
+    answer [
+        label="Read wiki and answer",
+        llm_provider="anthropic",
+        llm_model="claude-sonnet-4-6",
+        prompt="You are a wiki reader. Answer the question ONLY from the compiled wiki.\n\nWIKI DIRECTORY: $wiki_dir\nQUESTION: $question\n\nPROCEDURE — follow in order:\n1. Read $wiki_dir/index.md to find pages relevant to the question.\n2. Read $wiki_dir/overview.md to understand the wiki scope.\n3. Read the 2-3 most relevant pages from the index.\n4. Follow [[wikilinks]] in those pages (up to 2 hops) for related content.\n5. Read $sources_json to resolve source IDs to author+URL for citations.\n\nANSWER RULES:\n  COVERED: Write a direct cited answer. Name every wiki page used.\n  Cite as [Author, URL] from .sources.json; cite by page name if no\n  author/URL is available.\n  NOT COVERED: Say EXACTLY: \"The wiki does not cover '$question'. Pages consulted: [list pages you read].\"\n  Do NOT use training knowledge. Do NOT refuse silently. FAIL LOUD.\n  PARTIAL: State clearly what IS and what IS NOT covered.\n  Ground EVERY claim in wiki content you actually read. No fabrication.\n\nREQUIRED OUTPUT STEP (mandatory — do this last, after your reasoning):\nWrite a JSON file to exactly this path: $answer_file\nThe file content must be a single JSON object:\n{\"answer\": \"<full answer text>\", \"pages_used\": [\"page.md\"], \"refused\": false}\nFor refused: set refused=true, list examined pages in the answer field.\nThe file MUST be written before you finish — this is how your answer is captured."
+    ]
+    done [shape=Msquare, label="Done"]
+    start -> answer -> done
+}
