@@ -1,33 +1,39 @@
-// ingest.dot -- Increment 1: ingest ONE inbox source via synthesize.dot.
+// ingest.dot -- Full inbox DRAIN loop via synthesize.dot.
 //
-// Minimal parent DAG:
-//   setup (tool, deterministic) -- picks next inbox source, assigns stable id,
-//                                   publishes JSON context for synthesize.dot.
-//   run_synthesize (folder)     -- runs synthesize.dot as a sub-pipeline;
-//                                   child inherits the setup context keys.
+// Drains the _inbox/ in a single run: picks one source, synthesizes it,
+// archives or fails it, then loops back to setup until the inbox is empty.
 //
 // Compile-time tokens substituted by run_ingest() before handing to the engine:
-//   $setup_cmd       -- absolute path command to cli/ingest_setup.py
-//   $synthesize_dot  -- absolute path to pipeline/synthesize.dot
+//   $setup_cmd         -- absolute path command to cli/ingest_setup.py
+//   $synthesize_dot    -- absolute path to pipeline/synthesize.dot
+//   $max_drain_iters   -- safety bound (generous multiple of inbox size);
+//                         if this limit trips the engine fails loud, which is
+//                         the correct behaviour -- a bug would spin forever
+//                         otherwise.
 //
 // Context keys produced by the setup node (via parse_json="true") and consumed
 // by synthesize.dot as $var references:
-//   source_path, source_id, wiki_dir, validation_report,
+//   has_source, source_path, source_id, wiki_dir, validation_report,
 //   schema_path, convergence_rubric, max_cycles,
-//   normalize_cmd, footnotes_cmd, validate_cmd
+//   normalize_cmd, footnotes_cmd, validate_cmd, archive_cmd, fail_cmd
 //
-// NOT YET in this increment: drain loop, tamper check, archive, ledger write.
-// Those ride in Increment 2 once folder composition is proven end-to-end.
+// Drain-loop semantics:
+//   setup emits has_source=false  -> done (inbox drained, clean exit)
+//   setup emits has_source=true   -> synthesize -> archive or fail_handler
+//   archive/fail_handler          -> setup (loop_restart="true")
 
 digraph ingest {
     graph [
-        goal="Ingest one inbox source into the wiki via synthesize.dot"
+        goal="Drain the inbox: ingest all sources via synthesize.dot",
+        default_max_retry="$max_drain_iters"
     ]
 
     start [shape=Mdiamond, label="Start"]
 
     // SETUP (deterministic tool): pick next inbox source, assign stable id,
-    // emit JSON context keys for synthesize.dot to consume.
+    // emit JSON context keys for synthesize.dot and the archive/fail commands.
+    // Emits has_source=false (inbox empty) or has_source=true (source ready).
+    // ALWAYS exits 0 -- inbox empty is the normal drain-complete signal.
     setup [
         shape=parallelogram,
         label="Setup: pick source + assign id",
@@ -35,16 +41,74 @@ digraph ingest {
         parse_json="true"
     ]
 
+    // CLEAR_SYNTHESIZE_STATE: delete the subgraph checkpoint left by the
+    // previous loop iteration so the child pipeline always starts fresh.
+    //
+    // Why: PipelineHandler creates child logs at {run_dir}/subgraph_{node.id}.
+    // The directory is reused across loop iterations (exist_ok=True), so the
+    // checkpoint written by iteration 1 is found by iteration 2's child engine,
+    // which fingerprint-matches synthesize.dot (unchanged), restores stale
+    // context (source_id=1), and exits immediately without doing real work.
+    // This rm -f runs before every run_synthesize invocation; -f means exit 0
+    // on first iteration when the file does not yet exist.
+    // $clear_synthesize_cmd is substituted at compile-time by run_ingest().
+    clear_synthesize_state [
+        shape=parallelogram,
+        label="Clear synthesize state",
+        tool_command="$clear_synthesize_cmd"
+    ]
+
     // RUN_SYNTHESIZE (folder sub-pipeline): runs synthesize.dot with the
-    // context keys produced by the setup node.  The child context is a clone
-    // of the parent context, so $source_path/$wiki_dir/etc. resolve directly.
+    // context keys produced by the setup node. Child inherits context clone,
+    // so $source_path/$wiki_dir/etc. resolve directly inside the child.
     run_synthesize [
         shape=folder,
         label="Synthesize source",
         dot_file="$synthesize_dot"
     ]
 
+    // ARCHIVE (deterministic tool): move source -> _archive/, append ledger,
+    // mark ingested in .sources.json. Uses $archive_cmd from context (set by
+    // setup for the current source).
+    archive [
+        shape=parallelogram,
+        label="Archive source",
+        tool_command="$archive_cmd"
+    ]
+
+    // FAIL_HANDLER (deterministic tool): move non-converged source -> _failed/
+    // so the inbox shrinks and the drain loop continues cleanly.
+    // Uses $fail_cmd from context (set by setup for the current source).
+    fail_handler [
+        shape=parallelogram,
+        label="Route to _failed/",
+        tool_command="$fail_cmd"
+    ]
+
     done [shape=Msquare, label="Done"]
 
-    start -> setup -> run_synthesize -> done
+    start -> setup
+
+    // SETUP routes EXHAUSTIVELY (no dead-end).
+    // Conditional edges are tried first; the single unconditional fallback
+    // (else) is the safety net for any unexpected state.
+    setup -> done                   [label="inbox empty",          condition="context.has_source=false"]
+    setup -> clear_synthesize_state [label="source ready",         condition="context.has_source=true"]
+    setup -> done                   [label="else (unexpected -> done)"]
+
+    clear_synthesize_state -> run_synthesize
+
+    // RUN_SYNTHESIZE routes:
+    //   converged  -> archive (write process state, then loop back)
+    //   everything else -> fail_handler (non-convergence, error, unset)
+    // The unconditional fallback is the fail-safe direction -- more drain,
+    // never premature done.
+    run_synthesize -> archive      [label="converged",           condition="outcome=success"]
+    run_synthesize -> fail_handler [label="else (non-converged)"]
+
+    // Loop back to drain the next source.
+    // Both edges use loop_restart="true" so the engine restarts the outer
+    // loop counter cleanly on each successful or failed source.
+    archive      -> setup [loop_restart="true"]
+    fail_handler -> setup [loop_restart="true"]
 }

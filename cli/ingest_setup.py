@@ -8,6 +8,10 @@ ingest.dot consumes this output: it runs the command, parses stdout as
 JSON, and deposits each key into the engine's shared context so the
 child synthesize.dot pipeline can reference them as $source_path, etc.
 
+When no ready source is found (inbox empty OR all files still within the
+2-second debounce window), exits 0 and prints {"has_source":"false"}.
+This is the NORMAL drain-complete signal, NOT an error.
+
 Usage:
     python <this_file> <inbox_or_wiki_dir> <wiki_dir>
 
@@ -17,7 +21,8 @@ Usage:
                           directly.
     wiki_dir           -- the wiki root (registry, policy, etc.)
 
-Exits non-zero with a message on stderr when no ready source is found.
+Exits non-zero ONLY on hard errors (bad args, missing wiki_dir).
+Inbox empty or debounce → exit 0 with {"has_source":"false"}.
 """
 
 from __future__ import annotations
@@ -33,6 +38,11 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+# Absolute paths to the archive and fail CLI scripts (sibling scripts in cli/).
+_CLI_DIR = Path(__file__).resolve().parent
+INGEST_ARCHIVE_PY = _CLI_DIR / "ingest_archive.py"
+INGEST_FAIL_PY = _CLI_DIR / "ingest_fail.py"
 
 
 def main() -> int:
@@ -57,8 +67,9 @@ def main() -> int:
     inbox = candidate_inbox if candidate_inbox.is_dir() else inbox_or_wiki
 
     if not inbox.is_dir():
-        print(f"ERROR: inbox not found: {inbox}", file=sys.stderr)
-        return 1
+        # No inbox at all → treat as drain-complete (not a hard error).
+        print(json.dumps({"has_source": "false"}))
+        return 0
 
     # Import the library functions and engine constants lazily so
     # init/lint/doctor do not pay the cost of loading them.
@@ -92,8 +103,9 @@ def main() -> int:
         break
 
     if src is None:
-        print("ERROR: no ready source found in inbox", file=sys.stderr)
-        return 1
+        # Inbox empty or all sources already ingested → drain complete.
+        print(json.dumps({"has_source": "false"}))
+        return 0
 
     # Build the JSON context block that synthesize.dot needs.
     # Keys mirror the $var substitutions that build_dot() makes in the
@@ -108,7 +120,13 @@ def main() -> int:
     normalize_cmd = f"{sys.executable} {NORMALIZE_PY} {wiki_dir}"
     footnotes_cmd = f"{sys.executable} {FOOTNOTES_PY} {wiki_dir}"
 
+    # Fully-formed archive and fail commands, constructed with sys.executable
+    # so they run in the same interpreter that launched this script.
+    archive_cmd = f"{sys.executable} {INGEST_ARCHIVE_PY} {wiki_dir} {src} {source_id}"
+    fail_cmd = f"{sys.executable} {INGEST_FAIL_PY} {wiki_dir} {src}"
+
     result = {
+        "has_source": "true",
         "source_path": str(src),
         "source_id": str(source_id),
         "wiki_dir": str(wiki_dir),
@@ -119,6 +137,8 @@ def main() -> int:
         "normalize_cmd": normalize_cmd,
         "footnotes_cmd": footnotes_cmd,
         "validate_cmd": validate_cmd,
+        "archive_cmd": archive_cmd,
+        "fail_cmd": fail_cmd,
     }
     # Single JSON object, exactly as parse_json="true" expects.
     print(json.dumps(result))

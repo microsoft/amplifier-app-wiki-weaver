@@ -43,6 +43,10 @@ INGEST_DOT = PIPELINE_DIR / "ingest.dot"
 # ingest_setup.py: the tool node that picks the next inbox source + assigns a
 # stable id before the synthesize.dot folder sub-pipeline runs.
 INGEST_SETUP_PY = Path(__file__).resolve().parent / "ingest_setup.py"
+# ingest_archive.py: the archive tool node (post-convergence process-state write).
+INGEST_ARCHIVE_PY = Path(__file__).resolve().parent / "ingest_archive.py"
+# ingest_fail.py: the fail-route tool node (non-convergence; moves to _failed/).
+INGEST_FAIL_PY = Path(__file__).resolve().parent / "ingest_fail.py"
 SCHEMA_PATH = PIPELINE_DIR / "SCHEMA.md"
 VALIDATE_PY = PIPELINE_DIR / "validate_wiki.py"
 NORMALIZE_PY = PIPELINE_DIR / "normalize_links.py"
@@ -974,20 +978,31 @@ def run_ingest(
     wiki_dir: str | Path,
     max_cycles: int | None = None,
 ) -> InnerResult:
-    """Run the ingest pipeline for the next inbox source via ingest.dot.
+    """Run the full inbox DRAIN loop via ingest.dot.
 
-    ``ingest.dot`` orchestrates:
-      1. A setup tool node (ingest_setup.py) that picks the next inbox source
-         and assigns a stable source id, publishing context keys as JSON.
+    ``ingest.dot`` orchestrates a full drain of _inbox/ in a single engine run:
+      1. A setup tool node (ingest_setup.py) that picks the next inbox source,
+         assigns a stable source id, and publishes context keys as JSON
+         (including has_source, archive_cmd, fail_cmd, and synthesize keys).
+         Returns has_source=false when the inbox is empty -- the normal
+         drain-complete signal.
       2. A folder sub-pipeline (synthesize.dot) that integrates the source,
-         inheriting the context keys from step 1.
+         inheriting all context keys from step 1.
+      3. An archive tool node (ingest_archive.py) on convergence -- moves the
+         source to _archive/, appends the ledger, marks ingested in .sources.json.
+      4. A fail_handler tool node (ingest_fail.py) on non-convergence -- moves
+         the source to _failed/ so the inbox keeps shrinking.
+      5. loop_restart back to setup until has_source=false.
 
-    This is the first increment: no drain / tamper-check / archive yet.
-    Those ride in subsequent increments once the composition is proven.
+    Safety bound: ``max_drain_iters`` is computed as max(20, inbox_count * 5)
+    and substituted into ingest.dot's ``default_max_retry`` graph attribute.
+    If the engine hits the bound it fails loudly -- a bug would spin forever
+    otherwise.  For a 7-source inbox the bound is 35; well clear of normal
+    operation but finite.
 
-    ``max_cycles`` is currently unused (the policy is read by ingest_setup.py
-    and passed as a context key into synthesize.dot). Retained for API
-    symmetry with run_inner.
+    ``max_cycles`` is unused (the policy is read by ingest_setup.py and
+    passed as a context key into synthesize.dot). Retained for API symmetry
+    with run_inner.
     """
     import sys
 
@@ -995,18 +1010,44 @@ def run_ingest(
     if not wiki_dir.is_dir():
         raise FileNotFoundError(f"wiki dir not found: {wiki_dir}")
 
+    # Compute a generous-but-finite loop safety bound based on the current
+    # inbox size.  Each drain cycle (one source) uses one loop_restart, so
+    # a 7-source inbox needs 7 iterations; the 5x multiplier gives headroom
+    # for retries and partial-failure recovery while keeping it finite.
+    # The bound is substituted into ingest.dot as default_max_retry.
+    inbox = wiki_dir / "_inbox"
+    if inbox.is_dir():
+        inbox_count = sum(
+            1 for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
+        )
+    else:
+        inbox_count = 0
+    max_drain_iters = max(20, inbox_count * 5)
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     logs_dir = wiki_dir / ".runs" / f"ingest-{timestamp}"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Substitute compile-time tokens in ingest.dot (paths that must be
-    # absolute concrete values, NOT expanded from engine context).
+    # Substitute compile-time tokens in ingest.dot (paths and bounds that
+    # must be concrete values, not expanded from engine context).
     dot_template = INGEST_DOT.read_text(encoding="utf-8")
     setup_cmd = f"{sys.executable} {INGEST_SETUP_PY} {wiki_dir} {wiki_dir}"
     synthesize_dot_abs = str(INNER_DOT)
 
+    # The engine names child pipeline logs {logs_dir}/subgraph_{node.id}.
+    # On loop iterations 2+, the child engine finds the checkpoint written by
+    # iteration 1 there, fingerprint-matches synthesize.dot (unchanged), restores
+    # stale context (source_id=1), and exits immediately without doing any work.
+    # Fix: delete that checkpoint before every run_synthesize invocation.
+    synthesize_checkpoint = str(
+        logs_dir / "subgraph_run_synthesize" / "checkpoint.json"
+    )
+    clear_synthesize_cmd = f"rm -f {synthesize_checkpoint}"
+
     dot_source = dot_template.replace("$setup_cmd", setup_cmd)
     dot_source = dot_source.replace("$synthesize_dot", synthesize_dot_abs)
+    dot_source = dot_source.replace("$max_drain_iters", str(max_drain_iters))
+    dot_source = dot_source.replace("$clear_synthesize_cmd", clear_synthesize_cmd)
 
     (logs_dir / "ingest.dot").write_text(dot_source, encoding="utf-8")
 

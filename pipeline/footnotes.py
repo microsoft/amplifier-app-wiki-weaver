@@ -73,6 +73,10 @@ _URL_PAT = re.compile(r"https?://")
 # Strip trailing (Part_One)-style parenthetical noise from fallback titles.
 _TRAILING_PARENS = re.compile(r"\s*\([^)]+\)\s*$")
 
+# YAML frontmatter sources list — for normalization to plain ints.
+# Matches `sources: [...]` so we can strip any leading ^ from each element.
+_FM_SOURCES = re.compile(r"^(sources:\s*\[)([^\]]*)\]")
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -138,6 +142,24 @@ def _code_fence_line_set(lines: list[str]) -> set[int]:
             if stripped.startswith(fence_char * 3):
                 in_fence = False
     return code_lines
+
+
+def _frontmatter_line_set(lines: list[str]) -> set[int]:
+    """Return line indices that are inside (or are) the YAML frontmatter block.
+
+    The frontmatter is the opening `---` block at the very top of the file.
+    Lines 0..N (inclusive) are frontmatter when line 0 is `---` and line N is
+    the closing `---`.  Returns an empty set when no frontmatter is present.
+    """
+    fm_lines: set[int] = set()
+    if not lines or lines[0].strip() != "---":
+        return fm_lines
+    fm_lines.add(0)
+    for i in range(1, len(lines)):
+        fm_lines.add(i)
+        if lines[i].strip() == "---":
+            break
+    return fm_lines
 
 
 def _find_sources_section(lines: list[str]) -> tuple[int, int]:
@@ -248,6 +270,7 @@ def _convert_page_format(
     trailing_newline = text.endswith("\n")
 
     code_lines = _code_fence_line_set(lines)
+    fm_lines = _frontmatter_line_set(lines)
     sec_start, sec_end = _find_sources_section(lines)
 
     new_lines: list[str] = []
@@ -257,6 +280,11 @@ def _convert_page_format(
     for i, line in enumerate(lines):
         # Code fence lines are never touched.
         if i in code_lines:
+            new_lines.append(line)
+            continue
+
+        # Frontmatter lines are never touched (citations belong in body only).
+        if i in fm_lines:
             new_lines.append(line)
             continue
 
@@ -277,6 +305,18 @@ def _convert_page_format(
             # Count net new [^N] instances introduced.
             refs_converted += new_line.count("[^") - line.count("[^")
         new_lines.append(new_line)
+
+    # Normalize sources: [...] in frontmatter to plain ints (strip any ^ carets).
+    # Idempotent: already-plain ints are unchanged.  Runs regardless of how
+    # carets arrived (LLM mirroring footnote style, or a prior conversion pass
+    # that didn't exclude the frontmatter).
+    for i in fm_lines:
+        m = _FM_SOURCES.match(new_lines[i])
+        if m:
+            raw = m.group(2)
+            cleaned = re.sub(r"\^(\d+)", r"\1", raw)
+            if cleaned != raw:
+                new_lines[i] = f"{m.group(1)}{cleaned}]"
 
     new_text = "\n".join(new_lines)
     if trailing_newline:
