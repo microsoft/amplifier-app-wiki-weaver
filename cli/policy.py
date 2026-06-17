@@ -34,7 +34,7 @@ from pathlib import Path
 _PIPELINE = Path(__file__).resolve().parent.parent / "pipeline"
 _DEF_SCHEMA = _PIPELINE / "SCHEMA.md"
 _DEF_RUBRIC = _PIPELINE / "CONVERGENCE_RUBRIC.md"
-_DEF_INNERDOT = _PIPELINE / "wiki-weaver-inner.dot"
+_DEF_INNERDOT = _PIPELINE / "synthesize.dot"
 _DEF_MODEL = os.environ.get("WIKI_WEAVER_MODEL", "claude-sonnet-4-6")
 _DEF_PROVIDER = os.environ.get("WIKI_WEAVER_PROVIDER", "anthropic")
 

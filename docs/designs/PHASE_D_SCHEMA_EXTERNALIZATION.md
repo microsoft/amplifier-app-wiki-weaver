@@ -38,8 +38,8 @@ ledger — all stay fixed engine machinery.
 | `pipeline/CONVERGENCE_RUBRIC.md` | **POLICY** (domain-neutral default) | The C1–C5 quality bar. Generic enough to be the default; overridable when a domain needs a different bar. |
 | `validate_wiki.py` constants `NAV_PAGES`/`REQUIRED_FM`/`META_TYPES` (`:33–36`) | **POLICY** | Which page slugs are nav roots, which frontmatter keys are required, which `type:`s need not cite a source — all depend on the wiki's taxonomy. |
 | `validate_wiki.py` `validate()` body (`:56`) | **MECHANISM** | The structural checks themselves (link resolution, orphans, frontmatter presence, provenance) are generic. |
-| Prompt STRINGS in `wiki-weaver-inner.dot` ingest/assess/feedback nodes | **MIXED — default is engine, override is advanced** | Synthesis language ("weave by theme", "one page per concept") is generic enough to ship as the default; the HARD PROHIBITION (process-state ownership), remediation-first, and focused-slice are mechanism and must NOT be removed. Treat the whole `.dot` as an engine default that a project MAY override wholesale (escape hatch), but the expected override surface is `schema.md`, not the prompts. |
-| `wiki-weaver-inner.dot` node/edge graph, `loop_restart`, `goal_gate`, routing (`:85–107`) | **MECHANISM** | Attractor control flow. Fixed. |
+| Prompt STRINGS in `synthesize.dot` ingest/assess/feedback nodes | **MIXED — default is engine, override is advanced** | Synthesis language ("weave by theme", "one page per concept") is generic enough to ship as the default; the HARD PROHIBITION (process-state ownership), remediation-first, and focused-slice are mechanism and must NOT be removed. Treat the whole `.dot` as an engine default that a project MAY override wholesale (escape hatch), but the expected override surface is `schema.md`, not the prompts. |
+| `synthesize.dot` node/edge graph, `loop_restart`, `goal_gate`, routing (`:79–120`) | **MECHANISM** | Attractor control flow. Fixed. |
 | `engine_runner.py` `PROVIDER`/`MODEL`/`REASONING_EFFORT` (`:81–88`), uniform per-node injection (`:200–205`) | **POLICY (the model-tier knob)** | Today every LLM node gets the *same* model. Per-stage model is a real lever. |
 | `--max-cycles` (`wiki_weaver.py:765`, default 3) | **POLICY (the cycles knob)** | Convergence budget. |
 | Outer sweep loop (`wiki_weaver.cmd_ingest:404`), dedup registry (`_assign_source_id:251`), tamper guard (`_detect_and_undo_tamper:325`), ledger/archive | **MECHANISM** | Dependability backbone. Fixed. |
@@ -119,7 +119,7 @@ from pathlib import Path
 _PIPELINE = Path(__file__).resolve().parent.parent / "pipeline"
 _DEF_SCHEMA   = _PIPELINE / "SCHEMA.md"
 _DEF_RUBRIC   = _PIPELINE / "CONVERGENCE_RUBRIC.md"
-_DEF_INNERDOT = _PIPELINE / "wiki-weaver-inner.dot"
+_DEF_INNERDOT = _PIPELINE / "synthesize.dot"
 _DEF_MODEL    = os.environ.get("WIKI_WEAVER_MODEL", "claude-sonnet-4-6")
 _DEF_PROVIDER = os.environ.get("WIKI_WEAVER_PROVIDER", "anthropic")
 
@@ -223,7 +223,7 @@ Defaults above are fine; do not block Phase D on the redline.)
 
 A wiki with **no `policy/` dir and no `wiki.config.yaml`** must produce behavior identical to
 pre-Phase-D. `load_policy` returns the built-in default paths, the env/hardcoded model, and
-`max_cycles=3`. `build_dot` reads the same `pipeline/wiki-weaver-inner.dot`, substitutes the
+`max_cycles=3`. `build_dot` reads the same `pipeline/synthesize.dot`, substitutes the
 same `pipeline/SCHEMA.md` + `pipeline/CONVERGENCE_RUBRIC.md`, injects the same uniform model
 (because every stage resolves to `default`), and emits no `--config`. The `validate_wiki.py`
 defaults are unchanged. `runs/corpus` keeps working untouched.
@@ -236,7 +236,7 @@ defaults are unchanged. `runs/corpus` keeps working untouched.
 
 - **`test_policy_fallback.py`**: `load_policy(<tmp wiki, no policy>)` returns
   `schema_path == pipeline/SCHEMA.md`, `convergence_rubric_path == pipeline/CONVERGENCE_RUBRIC.md`,
-  `inner_dot_path == pipeline/wiki-weaver-inner.dot`, `validator_config_path is None`,
+  `inner_dot_path == pipeline/synthesize.dot`, `validator_config_path is None`,
   `provider == "anthropic"`, `model_for("ingest") == "claude-sonnet-4-6"`, `max_cycles == 3`.
 - **Golden-DOT test**: capture `build_dot(src, <wiki, no policy>, 3, source_id=1)` output as a
   committed golden BEFORE the refactor; assert byte-identical AFTER. This is the mechanical

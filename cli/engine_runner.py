@@ -37,7 +37,7 @@ from .policy import WikiPolicy, load_policy
 
 WIKI_WEAVER_ROOT = Path(__file__).resolve().parent.parent
 PIPELINE_DIR = WIKI_WEAVER_ROOT / "pipeline"
-INNER_DOT = PIPELINE_DIR / "wiki-weaver-inner.dot"
+INNER_DOT = PIPELINE_DIR / "synthesize.dot"
 SCHEMA_PATH = PIPELINE_DIR / "SCHEMA.md"
 VALIDATE_PY = PIPELINE_DIR / "validate_wiki.py"
 NORMALIZE_PY = PIPELINE_DIR / "normalize_links.py"
@@ -100,9 +100,8 @@ _ATTRACTOR_REPO_ROOT: Path | None = (
     else None
 )
 
-# LLM-driven node ids in the inner DOT (need an explicit llm_provider so the
-# engine routes them to a child agent). Tool nodes (validate) and routing nodes
-# (check) do not.
+# LLM-driven node ids in the DOT (need an explicit llm_provider so the engine
+# routes them to a child agent). Tool nodes (validate) do not.
 LLM_NODE_IDS = ("ingest", "assess", "feedback")
 
 
