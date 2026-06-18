@@ -176,7 +176,10 @@ def main() -> None:
         "--wiki", default=None, help="also check this wiki's structure"
     )
 
-    p_query = sub.add_parser("query", help="(stub) list pages matching a term")
+    p_query = sub.add_parser(
+        "query",
+        help="naive substring page search; for real cited answers use 'ask'",
+    )
     p_query.add_argument("term")
     p_query.add_argument("--wiki", default=".", help="wiki directory (default: .)")
 

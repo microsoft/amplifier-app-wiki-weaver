@@ -60,9 +60,9 @@ grade_provenance = _grade_mod.grade_provenance
 
 # Representative transcript header — no YAML frontmatter, labeled metadata block
 _TRANSCRIPT_FULL = """\
-# Transcript: Team Pulse Weekly Planning
+# Transcript: Weekly Planning Sync
 
-Source: https://microsoft-my.sharepoint.com/:v:/p/cspark/IQCy_example123
+Source: https://example.com/meetings/weekly-planning-2026-05-29
 Duration: 1:00:50
 Speakers: Chris Park, Alex Rivera, Samuel Lee
 Date: 5/29/2026, 11:07:43 AM
@@ -78,7 +78,7 @@ Attendees: Samuel Lee, Chris Park, Alex Rivera
 
 # Transcript with only Attendees: (no Speakers:) — tests fallback author
 _TRANSCRIPT_ATTENDEES_ONLY = """\
-# Transcript: Team Pulse Stand-up
+# Transcript: Engineering Stand-up
 
 Source: https://example.com/standup-recording
 Date: 6/1/2026, 10:00:00 AM
@@ -140,11 +140,10 @@ class TestParseTranscriptHeader:
         result = _parse_transcript_header(_TRANSCRIPT_FULL)
         assert result["author"] == "Chris Park, Alex Rivera, Samuel Lee"
         assert (
-            result["url"]
-            == "https://microsoft-my.sharepoint.com/:v:/p/cspark/IQCy_example123"
+            result["url"] == "https://example.com/meetings/weekly-planning-2026-05-29"
         )
         assert result["date"] == "5/29/2026, 11:07:43 AM"
-        assert result["title"] == "Team Pulse Weekly Planning"
+        assert result["title"] == "Weekly Planning Sync"
 
     def test_attendees_fallback_author(self):
         """When Speakers: is absent, Attendees: is used as the author."""
@@ -152,7 +151,7 @@ class TestParseTranscriptHeader:
         assert result["author"] == "Alice Chen, Bob Smith"
         assert result["url"] == "https://example.com/standup-recording"
         assert result["date"] == "6/1/2026, 10:00:00 AM"
-        assert result["title"] == "Team Pulse Stand-up"
+        assert result["title"] == "Engineering Stand-up"
 
     def test_plain_file_returns_all_none(self):
         """Plain file with no transcript markers returns all-None (no false positive)."""
@@ -202,8 +201,7 @@ class TestReadSourceFrontmatterWithTranscriptFallback:
         result = _read_source_frontmatter(src)
         assert result["author"] == "Chris Park, Alex Rivera, Samuel Lee"
         assert (
-            result["url"]
-            == "https://microsoft-my.sharepoint.com/:v:/p/cspark/IQCy_example123"
+            result["url"] == "https://example.com/meetings/weekly-planning-2026-05-29"
         )
         assert result["date"] == "5/29/2026, 11:07:43 AM"
 

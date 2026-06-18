@@ -1,39 +1,54 @@
 # Wiki-Weaver — Demo Runbook & Proof
 
-A **code-first** pipeline that turns a pile of raw source articles into a **connected,
-organized, error-free, provenance-tracked** wiki — the Karpathy LLM-wiki / second-brain
-"compounding memory" concept, made real and repeatable. Agents do the judgment work
-(synthesis, quality, remediation); code owns control, validation, archiving, and dedup.
+Compile a pile of source material into a **connected, organized, error-free,
+provenance-tracked** markdown wiki — the Karpathy LLM-wiki / second-brain "compounding memory"
+pattern, made real and repeatable. Agents do the judgment work (schema design, synthesis,
+quality, remediation); code owns control, validation, archiving, and dedup.
 
 ## Demo it (any pile of articles → a wiki)
 
+`wiki-weaver` runs under an Amplifier Python interpreter. Invoke it as `python -m cli <command>`
+from the repo root.
+
 ```bash
-PY=/path/to/amplifier/bin/python3  # python3 from your Amplifier install
+PY=/path/to/amplifier/bin/python3   # python3 from your Amplifier install
 cd wiki-weaver
 
-$PY -m cli doctor                       # env preflight (all green)
-$PY -m cli init   runs/demo/wiki        # new empty wiki
-cp ~/some_articles/*.md runs/demo/wiki/_inbox/   # drop in source material
-$PY -m cli ingest --wiki runs/demo/wiki --max-cycles 5   # weave it in (one source at a time)
-$PY pipeline/validate_wiki.py runs/demo/wiki            # -> PASS (exit 0)
+$PY -m cli doctor                   # env preflight (all green)
+
+# Create a wiki and design a domain-fit schema from your purpose (one LLM call).
+$PY -m cli init mywiki \
+  --purpose "A research second-brain on distributed systems: answer 'which approach for X',
+  compare trade-offs, and track how conclusions evolve as more sources arrive."
+
+cp ~/some_articles/*.md mywiki/_inbox/                  # drop in source material
+$PY -m cli ingest --wiki mywiki --max-cycles 5          # weave it in (one source at a time)
+$PY -m cli ask "what are the trade-offs of X vs Y?" --wiki mywiki   # query the compiled wiki
+$PY -m cli lint --wiki mywiki                           # structural validation -> PASS (exit 0)
 ```
+
+Prefer a generic, no-LLM scaffold? Use `$PY -m cli init mywiki --plain` (free, instant) and
+`ingest`/`ask`/`lint` the same way.
 
 Each source is ingested, structurally validated, quality-assessed, and — only when it
 genuinely converges — archived with a provenance entry. Re-running is idempotent
-(already-ingested sources are deduped by content hash).
+(already-ingested sources are deduped by content hash), so you can keep dropping new files
+into `_inbox/` and re-running `ingest` over time.
 
-## What's proven (evidence, not claims)
+## What's proven (properties, validated this development cycle)
 
-| Property | Evidence |
+> Note: the run directories that produced this evidence are local working artifacts
+> (`runs/` is gitignored) — they don't ship in the repo. Reproduce them with the demo above.
+
+| Property | How it shows up |
 |---|---|
-| **Compounds correctly** | `runs/proof/` (Karpathy cluster): `sources:` accrue `[1]→[1,2]`, pages grow in place, **0 duplicate** concept pages |
-| **Generalizes (not over-fit)** | `runs/holdout/` — a *different* topic (AI-agent long-term memory): 3 articles converge, **0 orphans / 0 broken / 0 dup**, `sources:[1,2,3]` accrual, real synthesis |
-| **Surfaces contradictions** | `runs/contradiction/` — a pro-RAG source vs the anti-RAG page produced an `## Open Tensions` section with **both sides + provenance**, not averaged |
-| **Error-free** | structural validator (links, orphans, frontmatter, provenance) exits 0 on every convergence |
-| **Dependable (no lying)** | confabulation guard: the ledger/archive are written by code *only on real convergence*; an agent cannot fake "converged" (proven through 2 hard kills) |
-| **Self-heals** | inject a broken `[[link]]` → the validate→feedback→ingest loop repairs it and re-converges |
-| **Robust routing** | a flaky/empty assess verdict routes to *refine* (more work), never a dead-end or a false "converged" |
-| **Reliable** | `runs/final/` — 4 articles, **4/4 converged**, validator PASS |
+| **Domain-adaptive schema** | `init --purpose` designs page types that fit the stated outcomes (e.g. a tool-landscape purpose yields `tool`/`comparison` pages; a team-decisions purpose yields `decision`/`owner` pages), not a fixed template. |
+| **Compounds correctly** | `sources:` accrue in place (`[1] → [1, 2, 4]`); pages grow rather than fork; **0 duplicate** concept pages on re-ingest. |
+| **Surfaces contradictions** | when sources disagree, an `## Open Tensions` section records **both sides + provenance**, rather than averaging them. |
+| **Error-free** | the structural validator (links, orphans, frontmatter, provenance) exits 0 on every convergence. |
+| **Dependable (no lying)** | the ledger/`_archive/` are written by code *only on real convergence*; an agent cannot fake "converged" (a deterministic tamper guard reverts and fails loud). |
+| **Self-heals** | a broken `[[link]]` is repaired by the validate → feedback → ingest loop, which re-converges. |
+| **Robust routing** | a flaky/empty `assess` verdict routes to *refine* (more work), never a dead-end or a false "converged". |
 
 ## Architecture (code-first, agents where they earn their keep)
 
@@ -41,17 +56,15 @@ genuinely converges — archived with a provenance entry. Re-running is idempote
 The validator's exact failures are plumbed into the feedback/refine instructions (via file),
 so remediation targets the real problem. Each node is an isolated session with a thin,
 focused context — ingest reads a *slice* (touched + broken/orphan pages), not the whole
-corpus, so it **scales** as the wiki grows. Full design: `docs/designs/PIPELINE_DESIGN.md`.
+corpus, so it **scales** as the wiki grows. Full design: `docs/`.
 
 ## Honest residuals (non-blocking)
 
 - The `assess` LLM node occasionally returns its verdict as prose instead of strict JSON.
-  This is now **non-fatal** — `check` routes any non-`converged` verdict (incl. unset/prose)
-  to `refine`, so it costs at most an extra cycle and never falsely converges. A deeper
-  engine-level fix (`_parse_outcome` should not launder a missing verdict into success) is
-  noted for upstream.
+  This is **non-fatal** — `check` routes any non-`converged` verdict (incl. unset/prose)
+  to `refine`, so it costs at most an extra cycle and never falsely converges.
 - Default model is `claude-sonnet-4-6` (set in `cli/engine_runner.py`, overridable via
   `WIKI_WEAVER_MODEL`). Chosen by a model-swap eval (`eval/model_sweep.py`): it converged
-  3/3 with zero flakes, ~2× faster and ~5× cheaper than Opus-class. Use
-  `WIKI_WEAVER_MODEL=claude-opus-4-8` for the premium tier (richest synthesis). The old
-  `claude-sonnet-4-20250514` default retires 2026-06-15.
+  with zero flakes, faster and cheaper than Opus-class. Use a premium model via
+  `WIKI_WEAVER_MODEL` for the richest synthesis.
+- `query` is a naive substring-grep stub — use `ask` to query a wiki.

@@ -17,8 +17,8 @@
 #   gates. Held-out scenario guards against prompt overfitting.
 #
 # Output (wikis, schemas, results) -> .amplifier/evaluation/wiki-weaver/<datetime>/
-#   NEVER committed. Source DATA (medium_articles, transcripts) is read at runtime,
-#   never copied into the repo.
+#   NEVER committed. Any source DATA you point a flow-through at (your own articles or
+#   transcripts) is read at runtime, never copied into the repo.
 
 meta:
   feature_under_test: "wiki-weaver init — LLM-driven domain-adaptive schema design (pipeline/init.dot)"
@@ -66,7 +66,7 @@ scenarios:
   - id: D1
     held_out: false
     domain: ai-coding-tools-navigator
-    source_dir: ~/medium_articles            # READ at runtime for the A/B flow-through; never copied into repo
+    source_dir: null   # optional: point at your OWN dir of articles for an A/B flow-through; the harness judges design-from-purpose by default
     purpose: >
       A working developer's second brain for navigating the fast-moving AI coding-tools
       landscape. Optimized to answer "which tool or technique should I use for X, and why",
@@ -85,7 +85,7 @@ scenarios:
   - id: D2
     held_out: false
     domain: team-institutional-memory
-    source_dir: ~/dev/future-brainstorm/archive/transcripts   # READ at runtime; never copied into repo
+    source_dir: null   # optional: point at your OWN dir of meeting transcripts; the harness judges design-from-purpose by default
     purpose: >
       A software team's institutional memory across concurrent workstreams. Optimized to
       answer "what did we decide about X and the rationale behind it", "what is the current

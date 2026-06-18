@@ -163,9 +163,9 @@ def _parse_transcript_header(text: str) -> dict:
 
     Handles the format produced by Teams/Zoom/calendar export tools::
 
-        # Transcript: Team Pulse Weekly Planning
+        # Transcript: Weekly Planning Sync
 
-        Source: https://microsoft-my.sharepoint.com/...
+        Source: https://example.com/meetings/...
         Duration: 1:00:50
         Speakers: Chris Park, Alex Rivera, Samuel Lee
         Date: 5/29/2026, 11:07:43 AM
