@@ -1,0 +1,120 @@
+# Init Schema-Design Eval — does `wiki-weaver init` design a GOOD domain-adaptive schema?
+# ============================================================================
+# What the init feature is meant to do better than anything else:
+#   The Karpathy "LLM wiki" pattern says the SCHEMA is the domain-specific config
+#   that makes the LLM a disciplined wiki maintainer. A generic one-size-fits-all
+#   schema (concept/entity/comparison/synthesis) underserves a specific purpose.
+#   `init` (contract C) takes a RICH purpose description (intended use + desired
+#   OUTCOMES) [+ optionally a sample of staged sources] and designs a schema —
+#   page-type taxonomy, frontmatter contract, conventions — TAILORED to that
+#   purpose, written to <wiki>/policy/schema.md (already consumed by synthesize).
+#
+# This eval measures whether the designed schema actually fits the domain and
+# serves the stated outcomes — NOT just that a file was written.
+#
+# Grading: LLM-as-judge rubric (0-5 per dimension) on the produced schema.md,
+#   given the purpose and the generic default for contrast. Plus deterministic
+#   gates. Held-out scenario guards against prompt overfitting.
+#
+# Output (wikis, schemas, results) -> .amplifier/evaluation/wiki-weaver/<datetime>/
+#   NEVER committed. Source DATA (medium_articles, transcripts) is read at runtime,
+#   never copied into the repo.
+
+meta:
+  feature_under_test: "wiki-weaver init — LLM-driven domain-adaptive schema design (pipeline/init.dot)"
+  generic_default_schema: pipeline/SCHEMA.md   # the one-size-fits-all baseline to beat
+  held_out_ids: [D3]                            # do NOT tune the init prompt against this one
+  grader:
+    # 0-5 per dimension; PASS threshold = mean >= 3.5 AND no dimension < 3 AND all deterministic gates pass
+    dimensions:
+      - id: domain_fit
+        weight: 1
+        question: >
+          Does the page-type taxonomy (the `type:` enum) and frontmatter contract genuinely
+          fit THIS domain, rather than reusing the generic concept/entity/comparison/synthesis
+          types? Domain-specific page types that a knowledgeable reader of this domain would
+          recognize as right score high.
+      - id: outcome_orientation
+        weight: 2   # most important: the schema must serve the STATED outcomes
+        question: >
+          Does the schema's structure demonstrably serve the specific OUTCOMES named in the
+          purpose? Look for concrete structural choices that map to each stated outcome (e.g.
+          a time/change-tracking page type or field for "track how X changes over time"; a
+          status/blocker field for "what's blocking workstream Y"; an owner field for "who
+          drives Z"). Each outcome served by a real structural element scores high.
+      - id: differentiation
+        weight: 1
+        question: >
+          Is the schema meaningfully DIFFERENT from the generic default where the domain
+          warrants it (and sensibly similar where it doesn't)? A schema that is just the
+          generic default lightly reworded scores low.
+      - id: validity
+        weight: 1
+        question: >
+          Is it a valid, internally-consistent schema contract? Requires title/type/sources
+          in frontmatter, KEEPS index.md and overview.md as nav pages, defines linking and
+          contradiction conventions, and contains no self-contradictions. A schema that
+          renames or drops the required nav pages, or omits required frontmatter, scores low.
+  deterministic_gates:
+    - "policy/schema.md exists and is non-empty"
+    - "declares a page-type taxonomy (contains 'type:' and an enumerated list of types)"
+    - "keeps index and overview as nav pages (mentions both)"
+    - "run_init exit code == 0"
+
+scenarios:
+
+  - id: D1
+    held_out: false
+    domain: ai-coding-tools-navigator
+    source_dir: ~/medium_articles            # READ at runtime for the A/B flow-through; never copied into repo
+    purpose: >
+      A working developer's second brain for navigating the fast-moving AI coding-tools
+      landscape. Optimized to answer "which tool or technique should I use for X, and why",
+      to compare alternatives head-to-head for a specific task, and to track how
+      recommendations change over time as tools and models are updated.
+    # What a GOOD schema would surface (guidance for the judge on outcome_orientation —
+    # NOT a rigid answer key; the model may find better structures):
+    outcomes_to_serve:
+      - "'which tool/technique for X and why' -> tool and technique page types, decision rationale"
+      - "'compare alternatives head-to-head' -> a comparison page type scoped to a task"
+      - "'track how recommendations change over time' -> a time/changelog page type or dated fields"
+    anti_patterns:
+      - "Just keeps the generic concept/entity/comparison/synthesis taxonomy unchanged"
+      - "No structural support for the time/change-tracking outcome"
+
+  - id: D2
+    held_out: false
+    domain: team-institutional-memory
+    source_dir: ~/dev/future-brainstorm/archive/transcripts   # READ at runtime; never copied into repo
+    purpose: >
+      A software team's institutional memory across concurrent workstreams. Optimized to
+      answer "what did we decide about X and the rationale behind it", "what is the current
+      status of workstream Y and what is blocking it", and "who owns or is driving Z" — while
+      preserving the history and reasoning behind decisions as they evolve, and making
+      ownership and current state easy to see at a glance.
+    outcomes_to_serve:
+      - "'what did we decide and why' -> decision/ADR page type carrying rationale + date"
+      - "'current status of workstream Y and blockers' -> workstream page type with status + blockers fields"
+      - "'who owns/drives Z' -> owner/person page type and an owner frontmatter field"
+      - "'preserve history as decisions evolve' -> superseded_by / status lifecycle"
+    anti_patterns:
+      - "Generic concept/entity types with no decision/workstream/owner notion"
+      - "No status or ownership fields despite those being explicit outcomes"
+
+  - id: D3
+    held_out: true     # generalization guard — do NOT tune the init prompt against this
+    domain: book-companion-wiki
+    source_dir: null   # design-from-purpose only (no source sample) — tests the no-inbox path
+    purpose: >
+      A companion wiki built while reading a long non-fiction book, chapter by chapter.
+      Optimized to answer "what is the author's argument and how does it develop across
+      chapters", "how do the key ideas and people relate", and "where does the author
+      contradict or qualify an earlier claim" — building a connected map of the book's ideas
+      that gets richer as more chapters are filed.
+    outcomes_to_serve:
+      - "'argument and how it develops' -> chapter and argument/thesis page types"
+      - "'how ideas and people relate' -> concept and person page types with rich wikilinks"
+      - "'where the author contradicts/qualifies earlier claims' -> explicit tension/contradiction handling"
+    anti_patterns:
+      - "Tool/technique types leaking in from unrelated domains"
+      - "No chapter-progression or argument-development structure"
