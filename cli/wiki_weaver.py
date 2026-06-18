@@ -82,7 +82,9 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
-    return lint(args.wiki)
+    from cli.engine_runner import run_lint
+
+    return run_lint(args.wiki)
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:

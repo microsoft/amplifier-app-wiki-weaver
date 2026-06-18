@@ -1323,6 +1323,138 @@ def run_rag(
     )
 
 
+# --------------------------------------------------------------------------
+# Lint pipeline: single-shot structural validation
+# --------------------------------------------------------------------------
+#
+# MECHANISM: a deterministic tool-only pipeline (no LLM) that runs the same
+# validate_wiki.py the in-pipeline `validate` node uses. Keeps `wiki-weaver lint`
+# and the pipeline's structural gate structurally aligned — one validator, two
+# entry points. Uses --out to write a result file so run_lint can recover the
+# validator's pass/fail verdict from outside the engine.
+
+# lint.dot: the single-node lint pipeline (static DOT with $var token).
+LINT_DOT = PIPELINE_DIR / "lint.dot"
+
+
+def build_lint_dot(wiki_dir: Path, lint_result_file: Path) -> str:
+    """Build the lint DOT pipeline as a Python string (reference builder).
+
+    Token substitution mirrors build_lint_dot_from_file:
+      $validate_cmd -> python validate_wiki.py <wiki_abs> [--config <cfg>] --out <lint_result_file>
+
+    ``wiki_dir`` is resolved to an absolute path so the DOT is self-contained.
+    If ``<wiki_dir>/policy/validator.yaml`` exists, ``--config`` is appended
+    (identical behaviour to lib.lint).
+
+    Byte-identical to build_lint_dot_from_file for the same inputs.
+    """
+    import sys
+
+    wiki_abs = str(wiki_dir.resolve())
+    validator_cfg = wiki_dir / "policy" / "validator.yaml"
+    validate_cmd = f"{sys.executable} {VALIDATE_PY} {wiki_abs}"
+    if validator_cfg.is_file():
+        validate_cmd += f" --config {validator_cfg}"
+    validate_cmd += f" --out {lint_result_file}"
+
+    lines = [
+        "digraph lint_wiki {",
+        '    graph [goal="Validate wiki structure"]',
+        '    start [shape=Mdiamond, label="Start"]',
+        "    lint [",
+        "        shape=parallelogram,",
+        '        label="Validate Structure",',
+        f'        tool_command="{validate_cmd}"',
+        "    ]",
+        '    done [shape=Msquare, label="Done"]',
+        "    start -> lint",
+        '    lint -> done [label="pass", condition="outcome=success"]',
+        '    lint -> done [label="fail", condition="outcome=fail"]',
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_lint_dot_from_file(wiki_dir: Path, lint_result_file: Path) -> str:
+    """Build the lint DOT pipeline by reading pipeline/lint.dot and substituting tokens.
+
+    Token substitution:
+      $validate_cmd -> python validate_wiki.py <wiki_abs> [--config <cfg>] --out <lint_result_file>
+
+    Byte-identical to build_lint_dot for the same inputs.
+    """
+    import sys
+
+    wiki_abs = str(wiki_dir.resolve())
+    validator_cfg = wiki_dir / "policy" / "validator.yaml"
+    validate_cmd = f"{sys.executable} {VALIDATE_PY} {wiki_abs}"
+    if validator_cfg.is_file():
+        validate_cmd += f" --config {validator_cfg}"
+    validate_cmd += f" --out {lint_result_file}"
+
+    dot = LINT_DOT.read_text(encoding="utf-8")
+    dot = dot.replace("$validate_cmd", validate_cmd)
+    return dot
+
+
+def run_lint(wiki_dir: str | Path) -> int:
+    """Run the structural validator as an attractor pipeline.
+
+    Mirrors lib.lint() but routes through the attractor engine. Returns the
+    validator's exit code: 0 on pass, 1 on fail. Prints the validator report
+    to stdout (identical output to lib.lint).
+
+    The wiki must already exist — lint runs on a built wiki whose ``.runs/``
+    directory is writable (no bootstrapping issue, unlike init).
+
+    The validator result is written to a tmp file via ``--out`` and read back
+    so run_lint can recover the pass/fail verdict from outside the engine.
+    """
+    import sys
+
+    wiki_dir = Path(wiki_dir).resolve()
+    if not wiki_dir.is_dir():
+        print(f"FAIL: wiki dir not found: {wiki_dir}", file=sys.stderr)
+        return 1
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    logs_dir = wiki_dir / ".runs" / f"lint-{timestamp}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Result file: validate_wiki.py writes its output here via --out.
+    # Using a /tmp path (not wiki/.ai/) avoids collision on concurrent runs
+    # and sidesteps any denied_write_paths constraints.
+    lint_result_file = Path(f"/tmp/wiki_lint_{timestamp}.md")
+
+    dot_source = build_lint_dot_from_file(wiki_dir, lint_result_file)
+    (logs_dir / "lint.dot").write_text(dot_source, encoding="utf-8")
+
+    _text, _data = asyncio.run(
+        _run_pipeline(dot_source, logs_dir, wiki_dir, execute_prompt="Run the pipeline")
+    )
+
+    # Primary: read from the result file (written by validate_wiki.py --out).
+    # Print it so the user sees the same PASS/FAIL output as lib.lint.
+    # The report starts with "Wiki: ..." and the PASS/FAIL verdict appears
+    # after the per-check lines — check for the marker line, not startswith.
+    if lint_result_file.exists():
+        result = lint_result_file.read_text(encoding="utf-8")
+        sys.stdout.write(result)
+        lint_result_file.unlink(missing_ok=True)
+        return 0 if "\nPASS \u2014 structurally valid" in result else 1
+
+    # Fallback: result file not written (unexpected). Fail loud — if we cannot
+    # confirm PASS we must not silently return 0.
+    print(
+        "FAIL: validator result file not written — see logs in "
+        f"{logs_dir} for details.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 if __name__ == "__main__":
     import argparse
 

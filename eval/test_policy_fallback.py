@@ -45,6 +45,8 @@ from cli.engine_runner import (  # noqa: E402
     build_ask_dot,
     build_ask_dot_from_file,
     build_dot,
+    build_lint_dot,
+    build_lint_dot_from_file,
 )
 from validate_wiki import (  # noqa: E402
     META_TYPES,
@@ -379,6 +381,76 @@ class TestBuildAskDotByteIdentical:
         assert build_ask_dot(wiki, question, af) == build_ask_dot_from_file(
             wiki, question, af
         )
+
+
+# ---------------------------------------------------------------------------
+# Group 2c — lint DOT byte-identical
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLintDotByteIdentical:
+    """build_lint_dot_from_file must be BYTE-IDENTICAL to build_lint_dot for the
+    same inputs.  All tests are deterministic — no LLM, no network, no API key,
+    no engine run."""
+
+    def test_no_validator_config_byte_identical(self, tmp_path: Path) -> None:
+        """Wiki without policy/validator.yaml — no --config flag in the cmd."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        result_file = tmp_path / "lint_result.md"
+        assert build_lint_dot(wiki, result_file) == build_lint_dot_from_file(
+            wiki, result_file
+        ), (
+            "build_lint_dot_from_file must be byte-identical to build_lint_dot (no config)"
+        )
+
+    def test_with_validator_config_byte_identical(self, tmp_path: Path) -> None:
+        """Wiki with policy/validator.yaml present — --config appended to cmd."""
+        wiki = tmp_path / "wiki"
+        (wiki / "policy").mkdir(parents=True)
+        (wiki / "policy" / "validator.yaml").write_text(
+            "nav_pages: [index]\n", encoding="utf-8"
+        )
+        result_file = tmp_path / "lint_result.md"
+        assert build_lint_dot(wiki, result_file) == build_lint_dot_from_file(
+            wiki, result_file
+        ), (
+            "build_lint_dot_from_file must be byte-identical to build_lint_dot (with config)"
+        )
+
+    def test_config_present_differs_from_absent(self, tmp_path: Path) -> None:
+        """Sanity: the two cases (config present / absent) must NOT be identical."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        result_file = tmp_path / "lint_result.md"
+        no_cfg = build_lint_dot(wiki, result_file)
+
+        (wiki / "policy").mkdir()
+        (wiki / "policy" / "validator.yaml").write_text(
+            "nav_pages: [index]\n", encoding="utf-8"
+        )
+        with_cfg = build_lint_dot(wiki, result_file)
+
+        assert no_cfg != with_cfg, (
+            "Adding policy/validator.yaml must change the validate_cmd (--config appended)"
+        )
+
+    def test_validate_cmd_contains_wiki_abs_path(self, tmp_path: Path) -> None:
+        """The validate_cmd in the DOT must contain the resolved absolute wiki path."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        result_file = tmp_path / "lint_result.md"
+        dot = build_lint_dot_from_file(wiki, result_file)
+        assert str(wiki.resolve()) in dot
+
+    def test_validate_cmd_contains_result_file(self, tmp_path: Path) -> None:
+        """The validate_cmd in the DOT must contain the --out result file path."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        result_file = tmp_path / "lint_result.md"
+        dot = build_lint_dot_from_file(wiki, result_file)
+        assert str(result_file) in dot
+        assert "--out" in dot
 
 
 # ---------------------------------------------------------------------------

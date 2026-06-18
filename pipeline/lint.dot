@@ -1,0 +1,13 @@
+digraph lint_wiki {
+    graph [goal="Validate wiki structure"]
+    start [shape=Mdiamond, label="Start"]
+    lint [
+        shape=parallelogram,
+        label="Validate Structure",
+        tool_command="$validate_cmd"
+    ]
+    done [shape=Msquare, label="Done"]
+    start -> lint
+    lint -> done [label="pass", condition="outcome=success"]
+    lint -> done [label="fail", condition="outcome=fail"]
+}
