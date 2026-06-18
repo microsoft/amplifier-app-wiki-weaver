@@ -21,6 +21,7 @@ Usage:
     python eval/run_ask_eval.py                              # all 9 scenarios
     python eval/run_ask_eval.py --limit 1                   # smoke: one scenario
     python eval/run_ask_eval.py --wiki <dir>                # different wiki
+    python eval/run_ask_eval.py --scenarios <file.yaml>     # pinned scenarios file
     python eval/run_ask_eval.py --judge-model <m>           # different judge
     python eval/run_ask_eval.py --concurrency 2             # reduce parallelism
     python eval/run_ask_eval.py --regrade <results.json>    # re-grade saved run, no re-run
@@ -91,9 +92,14 @@ _SKIP_PAGES = frozenset({".sources.json"})
 # ---------------------------------------------------------------------------
 
 
-def load_scenarios() -> list[dict]:
-    """Load scenarios from eval/ask_scenarios.yaml."""
-    raw = SCENARIOS_FILE.read_text(encoding="utf-8")
+def load_scenarios(path: Path = SCENARIOS_FILE) -> list[dict]:
+    """Load scenarios from a scenarios YAML file.
+
+    Fails loudly if the file does not exist — no silent fallback.
+    """
+    if not path.exists():
+        sys.exit(f"ERROR: scenarios file not found: {path}")
+    raw = path.read_text(encoding="utf-8")
     doc = yaml.safe_load(raw)
     return doc.get("scenarios", [])
 
@@ -730,6 +736,7 @@ def _write_summary(
 async def _run_regrade(
     results_json: Path,
     wiki: Path,
+    scenarios_path: Path,
     judge_model: str,
 ) -> int:
     """Re-grade a saved results.json without re-running asks.
@@ -746,7 +753,7 @@ async def _run_regrade(
     saved: list[dict] = json.loads(results_json.read_text(encoding="utf-8"))
 
     # Build scenario index for ground_truth / type lookup
-    scenarios_by_id = {sc["id"]: sc for sc in load_scenarios()}
+    scenarios_by_id = {sc["id"]: sc for sc in load_scenarios(scenarios_path)}
 
     judge_fn = _build_judge_fn(judge_model)
     if judge_fn is None:
@@ -862,9 +869,13 @@ async def _run_regrade(
 
 
 async def _run_eval(
-    wiki: Path, limit: int | None, judge_model: str, concurrency: int = 4
+    wiki: Path,
+    scenarios_path: Path,
+    limit: int | None,
+    judge_model: str,
+    concurrency: int = 4,
 ) -> int:
-    scenarios = load_scenarios()
+    scenarios = load_scenarios(scenarios_path)
     if limit is not None:
         scenarios = scenarios[:limit]
 
@@ -975,6 +986,13 @@ def main() -> None:
         help="max parallel ask subprocesses (default: 4)",
     )
     ap.add_argument(
+        "--scenarios",
+        type=Path,
+        default=SCENARIOS_FILE,
+        metavar="SCENARIOS_YAML",
+        help="Path to the scenarios YAML (default: eval/ask_scenarios.yaml).",
+    )
+    ap.add_argument(
         "--regrade",
         type=Path,
         default=None,
@@ -988,11 +1006,21 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.regrade is not None:
-        sys.exit(asyncio.run(_run_regrade(args.regrade, args.wiki, args.judge_model)))
+        sys.exit(
+            asyncio.run(
+                _run_regrade(args.regrade, args.wiki, args.scenarios, args.judge_model)
+            )
+        )
     else:
         sys.exit(
             asyncio.run(
-                _run_eval(args.wiki, args.limit, args.judge_model, args.concurrency)
+                _run_eval(
+                    args.wiki,
+                    args.scenarios,
+                    args.limit,
+                    args.judge_model,
+                    args.concurrency,
+                )
             )
         )
 
