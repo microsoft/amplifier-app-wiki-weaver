@@ -69,7 +69,14 @@ __all__ = [
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    return init(args.wiki_dir)
+    from cli.engine_runner import run_init
+
+    return run_init(
+        args.wiki_dir,
+        purpose=args.purpose,
+        sample_inbox=not args.no_sample_inbox,
+        plain=args.plain,
+    )
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
@@ -118,8 +125,33 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command")
 
-    p_init = sub.add_parser("init", help="scaffold a fresh wiki directory")
+    p_init = sub.add_parser(
+        "init", help="scaffold a wiki directory and design its schema"
+    )
     p_init.add_argument("wiki_dir")
+    p_init.add_argument(
+        "--purpose",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Rich free-text description of the wiki's intended use and desired outcomes. "
+            "When provided (and ANTHROPIC_API_KEY is set), the LLM designs a domain-fit "
+            "schema and writes it to <wiki>/policy/schema.md. "
+            "Example: --purpose 'AI coding tools second brain for answering which tool "
+            "to use for X and comparing alternatives'"
+        ),
+    )
+    p_init.add_argument(
+        "--plain",
+        action="store_true",
+        help="scaffold only — no LLM schema design, use the generic built-in schema",
+    )
+    p_init.add_argument(
+        "--no-sample-inbox",
+        action="store_true",
+        dest="no_sample_inbox",
+        help="do not sample existing _inbox/ sources to inform schema design",
+    )
 
     p_ingest = sub.add_parser("ingest", help="integrate inbox sources via the engine")
     p_ingest.add_argument("--wiki", default=".", help="wiki directory (default: .)")

@@ -43,6 +43,8 @@ INNER_DOT = PIPELINE_DIR / "synthesize.dot"
 INGEST_DOT = PIPELINE_DIR / "ingest.dot"
 # ask.dot: the single-node ask pipeline (static DOT with $var tokens).
 ASK_DOT = PIPELINE_DIR / "ask.dot"
+# init.dot: the single-node LLM schema-design pipeline (static DOT with $var tokens).
+INIT_DOT = PIPELINE_DIR / "init.dot"
 # ingest_setup.py: the tool node that picks the next inbox source + assigns a
 # stable id before the synthesize.dot folder sub-pipeline runs.
 INGEST_SETUP_PY = Path(__file__).resolve().parent / "ingest_setup.py"
@@ -1453,6 +1455,290 @@ def run_lint(wiki_dir: str | Path) -> int:
         file=sys.stderr,
     )
     return 1
+
+
+# --------------------------------------------------------------------------
+# Init pipeline: single-shot LLM schema design
+# --------------------------------------------------------------------------
+#
+# MECHANISM: one LLM node that reads the wiki purpose + source sample, adapts
+# the generic SCHEMA.md for the domain, and writes <wiki>/policy/schema.md.
+# That path is already the first override point in policy.py's schema_path
+# resolution — so the first ingest after `init --purpose` automatically runs
+# with the domain-fit schema, no other changes needed.
+#
+# POST-CHECK: after the engine returns, run_init asserts the file exists,
+# is non-empty, and looks like a schema (contains "type:" and "index"/"overview").
+# Fail loud — never silently fall back to the generic default.
+
+# The raw prompt template (real Python newlines and quotes; substituted then
+# DOT-escaped before embedding in the DOT string attribute).
+_INIT_PROMPT_TEMPLATE = (
+    "You are designing the SCHEMA for a domain-specific, LLM-maintained wiki \u2014 the\n"
+    "configuration file that makes an LLM a disciplined wiki maintainer for THIS domain\n"
+    '(the Karpathy "LLM wiki" pattern). You design STRUCTURE, not content. Do NOT invent\n'
+    "facts about the domain.\n"
+    "\n"
+    "PURPOSE OF THIS WIKI (its intended use and the outcomes it must serve):\n"
+    "$purpose\n"
+    "\n"
+    "SAMPLE OF REAL SOURCE MATERIAL that will be ingested (may be empty \u2014 if empty, design\n"
+    "from the purpose alone):\n"
+    "$source_sample\n"
+    "\n"
+    "GENERIC DEFAULT SCHEMA (the domain-agnostic baseline \u2014 adapt it: keep what works,\n"
+    "change what this domain and these outcomes actually need):\n"
+    "$default_schema\n"
+    "\n"
+    "Design a schema TAILORED to this wiki's purpose and desired outcomes. Write the\n"
+    "complete schema to `$wiki_dir/policy/schema.md`. It MUST define:\n"
+    "1. PAGE TYPES \u2014 a domain-fit `type:` taxonomy chosen to serve the stated outcomes.\n"
+    "   Do NOT reflexively keep concept/entity/comparison/synthesis if this domain wants\n"
+    "   different page types (e.g. a team-decisions wiki may want decision/workstream/owner\n"
+    "   pages; a tool-landscape wiki may want tool/technique/comparison pages).\n"
+    "2. FRONTMATTER CONTRACT \u2014 required fields (MUST include title, type, sources) plus any\n"
+    "   domain-useful optional fields that serve the outcomes (e.g. decision_date, owner,\n"
+    "   status, confidence).\n"
+    '3. CONVENTIONS \u2014 [[wikilink]] linking, how to record contradictions / "open tensions",\n'
+    "   no-orphan and no-dangling-link rules.\n"
+    "4. NAV PAGES \u2014 KEEP `index.md` and `overview.md` as the required navigation pages (do\n"
+    "   NOT rename them). Describe what each should contain for THIS domain.\n"
+    "5. INGEST & QUERY GUIDANCE \u2014 how a new source should be integrated, and how the wiki\n"
+    "   should be queried, both oriented to the desired outcomes.\n"
+    "\n"
+    "Make it specific: a reader should see what THIS wiki does better than a generic one.\n"
+    "Output ONLY the schema file content to the path above."
+)
+
+
+def build_init_dot(
+    wiki_dir: Path,
+    purpose: str,
+    source_sample: str,
+    *,
+    provider: str = PROVIDER,
+    model: str = MODEL,
+) -> str:
+    """Build the init DOT pipeline as a Python string (reference builder).
+
+    Constructs the raw prompt (with real Python newlines/quotes), substitutes
+    the four token values, then DOT-escapes the whole prompt for embedding in
+    the DOT attribute string.
+
+    Byte-identical to build_init_dot_from_file for the same inputs.
+    """
+    wiki_abs = str(wiki_dir.resolve())
+    default_schema = SCHEMA_PATH.read_text(encoding="utf-8")
+
+    # Substitute all tokens into the raw prompt BEFORE DOT-escaping.
+    # _dot_escape_prompt distributes over concatenation, so substituting
+    # values first and then escaping the whole prompt is byte-identical to
+    # escaping each value separately and substituting into the pre-escaped
+    # template (which is what build_init_dot_from_file does).
+    prompt = _INIT_PROMPT_TEMPLATE
+    prompt = prompt.replace("$wiki_dir", wiki_abs)
+    prompt = prompt.replace("$purpose", purpose)
+    prompt = prompt.replace("$source_sample", source_sample)
+    prompt = prompt.replace("$default_schema", default_schema)
+
+    prompt_dot = _dot_escape_prompt(prompt)
+
+    lines = [
+        "digraph init_wiki {",
+        '    graph [goal="Design a domain-adaptive schema for a new wiki"]',
+        '    start [shape=Mdiamond, label="Start"]',
+        "    design_schema [",
+        '        label="Design Domain Schema",',
+        f'        llm_provider="{provider}",',
+        f'        llm_model="{model}",',
+        f'        prompt="{prompt_dot}"',
+        "    ]",
+        '    done [shape=Msquare, label="Done"]',
+        "    start -> design_schema -> done",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_init_dot_from_file(
+    wiki_dir: Path,
+    purpose: str,
+    source_sample: str,
+    *,
+    provider: str = PROVIDER,
+    model: str = MODEL,
+) -> str:
+    """Build the init DOT pipeline by reading pipeline/init.dot and substituting tokens.
+
+    Token substitution:
+      $wiki_dir       -> str(wiki_dir.resolve())               (path; no DOT-escaping)
+      $purpose        -> _dot_escape_prompt(purpose)           (user-supplied text)
+      $source_sample  -> _dot_escape_prompt(source_sample)     (file content)
+      $default_schema -> _dot_escape_prompt(SCHEMA.md text)    (built-in schema)
+
+    The template bakes llm_provider="anthropic" / llm_model="claude-sonnet-4-6".
+    If policy differs, those values are replaced with the supplied provider/model.
+
+    Byte-identical to build_init_dot for the same inputs.
+    """
+    wiki_abs = str(wiki_dir.resolve())
+    default_schema = SCHEMA_PATH.read_text(encoding="utf-8")
+
+    dot = INIT_DOT.read_text(encoding="utf-8")
+
+    # Substitute path token — plain path, no DOT-escaping needed.
+    dot = dot.replace("$wiki_dir", wiki_abs)
+    # User/content tokens: DOT-escape before substituting into the already-
+    # DOT-escaped template (preserves byte-identity with build_init_dot).
+    dot = dot.replace("$purpose", _dot_escape_prompt(purpose))
+    dot = dot.replace("$source_sample", _dot_escape_prompt(source_sample))
+    dot = dot.replace("$default_schema", _dot_escape_prompt(default_schema))
+
+    # Apply provider/model override — replace the baked defaults unconditionally.
+    dot = dot.replace('llm_provider="anthropic"', f'llm_provider="{provider}"')
+    dot = dot.replace('llm_model="claude-sonnet-4-6"', f'llm_model="{model}"')
+
+    return dot
+
+
+def _sample_inbox(inbox: Path, max_chars: int = 6000) -> str:
+    """Return a sample of inbox source content (first ~max_chars across first few files).
+
+    Used by run_init to give the LLM a taste of what real sources look like,
+    so the schema can be tailored to actual content shape (not just the stated purpose).
+    """
+    parts: list[str] = []
+    total = 0
+    for p in sorted(inbox.iterdir()):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        chunk = text[: max_chars - total]
+        parts.append(f"--- {p.name} ---\n{chunk}")
+        total += len(chunk)
+        if total >= max_chars:
+            break
+    return "\n\n".join(parts)
+
+
+def run_init(
+    wiki_dir: str | Path,
+    *,
+    purpose: str | None = None,
+    sample_inbox: bool = True,
+    plain: bool = False,
+) -> int:
+    """Scaffold a wiki and optionally design a domain-fit schema via LLM.
+
+    Contract C (per parent conversation design decision):
+      - Always calls lib.init(wiki_dir) first (deterministic scaffold: dirs, stubs,
+        ledger). This also ensures <wiki>/.runs/ is writable for the engine.
+      - plain=True  -> stop after scaffold (generic default schema, no LLM). Free.
+      - No signal (purpose is None AND inbox is empty/absent) -> same as plain.
+      - Otherwise   -> run init.dot (one LLM node that writes policy/schema.md).
+
+    POST-CHECK after the LLM run (fail loud, never silent fallback):
+      Asserts <wiki>/policy/schema.md was written, is non-empty, and contains a
+      "type:" taxonomy reference plus "index" and "overview" nav-page mentions.
+    """
+    import sys
+
+    from .lib import init as _lib_init
+
+    wiki_dir = Path(wiki_dir).expanduser().resolve()
+
+    # Step 1: Always scaffold first (deterministic; creates dirs + stubs + ledger;
+    # also creates wiki_dir so the engine can create .runs/ inside it).
+    rc = _lib_init(wiki_dir)
+    if rc != 0:
+        return rc
+
+    # Step 2: Decide mode.
+    if plain:
+        print("  schema: generic default (--plain mode, no LLM schema design)")
+        return 0
+
+    source_sample = ""
+    if sample_inbox:
+        inbox = wiki_dir / "_inbox"
+        if inbox.is_dir():
+            source_sample = _sample_inbox(inbox)
+
+    # No signal: no purpose + no inbox sources → generic default, no LLM.
+    if purpose is None and not source_sample:
+        print(
+            "  schema: generic default"
+            " (no --purpose or inbox sources; use --purpose for a domain-fit schema)"
+        )
+        return 0
+
+    # Step 3: LLM mode — design a domain-fit schema.
+    purpose_str = purpose or ""
+
+    # Create policy/ dir before the engine runs so the LLM can write schema.md
+    # without needing to mkdir itself (belt-and-suspenders).
+    (wiki_dir / "policy").mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    logs_dir = wiki_dir / ".runs" / f"init-{timestamp}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    _init_policy = load_policy(wiki_dir)
+    dot_source = build_init_dot_from_file(
+        wiki_dir,
+        purpose_str,
+        source_sample,
+        provider=_init_policy.provider,
+        model=_init_policy.model_for("init"),
+    )
+    (logs_dir / "init.dot").write_text(dot_source, encoding="utf-8")
+
+    _text, _data = asyncio.run(
+        _run_pipeline(
+            dot_source,
+            logs_dir,
+            wiki_dir,
+            execute_prompt="Run the pipeline",
+            wiki_dir=wiki_dir,
+        )
+    )
+
+    # Step 4: Post-check — fail loud if schema.md wasn't written or looks malformed.
+    schema_file = wiki_dir / "policy" / "schema.md"
+    if not schema_file.is_file():
+        print(
+            f"FAIL: schema design completed but {schema_file} was not written.\n"
+            f"  See engine logs: {logs_dir}",
+            file=sys.stderr,
+        )
+        return 1
+
+    content = schema_file.read_text(encoding="utf-8")
+    if not content.strip():
+        print(
+            f"FAIL: {schema_file} was written but is empty. See logs: {logs_dir}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Sanity: domain-fit schema must define a type: taxonomy and mention both nav pages.
+    has_type = "type:" in content
+    has_nav = "index" in content.lower() and "overview" in content.lower()
+    if not (has_type and has_nav):
+        print(
+            f"FAIL: {schema_file} looks malformed — must contain a 'type:' taxonomy "
+            f"and mention both 'index' and 'overview' nav pages.\n"
+            f"  See logs: {logs_dir}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"  schema: {schema_file} (domain-fit, LLM-designed)")
+    return 0
 
 
 if __name__ == "__main__":

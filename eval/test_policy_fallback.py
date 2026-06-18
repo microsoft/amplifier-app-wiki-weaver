@@ -33,6 +33,7 @@ from cli.policy import WikiPolicy, _DEF_MODEL, _DEF_PROVIDER, load_policy  # noq
 from cli.engine_runner import (  # noqa: E402
     CONVERGENCE_RUBRIC_PATH,
     FOOTNOTES_PY,
+    INIT_DOT,
     INNER_DOT,
     LLM_NODE_IDS,
     MODEL,
@@ -45,6 +46,8 @@ from cli.engine_runner import (  # noqa: E402
     build_ask_dot,
     build_ask_dot_from_file,
     build_dot,
+    build_init_dot,
+    build_init_dot_from_file,
     build_lint_dot,
     build_lint_dot_from_file,
 )
@@ -451,6 +454,101 @@ class TestBuildLintDotByteIdentical:
         dot = build_lint_dot_from_file(wiki, result_file)
         assert str(result_file) in dot
         assert "--out" in dot
+
+
+# ---------------------------------------------------------------------------
+# Group 2d — init DOT byte-identical
+# ---------------------------------------------------------------------------
+
+
+class TestBuildInitDotByteIdentical:
+    """build_init_dot_from_file must be BYTE-IDENTICAL to build_init_dot for the
+    same inputs.  All tests are deterministic — no LLM, no network, no API key,
+    no engine run."""
+
+    def test_simple_purpose_empty_sample_byte_identical(self, tmp_path: Path) -> None:
+        """Simple ASCII purpose, empty source_sample."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        purpose = "A coding tools second brain"
+        assert build_init_dot(wiki, purpose, "") == build_init_dot_from_file(
+            wiki, purpose, ""
+        ), "build_init_dot_from_file must be byte-identical to build_init_dot"
+
+    def test_purpose_with_double_quotes_byte_identical(self, tmp_path: Path) -> None:
+        """Purpose containing double-quotes (DOT-special) must be escaped identically."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        purpose = 'Research "LLM wiki" patterns for knowledge management'
+        assert build_init_dot(wiki, purpose, "") == build_init_dot_from_file(
+            wiki, purpose, ""
+        )
+
+    def test_purpose_with_newline_byte_identical(self, tmp_path: Path) -> None:
+        """Purpose containing a literal newline (DOT-special) must be escaped identically."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        purpose = "AI tooling decisions wiki\noptimised for quick look-up"
+        assert build_init_dot(wiki, purpose, "") == build_init_dot_from_file(
+            wiki, purpose, ""
+        )
+
+    def test_source_sample_with_quotes_and_newlines_byte_identical(
+        self, tmp_path: Path
+    ) -> None:
+        """source_sample containing DOT-special chars must be escaped identically."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        purpose = "team memory"
+        source_sample = (
+            '---\ntitle: "Meeting Notes"\nauthor: Alice\n---\n# Discussion\nKey point.'
+        )
+        assert build_init_dot(wiki, purpose, source_sample) == build_init_dot_from_file(
+            wiki, purpose, source_sample
+        )
+
+    def test_empty_purpose_and_sample_byte_identical(self, tmp_path: Path) -> None:
+        """Empty purpose and sample (degenerate case) must still be byte-identical."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        assert build_init_dot(wiki, "", "") == build_init_dot_from_file(wiki, "", "")
+
+    def test_init_dot_file_exists(self) -> None:
+        """pipeline/init.dot must exist as a real file."""
+        assert INIT_DOT.is_file(), f"pipeline/init.dot must exist at {INIT_DOT}"
+
+    def test_init_dot_contains_tokens(self) -> None:
+        """pipeline/init.dot must contain all four substitution tokens."""
+        content = INIT_DOT.read_text(encoding="utf-8")
+        for token in ("$wiki_dir", "$purpose", "$source_sample", "$default_schema"):
+            assert token in content, f"pipeline/init.dot must contain token {token!r}"
+
+    def test_init_dot_contains_design_schema_node(self) -> None:
+        """pipeline/init.dot must declare the design_schema LLM node."""
+        content = INIT_DOT.read_text(encoding="utf-8")
+        assert "design_schema" in content
+        assert 'llm_provider="anthropic"' in content
+        assert 'llm_model="claude-sonnet-4-6"' in content
+
+    def test_wiki_dir_embedded_in_output(self, tmp_path: Path) -> None:
+        """The wiki directory absolute path must appear in both builders' output."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        wiki_abs = str(wiki.resolve())
+        dot = build_init_dot_from_file(wiki, "test", "")
+        assert wiki_abs in dot, "wiki_dir absolute path must be embedded in DOT output"
+
+    def test_provider_model_override(self, tmp_path: Path) -> None:
+        """Supplying provider/model replaces the baked defaults in both builders."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        dot_ref = build_init_dot(wiki, "test", "", provider="openai", model="gpt-4o")
+        dot_file = build_init_dot_from_file(
+            wiki, "test", "", provider="openai", model="gpt-4o"
+        )
+        assert dot_ref == dot_file
+        assert 'llm_provider="openai"' in dot_ref
+        assert 'llm_model="gpt-4o"' in dot_ref
 
 
 # ---------------------------------------------------------------------------

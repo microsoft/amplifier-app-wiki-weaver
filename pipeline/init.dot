@@ -1,0 +1,12 @@
+digraph init_wiki {
+    graph [goal="Design a domain-adaptive schema for a new wiki"]
+    start [shape=Mdiamond, label="Start"]
+    design_schema [
+        label="Design Domain Schema",
+        llm_provider="anthropic",
+        llm_model="claude-sonnet-4-6",
+        prompt="You are designing the SCHEMA for a domain-specific, LLM-maintained wiki — the\nconfiguration file that makes an LLM a disciplined wiki maintainer for THIS domain\n(the Karpathy \"LLM wiki\" pattern). You design STRUCTURE, not content. Do NOT invent\nfacts about the domain.\n\nPURPOSE OF THIS WIKI (its intended use and the outcomes it must serve):\n$purpose\n\nSAMPLE OF REAL SOURCE MATERIAL that will be ingested (may be empty — if empty, design\nfrom the purpose alone):\n$source_sample\n\nGENERIC DEFAULT SCHEMA (the domain-agnostic baseline — adapt it: keep what works,\nchange what this domain and these outcomes actually need):\n$default_schema\n\nDesign a schema TAILORED to this wiki's purpose and desired outcomes. Write the\ncomplete schema to `$wiki_dir/policy/schema.md`. It MUST define:\n1. PAGE TYPES — a domain-fit `type:` taxonomy chosen to serve the stated outcomes.\n   Do NOT reflexively keep concept/entity/comparison/synthesis if this domain wants\n   different page types (e.g. a team-decisions wiki may want decision/workstream/owner\n   pages; a tool-landscape wiki may want tool/technique/comparison pages).\n2. FRONTMATTER CONTRACT — required fields (MUST include title, type, sources) plus any\n   domain-useful optional fields that serve the outcomes (e.g. decision_date, owner,\n   status, confidence).\n3. CONVENTIONS — [[wikilink]] linking, how to record contradictions / \"open tensions\",\n   no-orphan and no-dangling-link rules.\n4. NAV PAGES — KEEP `index.md` and `overview.md` as the required navigation pages (do\n   NOT rename them). Describe what each should contain for THIS domain.\n5. INGEST & QUERY GUIDANCE — how a new source should be integrated, and how the wiki\n   should be queried, both oriented to the desired outcomes.\n\nMake it specific: a reader should see what THIS wiki does better than a generic one.\nOutput ONLY the schema file content to the path above."
+    ]
+    done [shape=Msquare, label="Done"]
+    start -> design_schema -> done
+}
