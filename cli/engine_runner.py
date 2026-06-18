@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1077,7 +1078,10 @@ def run_ingest(
     # Substitute compile-time tokens in ingest.dot (paths and bounds that
     # must be concrete values, not expanded from engine context).
     dot_template = INGEST_DOT.read_text(encoding="utf-8")
-    setup_cmd = f"{sys.executable} {INGEST_SETUP_PY} {wiki_dir} {wiki_dir}"
+    setup_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_SETUP_PY))}"
+        f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(wiki_dir))}"
+    )
     synthesize_dot_abs = str(INNER_DOT)
 
     # The engine names child pipeline logs {logs_dir}/subgraph_{node.id}.
@@ -1088,7 +1092,7 @@ def run_ingest(
     synthesize_checkpoint = str(
         logs_dir / "subgraph_run_synthesize" / "checkpoint.json"
     )
-    clear_synthesize_cmd = f"rm -f {synthesize_checkpoint}"
+    clear_synthesize_cmd = f"rm -f {shlex.quote(synthesize_checkpoint)}"
 
     dot_source = dot_template.replace("$setup_cmd", setup_cmd)
     dot_source = dot_source.replace("$synthesize_dot", synthesize_dot_abs)

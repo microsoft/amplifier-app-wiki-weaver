@@ -28,6 +28,7 @@ Inbox empty or debounce → exit 0 with {"has_source":"false"}.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -119,17 +120,36 @@ def main() -> int:
     # of whether it is invoked directly or as a folder sub-pipeline.
     validation_report = wiki_dir / ".ai" / "validation.md"
     validate_cmd = (
-        f"{sys.executable} {VALIDATE_PY} {wiki_dir} --out {validation_report}"
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(VALIDATE_PY))}"
+        f" {shlex.quote(str(wiki_dir))} --out {shlex.quote(str(validation_report))}"
     )
     if policy.validator_config_path is not None:
-        validate_cmd += f" --config {policy.validator_config_path}"
-    normalize_cmd = f"{sys.executable} {NORMALIZE_PY} {wiki_dir}"
-    footnotes_cmd = f"{sys.executable} {FOOTNOTES_PY} {wiki_dir}"
+        validate_cmd += f" --config {shlex.quote(str(policy.validator_config_path))}"
+    normalize_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(NORMALIZE_PY))}"
+        f" {shlex.quote(str(wiki_dir))}"
+    )
+    footnotes_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(FOOTNOTES_PY))}"
+        f" {shlex.quote(str(wiki_dir))}"
+    )
 
     # Fully-formed archive and fail commands, constructed with sys.executable
     # so they run in the same interpreter that launched this script.
-    archive_cmd = f"{sys.executable} {INGEST_ARCHIVE_PY} {wiki_dir} {src} {source_id}"
-    fail_cmd = f"{sys.executable} {INGEST_FAIL_PY} {wiki_dir} {src}"
+    # All paths are shell-quoted so filenames with spaces or special characters
+    # are passed as a single argument to each script.  The tool_command handler
+    # in the attractor engine uses asyncio.create_subprocess_shell, which passes
+    # the string to /bin/sh -c; without quoting, a filename like
+    # "Call with Brian.md" would be word-split by the shell into three separate
+    # argv entries, breaking archive/fail operations for any source with spaces.
+    archive_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_ARCHIVE_PY))}"
+        f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(src))} {shlex.quote(str(source_id))}"
+    )
+    fail_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_FAIL_PY))}"
+        f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(src))}"
+    )
 
     # Snapshot process state BEFORE synthesis so the tamper-check node can
     # detect any ledger lines or archive moves the LLM performed during synthesis
@@ -149,7 +169,8 @@ def main() -> int:
         encoding="utf-8",
     )
     tamper_check_cmd = (
-        f"{sys.executable} {INGEST_TAMPER_CHECK_PY} {wiki_dir} {snapshot_path}"
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_TAMPER_CHECK_PY))}"
+        f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(snapshot_path))}"
     )
 
     result = {

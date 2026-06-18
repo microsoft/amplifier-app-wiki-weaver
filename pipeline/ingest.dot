@@ -130,7 +130,15 @@ digraph ingest {
     //   everything else -> fail_handler (non-convergence, error, unset)
     // The unconditional fallback is the fail-safe direction -- more drain,
     // never premature done.
-    run_synthesize -> tamper_check [label="converged",           condition="outcome=success"]
+    //
+    // NOTE on condition value: the assess node in synthesize.dot emits
+    // {"preferred_label": "converged"} via report_outcome when it converges.
+    // The engine propagates this as the folder node's preferred_label, and
+    // conditions.py _resolve_key("outcome") returns preferred_label if set,
+    // falling back to status.value only when preferred_label is null.
+    // Therefore the condition must match "converged" (the actual resolved
+    // value), NOT "outcome=success" (which is shadowed by preferred_label).
+    run_synthesize -> tamper_check [label="converged",           condition="outcome=converged"]
     run_synthesize -> fail_handler [label="else (non-converged)"]
 
     // TAMPER_CHECK routes EXHAUSTIVELY.
