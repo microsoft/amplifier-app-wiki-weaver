@@ -7,28 +7,28 @@ quality, remediation); code owns control, validation, archiving, and dedup.
 
 ## Demo it (any pile of articles → a wiki)
 
-`wiki-weaver` runs under an Amplifier Python interpreter. Invoke it as `python -m wiki_weaver <command>`
-from the repo root.
+Install the `wiki-weaver` command with `uv tool install git+https://github.com/microsoft/amplifier-bundle-wiki-weaver`
+(requires an installed Amplifier — see the README). Installed users invoke it directly as
+`wiki-weaver <command>`; from a clone, use `python -m wiki_weaver <command>` under your Amplifier
+Python interpreter.
 
 ```bash
-PY=/path/to/amplifier/bin/python3   # python3 from your Amplifier install
-cd wiki-weaver
-
-$PY -m wiki_weaver doctor                   # env preflight (all green)
+wiki-weaver doctor                   # env preflight (all green)
 
 # Create a wiki and design a domain-fit schema from your purpose (one LLM call).
-$PY -m wiki_weaver init mywiki \
+wiki-weaver init mywiki \
   --purpose "A research second-brain on distributed systems: answer 'which approach for X',
   compare trade-offs, and track how conclusions evolve as more sources arrive."
 
 cp ~/some_articles/*.md mywiki/_inbox/                  # drop in source material
-$PY -m wiki_weaver ingest --wiki mywiki --max-cycles 5          # weave it in (one source at a time)
-$PY -m wiki_weaver ask "what are the trade-offs of X vs Y?" --wiki mywiki   # query the compiled wiki
-$PY -m wiki_weaver lint --wiki mywiki                           # structural validation -> PASS (exit 0)
+wiki-weaver ingest --wiki mywiki --max-cycles 5          # weave it in (one source at a time)
+wiki-weaver ask "what are the trade-offs of X vs Y?" --wiki mywiki   # query the compiled wiki
+wiki-weaver lint --wiki mywiki                           # structural validation -> PASS (exit 0)
 ```
 
-Prefer a generic, no-LLM scaffold? Use `$PY -m wiki_weaver init mywiki --plain` (free, instant) and
-`ingest`/`ask`/`lint` the same way.
+Prefer a generic, no-LLM scaffold? Use `wiki-weaver init mywiki --plain` (free, instant) and
+`ingest`/`ask`/`lint` the same way. (From a clone, swap `wiki-weaver` for
+`python -m wiki_weaver` under your Amplifier interpreter.)
 
 Each source is ingested, structurally validated, quality-assessed, and — only when it
 genuinely converges — archived with a provenance entry. Re-running is idempotent

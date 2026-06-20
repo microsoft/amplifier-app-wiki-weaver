@@ -60,7 +60,7 @@ wiki-weaver doctor
 
 # 1. Create a wiki and design a schema for YOUR purpose (one LLM call, ~30–60s).
 #    The --purpose text should describe the intended use and the outcomes you want.
-python -m wiki_weaver init mywiki \
+wiki-weaver init mywiki \
   --purpose "A personal research second-brain on distributed systems: answer 'which
   approach fits problem X', compare trade-offs between techniques, and track how my
   conclusions evolve as I read more."
@@ -70,17 +70,17 @@ cp ~/notes/*.md mywiki/_inbox/
 
 # 3. Weave the sources in. Re-run any time you add more to _inbox/ — it picks up where
 #    it left off (already-ingested sources are deduped by content hash).
-python -m wiki_weaver ingest --wiki mywiki --max-cycles 5
+wiki-weaver ingest --wiki mywiki --max-cycles 5
 
 # 4. Ask questions — answered by reading the compiled wiki, with citations.
-python -m wiki_weaver ask "what are the trade-offs between leader-based and leaderless replication?" \
+wiki-weaver ask "what are the trade-offs between leader-based and leaderless replication?" \
   --wiki mywiki
 
 # 5. Structurally validate the wiki (exit 0 = PASS).
-python -m wiki_weaver lint --wiki mywiki
+wiki-weaver lint --wiki mywiki
 ```
 
-Prefer a generic, no-LLM scaffold? `python -m wiki_weaver init mywiki --plain` skips schema design and
+Prefer a generic, no-LLM scaffold? `wiki-weaver init mywiki --plain` skips schema design and
 uses the built-in generic schema (free, instant). You can always `ingest`/`ask`/`lint` the same
 way afterward.
 
@@ -99,8 +99,8 @@ way afterward.
 
 ## Three ways to use it
 
-**1. CLI (primary surface).** The commands above, via `python -m wiki_weaver <command>` or the
-`wiki-weaver` console script. This is the supported, end-to-end path.
+**1. CLI (primary surface).** The commands above, via the installed `wiki-weaver <command>` console
+script (or `python -m wiki_weaver <command>` from a clone). This is the supported, end-to-end path.
 
 **2. As a library.** The commands are thin wrappers over importable functions in
 `wiki_weaver.engine_runner`. They use the Amplifier runtime at execution time (see Requirements).
