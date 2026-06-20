@@ -36,8 +36,8 @@ at runtime.
 
 ```bash
 # Clone and enter the repo
-git clone https://github.com/microsoft/amplifier-wiki-weaver.git
-cd amplifier-wiki-weaver
+git clone https://github.com/microsoft/amplifier-bundle-wiki-weaver.git
+cd amplifier-bundle-wiki-weaver
 
 # Run tests (deterministic subset — no LLM calls, no API key required)
 python -m pytest eval/ -q
@@ -52,7 +52,9 @@ skipped when `amplifier_foundation` is not importable — CI runs the determinis
 
 ## Running the Full Pipeline
 
-To run actual wiki ingest (requires Amplifier + an LLM provider API key):
+To run actual wiki ingest (requires Amplifier + an LLM provider API key). These commands run
+from a clone via `python -m wiki_weaver <command>`; installed users invoke the same commands as
+`wiki-weaver <command>`:
 
 ```bash
 # Environment preflight
@@ -75,5 +77,5 @@ See [DEMO.md](DEMO.md) for a full demo walkthrough and [docs/](docs/) for design
 
 ## Questions
 
-Open an [issue](https://github.com/microsoft/amplifier-wiki-weaver/issues) for
+Open an [issue](https://github.com/microsoft/amplifier-bundle-wiki-weaver/issues) for
 bugs, feature requests, or questions.
