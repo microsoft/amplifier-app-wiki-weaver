@@ -9,17 +9,28 @@ description = "LLM-wiki ingest pipeline driven by the attractor engine."
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Microsoft Corporation"}]
-# NOTE: amplifier_foundation and unified_llm are RUNTIME prerequisites supplied
-# by an Amplifier installation (https://github.com/microsoft/amplifier). They are
-# not pip-installable dependencies — run wiki-weaver under the Amplifier Python
-# interpreter (e.g. ~/.local/share/uv/tools/amplifier/bin/python3).
-dependencies = []
+# Runtime libraries are declared as git deps so `uv tool install git+...` resolves
+# them into the isolated tool venv (uv tool venvs do NOT share another tool's site
+# packages). Tracked at @main ON PURPOSE: wiki-weaver is a COMPANION to an installed
+# Amplifier ecosystem and must stay in lockstep with it, not pinned to a stale commit.
+#
+# RUNTIME PREREQUISITE (not satisfied by these deps): an Amplifier installation
+# (amplifier-app-cli) for ~/.amplifier config + API keys + the warm bundle cache the
+# attractor engine loads on first ingest. `wiki-weaver doctor` verifies all of this.
+dependencies = [
+    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
+    "amplifier-unified-llm-client @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/unified-llm-client",
+]
 
 [project.urls]
 Repository = "https://github.com/microsoft/amplifier-bundle-wiki-weaver"
 
 [project.scripts]
 wiki-weaver = "wiki_weaver.wiki_weaver:main"
+
+[tool.hatch.metadata]
+# Required so hatchling will build a wheel whose dependencies use direct git URLs.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["wiki_weaver"]

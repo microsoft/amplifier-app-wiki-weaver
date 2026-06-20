@@ -29,6 +29,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -877,6 +878,148 @@ def lint(wiki: str | Path = ".") -> int:
 
 
 # ---------------------------------------------------------------------------
+# preflight: shared HARD-prerequisite checks (single source of truth)
+# ---------------------------------------------------------------------------
+#
+# doctor() renders these verbosely (✓/✗ per check). The command wrappers in
+# wiki_weaver.py call preflight() to fail CLEAN + UPFRONT before any engine or
+# LLM work, so a broken environment never produces a mid-ingest traceback.
+# Both paths run the SAME probes here, so doctor and the gate can never drift.
+
+
+class _EnvCheck(NamedTuple):
+    """One HARD prerequisite probe result (pure detection -- no printing)."""
+
+    ok: bool
+    ok_msg: str
+    fail_msg: str
+    remediation: tuple[str, ...] = ()
+
+
+def _hard_env_checks(*, require_api_key: bool) -> list[_EnvCheck]:
+    """Probe the HARD environment prerequisites in display order.
+
+    ``require_api_key`` gates the ANTHROPIC_API_KEY check: engine/LLM-driven
+    commands (init, ingest, ask) need a key; deterministic ones (lint) do not.
+    All import probes are wrapped so a missing dependency is reported as a
+    failed check, never raised -- the caller decides how loud to be.
+    """
+    checks: list[_EnvCheck] = []
+
+    # API key -- only the engine/LLM-driven commands require it.
+    if require_api_key:
+        checks.append(
+            _EnvCheck(
+                ok=bool(os.environ.get("ANTHROPIC_API_KEY")),
+                ok_msg="ANTHROPIC_API_KEY is set",
+                fail_msg="ANTHROPIC_API_KEY is not set",
+                remediation=(
+                    "  export ANTHROPIC_API_KEY=... (or set it in ~/.amplifier settings)",
+                ),
+            )
+        )
+
+    # foundation is the engine entrypoint; prepare() resolves the loop-pipeline
+    # orchestrator and hook modules from the bundle on demand.
+    try:
+        import amplifier_foundation  # noqa: F401
+
+        checks.append(
+            _EnvCheck(True, "amplifier_foundation importable", "amplifier_foundation")
+        )
+    except Exception as e:  # noqa: BLE001
+        checks.append(
+            _EnvCheck(
+                ok=False,
+                ok_msg="",
+                fail_msg=f"amplifier_foundation not importable: {e}",
+                remediation=(
+                    "  run wiki-weaver under a python env that has amplifier-foundation",
+                    "  (e.g. the interpreter behind ~/.local/bin/amplifier)",
+                ),
+            )
+        )
+
+    # unified_llm must be importable: the engine's DirectProviderBackend fallback
+    # imports it, and a stale unified-llm-client (>=0.2 ships as `llm/`, not
+    # `unified_llm/`) makes that fallback crash AFTER a multi-minute ingest with
+    # ModuleNotFoundError. Catch the regression here in one second instead.
+    #
+    # Name-aware guardrail: if `unified_llm` is missing but `llm` IS present,
+    # that is the v0.2 import-name regression -- emit a specific, actionable
+    # message rather than a generic "not found".
+    try:
+        import unified_llm  # noqa: F401
+
+        checks.append(
+            _EnvCheck(True, "unified_llm importable (engine fallback path safe)", "")
+        )
+    except Exception as e:  # noqa: BLE001
+        import importlib.util
+
+        if importlib.util.find_spec("llm") is not None:
+            # `llm` is present but `unified_llm` isn't -> v0.2 rename regression.
+            checks.append(
+                _EnvCheck(
+                    ok=False,
+                    ok_msg="",
+                    fail_msg=(
+                        "IMPORT REGRESSION: `unified_llm` NOT importable -- but `llm` "
+                        "IS present. The installed amplifier-unified-llm-client uses the "
+                        "new `llm` import layout (v0.2+); this wiki-weaver expects "
+                        "`unified_llm` (v0.1.x). Incompatible -- reinstall wiki-weaver or "
+                        "align the client version."
+                    ),
+                    remediation=(
+                        "  fix: uv tool install --force"
+                        " git+https://github.com/microsoft/amplifier-bundle-wiki-weaver",
+                    ),
+                )
+            )
+        else:
+            # Neither unified_llm nor llm found -- client not installed at all.
+            checks.append(
+                _EnvCheck(
+                    ok=False,
+                    ok_msg="",
+                    fail_msg=f"unified_llm NOT importable: {e}",
+                    remediation=(
+                        "  install the correct client:"
+                        " uv pip install --python <amplifier py> \\",
+                        "  --force-reinstall <attractor-cache>/modules/unified-llm-client"
+                        " (v0.1.x, ships unified_llm/)",
+                    ),
+                )
+            )
+
+    # structural validator presence (deterministic lint + ingest verify nodes).
+    checks.append(
+        _EnvCheck(
+            ok=VALIDATE_PY.is_file(),
+            ok_msg=f"structural validator found: {VALIDATE_PY}",
+            fail_msg=f"validate_wiki.py missing: {VALIDATE_PY}",
+        )
+    )
+
+    return checks
+
+
+def preflight(*, require_api_key: bool) -> list[str]:
+    """Return HARD-prerequisite failure messages (empty list = environment OK).
+
+    Command wrappers call this BEFORE any engine/LLM work so a broken
+    environment fails CLEAN + UPFRONT (no mid-ingest traceback). doctor() runs
+    the SAME probes (via ``_hard_env_checks``) for its verbose report, so the
+    two can never drift.
+    """
+    return [
+        c.fail_msg
+        for c in _hard_env_checks(require_api_key=require_api_key)
+        if not c.ok
+    ]
+
+
+# ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
 
@@ -885,13 +1028,18 @@ def doctor(*, wiki: str | Path | None = None) -> int:
     """Run environment diagnostics, optionally checking a specific wiki."""
     ok = True
 
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        _ok("ANTHROPIC_API_KEY is set")
-    else:
-        _fail("ANTHROPIC_API_KEY is not set")
-        ok = False
+    # HARD prerequisites -- the SAME probes the command wrappers gate on, so the
+    # verbose report and the upfront gate can never disagree.
+    for c in _hard_env_checks(require_api_key=True):
+        if c.ok:
+            _ok(c.ok_msg)
+        else:
+            _fail(c.fail_msg)
+            for line in c.remediation:
+                _warn(line)
+            ok = False
 
-    # Engine runner imports cleanly (no engine cost yet).
+    # Engine runner imports cleanly (local code; needed for the WARN probes).
     try:
         from wiki_weaver.engine_runner import (
             ATTRACTOR_PIPELINE_LOCAL,
@@ -901,33 +1049,41 @@ def doctor(*, wiki: str | Path | None = None) -> int:
         _fail(f"could not load engine_runner: {e}")
         return 1
 
-    # foundation is the only hard import requirement; prepare() resolves the
-    # loop-pipeline orchestrator and hook modules from the bundle on demand.
-    try:
-        import amplifier_foundation  # noqa: F401
-
-        _ok("amplifier_foundation importable")
-    except Exception as e:  # noqa: BLE001
-        _fail(f"amplifier_foundation not importable: {e}")
-        _warn("  run wiki-weaver under a python env that has amplifier-foundation")
-        _warn("  (e.g. the interpreter behind ~/.local/bin/amplifier)")
-        ok = False
-
-    # unified_llm must be importable: the engine's DirectProviderBackend fallback
-    # imports it, and a stale unified-llm-client (>=0.2 ships as `llm/`, not
-    # `unified_llm/`) makes that fallback crash AFTER a multi-minute ingest with
-    # ModuleNotFoundError. Catch the regression here in one second instead.
-    try:
-        import unified_llm  # noqa: F401
-
-        _ok("unified_llm importable (engine fallback path safe)")
-    except Exception as e:  # noqa: BLE001
-        _fail(f"unified_llm NOT importable: {e}")
-        _warn("  install the correct client: uv pip install --python <amplifier py> \\")
+    # Amplifier runtime present: wiki-weaver is a companion tool. The engine's
+    # load_bundle() fetches the attractor-pipeline bundle on first ingest and
+    # reads API keys from ~/.amplifier/settings. A missing or empty cache means
+    # first ingest will cold-fetch from git (needs network + Amplifier install).
+    _amplifier_home = Path.home() / ".amplifier"
+    _amplifier_cache = _amplifier_home / "cache"
+    if not _amplifier_home.is_dir():
         _warn(
-            "  --force-reinstall <attractor-cache>/modules/unified-llm-client (v0.1.x, ships unified_llm/)"
+            "~/.amplifier/ not found — Amplifier (amplifier-app-cli) does not appear "
+            "installed/initialized. wiki-weaver is a companion tool; first ingest will "
+            "cold-fetch the engine bundle and requires network + an Amplifier install. "
+            "See README."
         )
-        ok = False
+    elif not _amplifier_cache.is_dir() or not any(_amplifier_cache.iterdir()):
+        _warn(
+            "~/.amplifier/cache/ is missing or empty — Amplifier may not be fully "
+            "initialized; first ingest will cold-fetch the engine bundle from git. "
+            "Initialize Amplifier first, or ensure network access is available."
+        )
+    else:
+        _ok("Amplifier runtime present (~/.amplifier/cache is non-empty)")
+
+    # Network reachability: load_bundle() fetches from github.com when the cache
+    # is cold. Fast TCP-only probe (no HTTP, no auth, no bundle load) — non-fatal
+    # WARN so it never blocks a user with an already-warm cache.
+    import socket as _socket
+
+    try:
+        with _socket.create_connection(("github.com", 443), timeout=3):
+            _ok("network: github.com:443 reachable")
+    except OSError as e:
+        _warn(
+            f"network: github.com:443 unreachable ({type(e).__name__}: {e}) — "
+            "first ingest fetches the attractor engine bundle and will fail offline"
+        )
 
     if ATTRACTOR_PIPELINE_LOCAL:
         pipeline_bundle = Path(ATTRACTOR_PIPELINE_LOCAL)
@@ -970,12 +1126,6 @@ def doctor(*, wiki: str | Path | None = None) -> int:
             _warn(
                 f"context-intelligence server DOWN/unreachable at {server_url} ({type(e).__name__}); OK -- hook fails soft, local events.jsonl still written"
             )
-
-    if VALIDATE_PY.is_file():
-        _ok(f"structural validator found: {VALIDATE_PY}")
-    else:
-        _fail(f"validate_wiki.py missing: {VALIDATE_PY}")
-        ok = False
 
     if wiki:
         wiki_path = Path(wiki).resolve()
@@ -1093,6 +1243,3 @@ def ask(
         if result.pages_used:
             print(f"\nPages consulted: {', '.join(result.pages_used)}")
     return 0
-
-
-

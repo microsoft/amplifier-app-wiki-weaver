@@ -31,15 +31,25 @@ without any tooling.
 
 ## Quick start
 
-`wiki-weaver` runs under an [Amplifier](https://github.com/microsoft/amplifier) Python
-interpreter (see [Requirements](#requirements)). Invoke it as `python -m wiki_weaver <command>` from
-the repo root (the `wiki-weaver` console script is equivalent if installed).
+Install the `wiki-weaver` command with one line (requires an [Amplifier](https://github.com/microsoft/amplifier)
+installation — see [Requirements](#requirements)):
 
 ```bash
-cd wiki-weaver
+uv tool install git+https://github.com/microsoft/amplifier-bundle-wiki-weaver
+```
 
-# 0. Preflight — verifies the runtime, provider key, and validator are all present.
-python -m wiki_weaver doctor
+`wiki-weaver` is a **companion** to an installed Amplifier: it tracks `@main` of the Amplifier
+runtime libraries so it stays in lockstep with your ecosystem, and it uses your Amplifier
+install at runtime for provider keys and the engine bundle cache. (Equivalently, run it from a
+clone as `python -m wiki_weaver <command>`.)
+
+Every command runs a fast preflight first and **fails loud and clean** — with a clear message,
+no traceback — if the environment is missing a prerequisite (runtime, provider key, or the
+import-name regression check). Run `doctor` any time for the full report:
+
+```bash
+# 0. Preflight — verifies the runtime, provider key, network, and validator are all present.
+wiki-weaver doctor
 
 # 1. Create a wiki and design a schema for YOUR purpose (one LLM call, ~30–60s).
 #    The --purpose text should describe the intended use and the outcomes you want.
@@ -86,8 +96,7 @@ way afterward.
 `wiki-weaver` console script. This is the supported, end-to-end path.
 
 **2. As a library.** The commands are thin wrappers over importable functions in
-`cli.engine_runner`. They need the Amplifier runtime (see Requirements) — this is **not** a
-standalone `pip install`.
+`wiki_weaver.engine_runner`. They use the Amplifier runtime at execution time (see Requirements).
 
 ```python
 from wiki_weaver.engine_runner import run_init, run_ingest, run_ask, run_lint
@@ -155,12 +164,15 @@ richest synthesis via `WIKI_WEAVER_MODEL`.
 ## Requirements
 
 - Python 3.11+
-- An [Amplifier](https://github.com/microsoft/amplifier) installation — the pipeline runs on
-  the attractor engine and routes to a configured LLM provider. Run wiki-weaver under the
-  Amplifier Python interpreter (e.g. `~/.local/share/uv/tools/amplifier/bin/python3`); the
-  `amplifier_foundation` and `unified_llm` packages are supplied by that runtime, **not** by
-  `pip install`. `python -m wiki_weaver doctor` verifies they're importable.
+- An [Amplifier](https://github.com/microsoft/amplifier) installation. `uv tool install` resolves
+  the `amplifier_foundation` and `unified_llm` libraries (tracked at `@main`) into wiki-weaver's
+  own tool venv, so the CLI imports cleanly — but the engine still uses your Amplifier install at
+  **runtime** for provider keys and the cached engine bundle it loads on first `ingest`. wiki-weaver
+  is a companion to that runtime, not a self-contained replacement for it.
 - `ANTHROPIC_API_KEY` (or the relevant provider key) set in the environment.
+
+`wiki-weaver doctor` verifies all of the above, and every command runs the same checks as a
+preflight — so a missing prerequisite fails fast with a clear message, never a mid-run traceback.
 
 ## Contributing
 
