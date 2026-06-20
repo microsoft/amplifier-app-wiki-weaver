@@ -27,11 +27,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._assets import pipeline_dir
+
 # --------------------------------------------------------------------------
 # Built-in defaults (the engine's own pipeline/ assets).
 # --------------------------------------------------------------------------
 
-_PIPELINE = Path(__file__).resolve().parent.parent / "pipeline"
+# Resolves the wheel sibling (wiki_weaver_pipeline/) or the dev tree (pipeline/).
+_PIPELINE = pipeline_dir()
 _DEF_SCHEMA = _PIPELINE / "SCHEMA.md"
 _DEF_RUBRIC = _PIPELINE / "CONVERGENCE_RUBRIC.md"
 _DEF_INNERDOT = _PIPELINE / "synthesize.dot"

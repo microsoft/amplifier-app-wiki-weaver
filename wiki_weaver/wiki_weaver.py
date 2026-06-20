@@ -28,6 +28,7 @@ from wiki_weaver.lib import (
     INBOX,
     REGISTRY_NAME,
     _assign_source_id,
+    _fail,
     _parse_transcript_header,
     _read_source_frontmatter,
     ask,
@@ -35,6 +36,7 @@ from wiki_weaver.lib import (
     ingest,
     init,
     lint,
+    preflight,
     query,
 )
 
@@ -65,7 +67,28 @@ __all__ = [
 # which is what existing tests and the main() dispatch expect.
 
 
+def _gate(*, require_api_key: bool) -> int:
+    """Run the HARD-prereq preflight; return 0 if OK, nonzero if not.
+
+    On failure, print the clean one/two-line message(s) + a doctor hint so a
+    broken environment fails UPFRONT instead of crashing minutes into an
+    engine/LLM run. preflight() catches ImportError etc. internally, so nothing
+    bubbles up as a traceback.
+    """
+    failures = preflight(require_api_key=require_api_key)
+    if not failures:
+        return 0
+    for msg in failures:
+        _fail(msg)
+    print("Run `wiki-weaver doctor` for full diagnostics.")
+    return 1
+
+
 def cmd_init(args: argparse.Namespace) -> int:
+    # init drives the engine + LLM (schema design) -> full preflight w/ key.
+    if rc := _gate(require_api_key=True):
+        return rc
+
     from wiki_weaver.engine_runner import run_init
 
     return run_init(
@@ -77,6 +100,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
+    # ingest drives the engine + LLM convergence loop -> full preflight w/ key.
+    if rc := _gate(require_api_key=True):
+        return rc
+
     return ingest(
         args.wiki,
         source=args.source,
@@ -86,6 +113,11 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
+    # lint runs validate_wiki.py deterministically through the engine -- no LLM
+    # call, so it needs foundation + the validator but NOT an API key.
+    if rc := _gate(require_api_key=False):
+        return rc
+
     from wiki_weaver.engine_runner import run_lint
 
     return run_lint(args.wiki)
@@ -96,10 +128,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_query(args: argparse.Namespace) -> int:
+    # query is a pure substring grep over the compiled wiki -- no engine, no
+    # foundation, no key. Deliberately NOT gated so it works fully offline.
     return query(args.wiki, args.term)
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
+    # ask spawns an engine sub-session that reads the wiki + calls the LLM ->
+    # full preflight w/ key.
+    if rc := _gate(require_api_key=True):
+        return rc
+
     return ask(args.wiki, args.question, json_out=args.json_out)
 
 

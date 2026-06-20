@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ._assets import pipeline_dir
 from .policy import WikiPolicy, load_policy
 
 # --------------------------------------------------------------------------
@@ -37,7 +38,10 @@ from .policy import WikiPolicy, load_policy
 # --------------------------------------------------------------------------
 
 WIKI_WEAVER_ROOT = Path(__file__).resolve().parent.parent
-PIPELINE_DIR = WIKI_WEAVER_ROOT / "pipeline"
+# Resolve the pipeline-asset directory for the active install layout (real wheel
+# ships them at site-packages/wiki_weaver_pipeline/; dev tree at repo-root
+# pipeline/). See wiki_weaver._assets.pipeline_dir for the dual-path logic.
+PIPELINE_DIR = pipeline_dir()
 INNER_DOT = PIPELINE_DIR / "synthesize.dot"
 # ingest.dot: the parent DAG that invokes synthesize.dot as a folder sub-pipeline.
 INGEST_DOT = PIPELINE_DIR / "ingest.dot"
@@ -1162,7 +1166,6 @@ def run_thin_slice(
         "logs_dir": str(logs_dir),
         "raw": text[:2000],
     }
-
 
 
 # --------------------------------------------------------------------------

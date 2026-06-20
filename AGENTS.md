@@ -28,9 +28,11 @@ Commands are **thin lib wrappers over attractor `.dot` pipelines**:
   execution. The `.dot` files are **not** drop-in standalone.
 - `cli/policy.py` — resolves per-wiki schema/rubric/model overrides (`<wiki>/policy/…`).
 
-Runtime: requires the Amplifier runtime (`amplifier_foundation` + `unified_llm`); `pyproject`
-deps are intentionally empty — **not** a standalone `pip install`. Run under the Amplifier
-Python interpreter. `python -m wiki_weaver doctor` verifies the runtime is importable.
+Runtime: requires the Amplifier runtime (`amplifier_foundation` + `unified_llm`). `pyproject`
+declares these as `@main` git deps + `allow-direct-references`, so `uv tool install git+...`
+resolves them into an isolated tool venv (it is NOT self-contained — it still uses an installed
+Amplifier at runtime for provider keys + the cached engine bundle). `python -m wiki_weaver doctor`
+(and every command's preflight) verifies the runtime is importable.
 
 ## Build / test
 
