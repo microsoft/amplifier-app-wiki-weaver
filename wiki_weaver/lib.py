@@ -31,6 +31,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
 
+from ._assets import pipeline_dir
+
 GREEN = "\033[32m"
 RED = "\033[31m"
 YELLOW = "\033[33m"
@@ -41,9 +43,10 @@ INBOX = "_inbox"
 ARCHIVE = "_archive"
 FAILED = "_failed"
 
-# Pipeline assets live alongside the cli/ package's repo root.
+# Pipeline assets resolve to the wheel sibling (wiki_weaver_pipeline/) on a real
+# install or the repo-root pipeline/ in a dev tree -- see wiki_weaver._assets.
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VALIDATE_PY = REPO_ROOT / "pipeline" / "validate_wiki.py"
+VALIDATE_PY = pipeline_dir() / "validate_wiki.py"
 
 
 def _ok(msg: str) -> None:
