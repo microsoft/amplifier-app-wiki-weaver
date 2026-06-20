@@ -29,8 +29,10 @@ or comments.
 ## Development Setup
 
 Wiki-Weaver runs on top of [Amplifier](https://github.com/microsoft/amplifier).
-The ingest pipeline calls into `amplifier_foundation` and `unified_llm`, which are
-provided by the Amplifier installation — not installable via pip separately.
+The ingest pipeline calls into `amplifier_foundation` and `unified_llm`, which `pyproject`
+declares as `@main` git deps — so `uv tool install git+...` (and `uv tool upgrade wiki-weaver`)
+resolve them — while an installed Amplifier still supplies provider keys and the engine bundle
+at runtime.
 
 ```bash
 # Clone and enter the repo

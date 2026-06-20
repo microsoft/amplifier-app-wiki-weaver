@@ -43,6 +43,13 @@ runtime libraries so it stays in lockstep with your ecosystem, and it uses your 
 install at runtime for provider keys and the engine bundle cache. (Equivalently, run it from a
 clone as `python -m wiki_weaver <command>`.)
 
+Because it tracks `@main`, update it the same way you would any uv tool — this re-fetches the
+latest `wiki-weaver` and its `@main` runtime libraries:
+
+```bash
+uv tool upgrade wiki-weaver
+```
+
 Every command runs a fast preflight first and **fails loud and clean** — with a clear message,
 no traceback — if the environment is missing a prerequisite (runtime, provider key, or the
 import-name regression check). Run `doctor` any time for the full report:
