@@ -1,0 +1,72 @@
+// wiki-weaver is a small Amplifier add-on that turns a folder of notes into a connected, linked wiki.
+digraph wiki_weaver {
+    rankdir=LR
+    fontname="Helvetica"
+    fontsize=12
+    label="Wiki Weaver\nA plug-in that builds a linked wiki from your notes — v0.1.0"
+    labelloc=t
+    labeljust=c
+    nodesep=0.6
+    ranksep=0.7
+    bgcolor="white"
+    source_hash="e1a5d1bb38f0bfa637cebc51d4af5c933af271139e259e67a33d65843424d531"
+
+    node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
+    edge [fontname="Helvetica", fontsize=9]
+
+    root_wiki_weaver [label="Wiki Weaver (main package) v0.1.0\n0 tools · 0 agents\n~1016 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+
+    subgraph cluster_behaviors {
+        label="Features it adds"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        beh_wiki_weaver_behavior [label="Wiki-building feature\n1 tools · 1 ctx\n~1055 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+    }
+
+    subgraph cluster_modules {
+        label="The working tools"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        mod_tool_wiki_weaver [label="Wiki builder tool\n4 tool · ~354 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+    }
+
+    subgraph cluster_context {
+        label="Background notes for the assistant"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        ctx_wiki_weaver_awareness_md [label="How-it-works guide\nwiki-weaver-awareness.md\n~812 tok", shape=box, fillcolor="#e1bee7", style="filled,rounded"]
+    }
+
+    subgraph cluster_legend {
+        label="Legend (what the colors mean)"
+        style="filled"
+        fillcolor="white"
+        color="#cccccc"
+        fontsize=9
+
+        leg_root [label="main package", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", fontsize=9]
+        leg_behavior [label="feature", shape=box, fillcolor="#e0f2f1", style="filled,rounded", fontsize=9]
+        leg_agent [label="helper", shape=box, fillcolor="#c8e6c9", style="filled,rounded", fontsize=9]
+        leg_module [label="tool", shape=box, fillcolor="#bbdefb", style="filled,rounded", fontsize=9]
+        leg_provider [label="AI service", shape=box, fillcolor="#e0e0e0", style="filled,rounded", fontsize=9]
+        leg_context [label="background notes", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_standalone [label="ready-to-use", shape=box, fillcolor="#80cbc4", style="filled,rounded", fontsize=9]
+        leg_experiment [label="experiment", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_ext_cost [label="outside + hidden cost", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2, fontsize=9]
+        leg_ext_muted [label="outside + no cost", shape=box, fillcolor="#f5f5f5", style="dashed", fontsize=9]
+    }
+
+    disclaimer [label="Token estimates: ~4 chars/token\nSolid border = local (counted)\nDashed + red = external, hidden cost (not counted)\nDashed + muted = external, no cost\nExcludes: sub-session costs, runtime-dynamic", shape=note, fillcolor="#eceff1", style="filled", fontsize=9]
+
+
+    root_wiki_weaver -> beh_wiki_weaver_behavior [label="composes"]
+    beh_wiki_weaver_behavior -> mod_tool_wiki_weaver [label="uses", penwidth=0.8]
+    beh_wiki_weaver_behavior -> ctx_wiki_weaver_awareness_md [style=dotted, color=purple]
+    root_wiki_weaver -> ctx_wiki_weaver_awareness_md [style=dotted, color=purple]
+}

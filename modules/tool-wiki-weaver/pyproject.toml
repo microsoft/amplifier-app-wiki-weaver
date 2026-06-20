@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amplifier-module-tool-wiki-weaver"
+version = "0.1.0"
+description = "Amplifier tool module: exposes the wiki-weaver commands (init, ingest, ask, lint) as mountable tools in an AmplifierSession."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# wiki-weaver is a PEER dependency — the bundle root's pyproject.toml declares the
+# `wiki-weaver` package, and Bundle.prepare() installs it (editable) BEFORE activating
+# modules, so `wiki_weaver` is importable here. Listing it would make
+# `uv pip install --no-sources` try (and fail) to resolve it from PyPI.
+# amplifier-core is likewise a peer dependency provided by the host amplifier install.
+dependencies = []
+
+[project.entry-points."amplifier.modules"]
+tool-wiki-weaver = "amplifier_module_tool_wiki_weaver:mount"
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_module_tool_wiki_weaver"]
