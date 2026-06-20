@@ -16,7 +16,7 @@ authors = [{name = "Microsoft Corporation"}]
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/microsoft/amplifier-wiki-weaver"
+Repository = "https://github.com/microsoft/amplifier-bundle-wiki-weaver"
 
 [project.scripts]
 wiki-weaver = "wiki_weaver.wiki_weaver:main"
