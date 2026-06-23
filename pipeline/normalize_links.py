@@ -37,7 +37,13 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from pipeline.validate_wiki import _parse_frontmatter, _slug  # noqa: E402
+# The pipeline/ dir is force-included into the installed wheel as
+# `wiki_weaver_pipeline`, but stays `pipeline` when run from the repo tree.
+# Resolve against both so this works installed AND in-repo.
+try:
+    from wiki_weaver_pipeline.validate_wiki import _parse_frontmatter, _slug  # noqa: E402
+except ModuleNotFoundError:
+    from pipeline.validate_wiki import _parse_frontmatter, _slug  # noqa: E402
 
 # Capture the full inside of [[ ... ]] — we parse target / section / display.
 _WIKILINK = re.compile(r"\[\[([^\]]+)\]\]")
