@@ -104,7 +104,7 @@ task 2. Provider lift and the provider registry build on a stable, pinned engine
 |---|------|---------|--------|
 | 1 | Pin the engine (pin map + `source_resolver`) | `engine_runner.py`, new `pins.py` | **PLANNED** |
 | 2 | Seam fix: explicit warm + verify-only runtime + coherence assert | `engine_runner.py`, `lib.py` (doctor) | **PLANNED** |
-| 3 | Lift provider/model into ALL DOTs (incl. `synthesize.dot` + ingest drain path) | `engine_runner.py`, `pipeline/synthesize.dot` | **Model selection DONE** (live family resolution, #68/#6); provider lift + `synthesize.dot` drain-path substitution **PLANNED / VERIFY** |
+| 3 | Lift provider/model into ALL DOTs (incl. `synthesize.dot` + ingest drain path) | `engine_runner.py`, `pipeline/synthesize.dot` | **DONE** — model selection via live family resolution (#68/#6); `synthesize.dot` model+provider substitution now applies on BOTH the CLI (`build_dot`) and the `run_ingest` drain path (materializes a resolved copy via the shared `_substitute_models` helper); verified live (opus/haiku per-stage, zero residual sonnet) |
 | 4 | Provider registry + pinned extras + `provider` subcommands + global config/secrets | new `providers.py`, new `config.py`, `pyproject.toml`, `wiki_weaver.py`, `lib.py` | **PLANNED** |
 
 ---
