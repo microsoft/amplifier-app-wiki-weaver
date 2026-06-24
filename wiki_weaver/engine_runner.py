@@ -16,7 +16,7 @@ PROPER PreparedBundle path (no sys.path hacks, no raw mount-plan):
 ``prepared.spawn`` composes parent -> child by default, so the context-intelligence
 hook is inherited by every per-node sub-session automatically.
 
-The OUTER corpus sweep is a plain Python loop in the CLI (see wiki_weaver.py).
+The OUTER corpus sweep is a plain Python loop in the CLI (see wiki_weaver/cli.py).
 """
 
 from __future__ import annotations

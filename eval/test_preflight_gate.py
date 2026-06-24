@@ -21,7 +21,7 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from wiki_weaver.lib import preflight  # noqa: E402
-from wiki_weaver.wiki_weaver import cmd_ingest, cmd_query  # noqa: E402
+from wiki_weaver.cli import cmd_ingest, cmd_query  # noqa: E402
 
 # The "env is clean -> preflight returns []" assertion only holds in a fully
 # provisioned dev environment. CI is deliberately lightweight (no Amplifier runtime,
@@ -74,7 +74,7 @@ def test_cmd_ingest_gates_before_engine(monkeypatch, tmp_path, capsys) -> None:
     def _boom(*_a, **_k):  # pragma: no cover - must never run
         raise AssertionError("ingest() reached despite failed preflight")
 
-    monkeypatch.setattr("wiki_weaver.wiki_weaver.ingest", _boom)
+    monkeypatch.setattr("wiki_weaver.cli.ingest", _boom)
 
     args = argparse.Namespace(
         wiki=str(tmp_path), source=None, max_cycles=None, keep_going=False

@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import argparse
 
-from wiki_weaver import __version__
+from wiki_weaver._version import __version__
 
 # ---------------------------------------------------------------------------
-# Re-exports: symbols imported by tests from wiki_weaver.wiki_weaver (backward compat)
+# Re-exports: symbols imported by tests from wiki_weaver.cli
 # ---------------------------------------------------------------------------
 from wiki_weaver.lib import (
     ARCHIVE,
@@ -63,8 +63,8 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # cmd_* wrappers: unpack argparse.Namespace → call lib function
 # ---------------------------------------------------------------------------
-# These stay here (not in lib) so they remain importable from wiki_weaver.wiki_weaver,
-# which is what existing tests and the main() dispatch expect.
+# These stay here (not in lib) so they remain importable from wiki_weaver.cli,
+# which is what tests and the main() dispatch expect.
 
 
 def _gate(*, require_api_key: bool) -> int:

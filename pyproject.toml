@@ -26,7 +26,7 @@ dependencies = [
 Repository = "https://github.com/microsoft/amplifier-bundle-wiki-weaver"
 
 [project.scripts]
-wiki-weaver = "wiki_weaver.wiki_weaver:main"
+wiki-weaver = "wiki_weaver.cli:main"
 
 [tool.hatch.metadata]
 # Required so hatchling will build a wheel whose dependencies use direct git URLs.
