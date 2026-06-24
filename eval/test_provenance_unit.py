@@ -14,11 +14,11 @@ import json
 import sys
 from pathlib import Path
 
-# Insert the repo root so we can import wiki_weaver.wiki_weaver without installing.
+# Insert the repo root so we can import wiki_weaver.cli without installing.
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-from wiki_weaver.wiki_weaver import (  # noqa: E402
+from wiki_weaver.cli import (  # noqa: E402
     REGISTRY_NAME,
     _assign_source_id,
     _read_source_frontmatter,

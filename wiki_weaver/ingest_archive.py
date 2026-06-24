@@ -29,19 +29,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# When run as __main__ Python inserts the script's directory (wiki_weaver/) at
-# sys.path[0], making wiki_weaver.py visible as the top-level 'wiki_weaver' module
-# and causing a circular import.  Ensure the *parent* of the script's directory
-# (repo root in a checkout; site-packages in an installed package) is at position 0
-# so the wiki_weaver *package* (directory with __init__.py) is found first.
-_PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
-if sys.path[:1] != [_PACKAGE_PARENT]:
-    try:
-        sys.path.remove(_PACKAGE_PARENT)
-    except ValueError:
-        pass
-    sys.path.insert(0, _PACKAGE_PARENT)
-
 
 def _find_ingest_logs_dir(wiki_dir: Path) -> Path:
     """Return the most-recent ingest-* run directory under <wiki>/.runs/.
