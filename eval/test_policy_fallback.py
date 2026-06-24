@@ -49,6 +49,7 @@ from wiki_weaver.engine_runner import (  # noqa: E402
     RUBRIC_PATH,
     SCHEMA_PATH,
     VALIDATE_PY,
+    _substitute_models,
     build_ask_dot,
     build_ask_dot_from_file,
     build_dot,
@@ -676,3 +677,159 @@ class TestValidatorDefaults:
         assert "catalog" not in orphans_custom, (
             "Custom validator must NOT flag 'catalog' as orphan when in nav_pages"
         )
+
+
+# ---------------------------------------------------------------------------
+# Group 4 — _substitute_models: run_ingest model-substitution gap
+# ---------------------------------------------------------------------------
+
+
+class TestSubstituteModels:
+    """_substitute_models rewrites all 3 LLM nodes in synthesize.dot text.
+
+    Approach: unit-test the helper directly (no LLM, no network, no pipeline run).
+    Feed it synthesize.dot's real text plus a monkeypatched resolve_model so that
+    'opus' -> 'claude-opus-4-8'.  Assert:
+      - all 3 nodes carry llm_model="claude-opus-4-8"
+      - no residual hardcoded claude-sonnet-4-6 survives in ANY node block
+    This proves the closure that run_ingest now materialises before passing the
+    path to the engine.
+    """
+
+    # Monkeypatch target: resolve_model as imported in engine_runner's namespace.
+    _RESOLVE_TARGET = "wiki_weaver.engine_runner.resolve_model"
+
+    @staticmethod
+    def _opus_resolver(provider: str, spec: str) -> str:
+        """All family tokens -> opus id; explicit ids pass through unchanged."""
+        _OPUS_FAMILIES = {"opus", "sonnet", "haiku"}
+        if spec.lower() in _OPUS_FAMILIES:
+            return "claude-opus-4-8"
+        return spec  # explicit id pass-through
+
+    def test_all_three_nodes_rewritten(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """All LLM_NODE_IDS in synthesize.dot are rewritten to claude-opus-4-8."""
+        monkeypatch.setattr(self._RESOLVE_TARGET, self._opus_resolver)
+
+        dot_text = INNER_DOT.read_text(encoding="utf-8")
+
+        # Build a policy that asks for 'opus' for every node (including feedback,
+        # which has a different default) so all three fire through the same path.
+        policy = WikiPolicy(
+            provider="anthropic",
+            models={
+                "default": "opus",
+                "ingest": "opus",
+                "assess": "opus",
+                "feedback": "opus",
+            },
+            max_cycles=1,
+            parallelism=1,
+            inner_dot_path=INNER_DOT,
+            schema_path=SCHEMA_PATH,
+            convergence_rubric_path=CONVERGENCE_RUBRIC_PATH,
+            validator_config_path=None,
+        )
+
+        result = _substitute_models(dot_text, policy)
+
+        for node_id in LLM_NODE_IDS:
+            # Isolate the node block so we check only the relevant region.
+            node_opener = f"    {node_id} [\n"
+            idx = result.find(node_opener)
+            assert idx != -1, f"Node '{node_id}' not found in synthesize.dot"
+            node_close = result.find("\n    ]", idx + len(node_opener))
+            assert node_close != -1, f"Node '{node_id}' block not closed"
+            block = result[idx:node_close]
+            assert 'llm_model="claude-opus-4-8"' in block, (
+                f"Node '{node_id}' should have llm_model=\"claude-opus-4-8\", got:\n{block}"
+            )
+
+    def test_no_residual_hardcoded_sonnet(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After substitution, no node block retains the hardcoded claude-sonnet-4-6."""
+        monkeypatch.setattr(self._RESOLVE_TARGET, self._opus_resolver)
+
+        dot_text = INNER_DOT.read_text(encoding="utf-8")
+
+        policy = WikiPolicy(
+            provider="anthropic",
+            models={"default": "opus", "feedback": "opus"},
+            max_cycles=1,
+            parallelism=1,
+            inner_dot_path=INNER_DOT,
+            schema_path=SCHEMA_PATH,
+            convergence_rubric_path=CONVERGENCE_RUBRIC_PATH,
+            validator_config_path=None,
+        )
+
+        result = _substitute_models(dot_text, policy)
+
+        # Check that none of the 3 LLM node blocks still carry the original default.
+        for node_id in LLM_NODE_IDS:
+            node_opener = f"    {node_id} [\n"
+            idx = result.find(node_opener)
+            assert idx != -1
+            node_close = result.find("\n    ]", idx + len(node_opener))
+            assert node_close != -1
+            block = result[idx:node_close]
+            assert "claude-sonnet-4-6" not in block, (
+                f"Node '{node_id}' still has hardcoded claude-sonnet-4-6 after substitution"
+            )
+
+    def test_provider_also_substituted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """llm_provider is overwritten to match policy.provider in every node."""
+        monkeypatch.setattr(self._RESOLVE_TARGET, self._opus_resolver)
+
+        dot_text = INNER_DOT.read_text(encoding="utf-8")
+        policy = WikiPolicy(
+            provider="anthropic",
+            models={"default": "opus", "feedback": "opus"},
+            max_cycles=1,
+            parallelism=1,
+            inner_dot_path=INNER_DOT,
+            schema_path=SCHEMA_PATH,
+            convergence_rubric_path=CONVERGENCE_RUBRIC_PATH,
+            validator_config_path=None,
+        )
+
+        result = _substitute_models(dot_text, policy)
+
+        for node_id in LLM_NODE_IDS:
+            node_opener = f"    {node_id} [\n"
+            idx = result.find(node_opener)
+            assert idx != -1
+            node_close = result.find("\n    ]", idx + len(node_opener))
+            block = result[idx:node_close]
+            assert 'llm_provider="anthropic"' in block, (
+                f"Node '{node_id}' should have llm_provider=\"anthropic\""
+            )
+
+    def test_build_dot_byte_identical_after_refactor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """build_dot still delegates to _substitute_models and produces the same
+        output it did before the refactor (byte-identical behaviour check)."""
+        monkeypatch.setattr(self._RESOLVE_TARGET, _mock_resolve)
+
+        wiki = _make_wiki(tmp_path)
+        src = _make_source(tmp_path)
+        policy = load_policy(wiki)
+
+        dot = build_dot(src, wiki, policy)
+
+        # Confirm each LLM node carries the mock-resolved id for its family.
+        for node_id in LLM_NODE_IDS:
+            node_opener = f"    {node_id} [\n"
+            idx = dot.find(node_opener)
+            assert idx != -1, f"Node '{node_id}' missing from build_dot output"
+            node_close = dot.find("\n    ]", idx + len(node_opener))
+            block = dot[idx:node_close]
+            # feedback defaults to haiku; others default to sonnet.
+            expected = (
+                "claude-haiku-4-5" if node_id == "feedback" else "claude-sonnet-4-6"
+            )
+            assert f'llm_model="{expected}"' in block, (
+                f"build_dot: node '{node_id}' expected llm_model=\"{expected}\", got:\n{block}"
+            )

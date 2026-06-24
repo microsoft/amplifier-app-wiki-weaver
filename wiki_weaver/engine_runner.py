@@ -174,6 +174,36 @@ def load_ci_config() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _substitute_models(dot_text: str, policy: WikiPolicy) -> str:
+    """Apply per-node llm_provider / llm_model substitutions to a synthesize DOT text.
+
+    Loops over LLM_NODE_IDS, resolves the concrete model id for each node via
+    the policy, and substitutes the ``llm_provider`` and ``llm_model`` attributes
+    in-place.  Returns the modified DOT text.
+
+    Factored out of ``build_dot`` so that ``run_ingest`` can materialise a fully
+    resolved ``synthesize.dot`` into the run directory — making the tool-module
+    path honour ``WIKI_WEAVER_MODEL`` exactly as the CLI path already did.
+    """
+    for node_id in LLM_NODE_IDS:
+        node_opener = f"    {node_id} [\n"
+        idx = dot_text.find(node_opener)
+        if idx == -1:
+            continue
+        node_close = dot_text.find("\n    ]", idx + len(node_opener))
+        if node_close == -1:
+            continue
+        block = dot_text[idx:node_close]
+        spec = policy.model_for(node_id)
+        concrete = resolve_model(policy.provider, spec)
+        block = re.sub(
+            r'llm_provider="[^"]*"', f'llm_provider="{policy.provider}"', block
+        )
+        block = re.sub(r'llm_model="[^"]*"', f'llm_model="{concrete}"', block)
+        dot_text = dot_text[:idx] + block + dot_text[node_close:]
+    return dot_text
+
+
 def build_dot(
     source_path: Path,
     wiki_dir: Path,
@@ -247,22 +277,7 @@ def build_dot(
     # override them here with resolved values so that:
     #   - family tokens ("sonnet", "haiku") resolve to the newest served id, and
     #   - per-stage overrides from wiki.config.yaml take effect.
-    for node_id in LLM_NODE_IDS:
-        node_opener = f"    {node_id} [\n"
-        idx = dot.find(node_opener)
-        if idx == -1:
-            continue
-        node_close = dot.find("\n    ]", idx + len(node_opener))
-        if node_close == -1:
-            continue
-        block = dot[idx:node_close]
-        spec = policy.model_for(node_id)
-        concrete = resolve_model(policy.provider, spec)
-        block = re.sub(
-            r'llm_provider="[^"]*"', f'llm_provider="{policy.provider}"', block
-        )
-        block = re.sub(r'llm_model="[^"]*"', f'llm_model="{concrete}"', block)
-        dot = dot[:idx] + block + dot[node_close:]
+    dot = _substitute_models(dot, policy)
 
     return dot
 
@@ -1117,7 +1132,18 @@ def run_ingest(
         f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_SETUP_PY))}"
         f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(wiki_dir))}"
     )
-    synthesize_dot_abs = str(INNER_DOT)
+
+    # Materialise a fully-resolved synthesize.dot in the run directory so that
+    # the engine executes with the WIKI_WEAVER_MODEL / wiki.config.yaml model,
+    # not the hardcoded defaults baked into the package file.  This closes the
+    # gap where the tool-module path (run_ingest) silently ignored the resolved
+    # model while the CLI path (run_inner / build_dot) honoured it.
+    policy = load_policy(wiki_dir)
+    inner_text = INNER_DOT.read_text(encoding="utf-8")
+    inner_text = _substitute_models(inner_text, policy)
+    resolved_synthesize_dot = logs_dir / "synthesize.dot"
+    resolved_synthesize_dot.write_text(inner_text, encoding="utf-8")
+    synthesize_dot_abs = str(resolved_synthesize_dot)
 
     # The engine names child pipeline logs {logs_dir}/subgraph_{node.id}.
     # On loop iterations 2+, the child engine finds the checkpoint written by
