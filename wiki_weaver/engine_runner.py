@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from ._assets import pipeline_dir
+from .model_resolver import resolve_model
 from .policy import WikiPolicy, load_policy
 
 # --------------------------------------------------------------------------
@@ -104,7 +105,7 @@ PROVIDER = os.environ.get("WIKI_WEAVER_PROVIDER", "anthropic")
 # Explicit model for the LLM nodes. The attractor child agents intentionally
 # carry NO default_model ("no silent defaults"), so the spawning node must name
 # one. The engine forwards it as a provider_preference to the child session.
-MODEL = os.environ.get("WIKI_WEAVER_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("WIKI_WEAVER_MODEL", "sonnet")
 # Optional per-node reasoning_effort (recognized stylesheet property). Unset =>
 # omitted entirely, so default behaviour (e.g. Wave 1 anthropic) is unchanged.
 REASONING_EFFORT = os.environ.get("WIKI_WEAVER_REASONING_EFFORT")
@@ -238,9 +239,31 @@ def build_dot(
     for var, value in substitutions.items():
         dot = dot.replace(var, value)
 
-    # NOTE: llm_provider and llm_model are now declared directly in synthesize.dot
-    # (baked in as self-contained attrs so the DOT works as both a direct pipeline
-    # and a folder sub-pipeline without requiring Python injection here).
+    # Apply per-node provider / model overrides from policy.
+    #
+    # synthesize.dot bakes in defaults (llm_provider="anthropic",
+    # llm_model="claude-sonnet-4-6") as self-contained fallbacks so the DOT can
+    # be loaded directly by the engine without Python injection.  We always
+    # override them here with resolved values so that:
+    #   - family tokens ("sonnet", "haiku") resolve to the newest served id, and
+    #   - per-stage overrides from wiki.config.yaml take effect.
+    for node_id in LLM_NODE_IDS:
+        node_opener = f"    {node_id} [\n"
+        idx = dot.find(node_opener)
+        if idx == -1:
+            continue
+        node_close = dot.find("\n    ]", idx + len(node_opener))
+        if node_close == -1:
+            continue
+        block = dot[idx:node_close]
+        spec = policy.model_for(node_id)
+        concrete = resolve_model(policy.provider, spec)
+        block = re.sub(
+            r'llm_provider="[^"]*"', f'llm_provider="{policy.provider}"', block
+        )
+        block = re.sub(r'llm_model="[^"]*"', f'llm_model="{concrete}"', block)
+        dot = dot[:idx] + block + dot[node_close:]
+
     return dot
 
 
@@ -690,6 +713,9 @@ def build_ask_dot(
 
     prompt_dot = _dot_escape_prompt(prompt)
 
+    # Resolve family token to a concrete served model id before injecting into DOT.
+    model = resolve_model(provider, model)
+
     # Build DOT using plain string concatenation for lines with literal { }
     # to avoid Python f-string brace conflicts.
     lines = [
@@ -745,6 +771,9 @@ def build_ask_dot_from_file(
     dot = dot.replace("$answer_file", answer_file_s)
     # Question is user-supplied and may contain DOT-special chars; escape before injecting.
     dot = dot.replace("$question", _dot_escape_prompt(question))
+
+    # Resolve family token to a concrete served model id before substitution.
+    model = resolve_model(provider, model)
 
     # Apply provider/model override — replace the baked defaults unconditionally so
     # the call is always correct regardless of env-var PROVIDER/MODEL values.
@@ -1386,6 +1415,9 @@ def build_init_dot(
 
     prompt_dot = _dot_escape_prompt(prompt)
 
+    # Resolve family token to a concrete served model id before injecting into DOT.
+    model = resolve_model(provider, model)
+
     lines = [
         "digraph init_wiki {",
         '    graph [goal="Design a domain-adaptive schema for a new wiki"]',
@@ -1437,6 +1469,9 @@ def build_init_dot_from_file(
     dot = dot.replace("$purpose", _dot_escape_prompt(purpose))
     dot = dot.replace("$source_sample", _dot_escape_prompt(source_sample))
     dot = dot.replace("$default_schema", _dot_escape_prompt(default_schema))
+
+    # Resolve family token to a concrete served model id before substitution.
+    model = resolve_model(provider, model)
 
     # Apply provider/model override — replace the baked defaults unconditionally.
     dot = dot.replace('llm_provider="anthropic"', f'llm_provider="{provider}"')

@@ -161,12 +161,16 @@ Full design: [`docs/`](docs/).
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `WIKI_WEAVER_MODEL` | Model for the LLM pipeline/`init` nodes | `claude-sonnet-4-6` |
+| `WIKI_WEAVER_MODEL` | Model (or family) for LLM pipeline/`init` nodes | `sonnet` |
 | `WIKI_WEAVER_PROVIDER` | Provider the LLM nodes route to | `anthropic` |
 
-The default model was chosen by a model-swap eval (`eval/model_sweep.py`): it converged
-reliably with no flakes, faster and cheaper than Opus-class. Use a premium model for the
-richest synthesis via `WIKI_WEAVER_MODEL`.
+`WIKI_WEAVER_MODEL` accepts a **bare family token** (`sonnet`, `haiku`, `opus`) or an explicit
+model id.  Family tokens resolve at runtime to the newest model the provider actually serves in
+that family — no pinned version to maintain.  An explicit id (e.g. `claude-opus-4-8`) passes
+through unchanged.  Internally, `feedback` nodes use `haiku` (fast, cheap) while the heavier
+synthesis nodes (`ingest`, `assess`, `init`, `ask`) use `sonnet`; both can be overridden per-wiki
+in `wiki.config.yaml` under `models:`.  If the family can't be resolved (network error, no match)
+wiki-weaver raises a loud error — it never silently falls back to a stale hardcoded id.
 
 ## Requirements
 
