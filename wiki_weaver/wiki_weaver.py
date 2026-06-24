@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 
-from wiki_weaver import __version__
+from wiki_weaver._version import __version__
 
 # ---------------------------------------------------------------------------
 # Re-exports: symbols imported by tests from wiki_weaver.wiki_weaver (backward compat)

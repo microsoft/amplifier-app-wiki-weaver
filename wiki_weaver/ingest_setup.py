@@ -33,12 +33,24 @@ import sys
 import time
 from pathlib import Path
 
-# When executed as a standalone script (via tool_command in ingest.dot), Python
-# adds only the script's directory (wiki-weaver/cli/) to sys.path, not the repo
-# root.  Add the repo root explicitly so that `from wiki_weaver.* import ...` works.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+# When run as __main__ Python inserts the script's directory (wiki_weaver/) at
+# sys.path[0].  In both a dev checkout AND an installed package that directory
+# IS the wiki_weaver package dir, so wiki_weaver.py is visible as the top-level
+# 'wiki_weaver' module — shadowing the real package and causing a circular import
+# the first time any code does `from wiki_weaver import ...`.
+#
+# Fix: ensure the *parent* of the script's directory is at sys.path[0].
+#   • Checkout:           parent = repo root  (contains wiki_weaver/)
+#   • Installed package:  parent = site-packages  (also contains wiki_weaver/)
+# In both cases that directory contains a wiki_weaver/ *package* (with __init__.py),
+# which Python prefers over a plain wiki_weaver.py module.
+_PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
+if sys.path[:1] != [_PACKAGE_PARENT]:
+    try:
+        sys.path.remove(_PACKAGE_PARENT)
+    except ValueError:
+        pass
+    sys.path.insert(0, _PACKAGE_PARENT)
 
 # Absolute paths to the archive, fail, and tamper-check CLI scripts (sibling scripts in cli/).
 _CLI_DIR = Path(__file__).resolve().parent
