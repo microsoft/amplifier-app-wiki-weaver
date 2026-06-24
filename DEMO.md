@@ -63,8 +63,11 @@ corpus, so it **scales** as the wiki grows. Full design: `docs/`.
 - The `assess` LLM node occasionally returns its verdict as prose instead of strict JSON.
   This is **non-fatal** — `check` routes any non-`converged` verdict (incl. unset/prose)
   to `refine`, so it costs at most an extra cycle and never falsely converges.
-- Default model is `claude-sonnet-4-6` (set in `cli/engine_runner.py`, overridable via
-  `WIKI_WEAVER_MODEL`). Chosen by a model-swap eval (`eval/model_sweep.py`): it converged
-  with zero flakes, faster and cheaper than Opus-class. Use a premium model via
-  `WIKI_WEAVER_MODEL` for the richest synthesis.
+- Default model is the `sonnet` family (overridable via `WIKI_WEAVER_MODEL`). Set
+  `WIKI_WEAVER_MODEL` to a bare family token (`sonnet`, `haiku`, `opus`) and wiki-weaver
+  resolves it at runtime to the newest model the provider actually serves in that family —
+  no version pin to maintain.  Set it to an explicit id (e.g. `claude-opus-4-8`) and it
+  passes through unchanged.  Fail-loud: if the family can't be resolved, the run stops with
+  a clear error rather than silently using a stale hardcoded id.  (The `feedback` nodes use
+  `haiku` by default; see `wiki.config.yaml` `models:` to override per stage.)
 - `query` is a naive substring-grep stub — use `ask` to query a wiki.

@@ -29,7 +29,13 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(_REPO / "pipeline"))
 
-from wiki_weaver.policy import WikiPolicy, _DEF_MODEL, _DEF_PROVIDER, load_policy  # noqa: E402
+from wiki_weaver.policy import (  # noqa: E402
+    WikiPolicy,
+    _DEF_FEEDBACK_MODEL,
+    _DEF_MODEL,
+    _DEF_PROVIDER,
+    load_policy,
+)
 from wiki_weaver.engine_runner import (  # noqa: E402
     CONVERGENCE_RUBRIC_PATH,
     FOOTNOTES_PY,
@@ -61,6 +67,19 @@ from validate_wiki import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Mock model-family map used by tests that call build functions.
+# Maps known family tokens to representative concrete ids without network calls.
+_MOCK_FAMILY_MAP: dict[str, str] = {
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+    "opus": "claude-opus-4-8",
+}
+
+
+def _mock_resolve(provider: str, spec: str) -> str:
+    """Deterministic stand-in for resolve_model — no network, no API key required."""
+    return _MOCK_FAMILY_MAP.get(spec, spec)
 
 
 def _make_wiki(tmp_path: Path) -> Path:
@@ -184,7 +203,8 @@ class TestLoadPolicyDefaults:
     def test_model_for_feedback_is_default(self, tmp_path: Path) -> None:
         wiki = _make_wiki(tmp_path)
         policy = load_policy(wiki)
-        assert policy.model_for("feedback") == _DEF_MODEL
+        # feedback has its own default (haiku), distinct from the general default.
+        assert policy.model_for("feedback") == _DEF_FEEDBACK_MODEL
 
     def test_model_for_ask_is_default(self, tmp_path: Path) -> None:
         wiki = _make_wiki(tmp_path)
@@ -281,34 +301,46 @@ class TestLoadPolicyDefaults:
 
 
 class TestBuildDotByteIdentical:
-    """With default policy (no project overrides), build_dot output must be
-    BYTE-IDENTICAL to the pre-Phase-D code that used module-level constants."""
+    """build_dot injects per-stage resolved models into each LLM node.
 
-    def test_default_policy_dot_byte_identical(self, tmp_path: Path) -> None:
+    Phase-E invariant: each stage (ingest/assess/feedback) gets the model
+    resolved from its policy spec.  Family tokens resolve to concrete ids
+    via resolve_model(); explicit ids pass through unchanged.
+    """
+
+    @pytest.fixture(autouse=True)
+    def mock_resolver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace resolve_model with a deterministic no-network mock."""
+        monkeypatch.setattr("wiki_weaver.engine_runner.resolve_model", _mock_resolve)
+
+    def test_default_policy_dot_per_stage_models(self, tmp_path: Path) -> None:
+        """With default policy, each LLM node gets the right resolved model."""
         wiki = _make_wiki(tmp_path)
         src = _make_source(tmp_path)
-        max_cycles = 3
-        source_id = 1
-
         policy = load_policy(wiki)
-        new_dot = build_dot(src, wiki, policy, source_id=source_id)
-        old_dot = _build_dot_pre_phase_d(src, wiki, max_cycles, source_id=source_id)
 
-        assert new_dot == old_dot, (
-            "build_dot with default policy MUST be byte-identical to pre-Phase-D output.\n"
-            f"First difference at position: "
-            f"{next((i for i, (a, b) in enumerate(zip(new_dot, old_dot)) if a != b), len(old_dot))}"
+        dot = build_dot(src, wiki, policy, source_id=1)
+
+        # ingest and assess should use resolved sonnet (mock: "claude-sonnet-4-6")
+        assert 'llm_model="claude-sonnet-4-6"' in dot, (
+            "ingest/assess nodes should use the resolved sonnet model"
         )
+        # feedback should use resolved haiku (mock: "claude-haiku-4-5")
+        assert 'llm_model="claude-haiku-4-5"' in dot, (
+            "feedback node should use the resolved haiku model"
+        )
+        # No $-var tokens should remain unsubstituted.
+        assert "$source_path" not in dot
+        assert "$wiki_dir" not in dot
+        assert "$schema_path" not in dot
 
-    def test_default_policy_dot_byte_identical_source_id_zero(
-        self, tmp_path: Path
-    ) -> None:
+    def test_default_policy_dot_source_id_substituted(self, tmp_path: Path) -> None:
+        """source_id token is substituted into the DOT (no $source_id remaining)."""
         wiki = _make_wiki(tmp_path)
         src = _make_source(tmp_path)
         policy = load_policy(wiki)
-        new_dot = build_dot(src, wiki, policy, source_id="")
-        old_dot = _build_dot_pre_phase_d(src, wiki, 3, source_id="")
-        assert new_dot == old_dot
+        dot = build_dot(src, wiki, policy, source_id="")
+        assert "$source_id" not in dot
 
     def test_default_policy_no_config_in_validate_cmd(self, tmp_path: Path) -> None:
         """Default policy must NOT inject --config into validate_cmd."""
@@ -344,6 +376,11 @@ class TestBuildDotByteIdentical:
 class TestBuildAskDotByteIdentical:
     """build_ask_dot_from_file must be BYTE-IDENTICAL to build_ask_dot for the
     same inputs.  All tests are deterministic — no LLM, no network, no API key."""
+
+    @pytest.fixture(autouse=True)
+    def mock_resolver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Patch resolve_model so no network call is made during DOT building."""
+        monkeypatch.setattr("wiki_weaver.engine_runner.resolve_model", _mock_resolve)
 
     def test_default_inputs_byte_identical(self, tmp_path: Path) -> None:
         """Simple question, default provider/model."""
@@ -465,6 +502,11 @@ class TestBuildInitDotByteIdentical:
     """build_init_dot_from_file must be BYTE-IDENTICAL to build_init_dot for the
     same inputs.  All tests are deterministic — no LLM, no network, no API key,
     no engine run."""
+
+    @pytest.fixture(autouse=True)
+    def mock_resolver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Patch resolve_model so no network call is made during DOT building."""
+        monkeypatch.setattr("wiki_weaver.engine_runner.resolve_model", _mock_resolve)
 
     def test_simple_purpose_empty_sample_byte_identical(self, tmp_path: Path) -> None:
         """Simple ASCII purpose, empty source_sample."""
