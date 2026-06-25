@@ -1198,20 +1198,9 @@ def run_ingest(
     resolved_synthesize_dot.write_text(inner_text, encoding="utf-8")
     synthesize_dot_abs = str(resolved_synthesize_dot)
 
-    # The engine names child pipeline logs {logs_dir}/subgraph_{node.id}.
-    # On loop iterations 2+, the child engine finds the checkpoint written by
-    # iteration 1 there, fingerprint-matches synthesize.dot (unchanged), restores
-    # stale context (source_id=1), and exits immediately without doing any work.
-    # Fix: delete that checkpoint before every run_synthesize invocation.
-    synthesize_checkpoint = str(
-        logs_dir / "subgraph_run_synthesize" / "checkpoint.json"
-    )
-    clear_synthesize_cmd = f"rm -f {shlex.quote(synthesize_checkpoint)}"
-
     dot_source = dot_template.replace("$setup_cmd", setup_cmd)
     dot_source = dot_source.replace("$synthesize_dot", synthesize_dot_abs)
     dot_source = dot_source.replace("$max_drain_iters", str(max_drain_iters))
-    dot_source = dot_source.replace("$clear_synthesize_cmd", clear_synthesize_cmd)
 
     (logs_dir / "ingest.dot").write_text(dot_source, encoding="utf-8")
 

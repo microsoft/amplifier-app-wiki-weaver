@@ -11,7 +11,6 @@
 //                         if this limit trips the engine fails loud, which is
 //                         the correct behaviour -- a bug would spin forever
 //                         otherwise.
-//   $clear_synthesize_cmd -- rm -f for the child synthesize checkpoint
 //
 // Context keys produced by the setup node (via parse_json="true") and consumed
 // by subsequent nodes via $var references:
@@ -44,23 +43,6 @@ digraph ingest {
         label="Setup: pick source + assign id",
         tool_command="$setup_cmd",
         parse_json="true"
-    ]
-
-    // CLEAR_SYNTHESIZE_STATE: delete the subgraph checkpoint left by the
-    // previous loop iteration so the child pipeline always starts fresh.
-    //
-    // Why: PipelineHandler creates child logs at {run_dir}/subgraph_{node.id}.
-    // The directory is reused across loop iterations (exist_ok=True), so the
-    // checkpoint written by iteration 1 is found by iteration 2's child engine,
-    // which fingerprint-matches synthesize.dot (unchanged), restores stale
-    // context (source_id=1), and exits immediately without doing real work.
-    // This rm -f runs before every run_synthesize invocation; -f means exit 0
-    // on first iteration when the file does not yet exist.
-    // $clear_synthesize_cmd is substituted at compile-time by run_ingest().
-    clear_synthesize_state [
-        shape=parallelogram,
-        label="Clear synthesize state",
-        tool_command="$clear_synthesize_cmd"
     ]
 
     // RUN_SYNTHESIZE (folder sub-pipeline): runs synthesize.dot with the
@@ -119,11 +101,9 @@ digraph ingest {
     // SETUP routes EXHAUSTIVELY (no dead-end).
     // Conditional edges are tried first; the single unconditional fallback
     // (else) is the safety net for any unexpected state.
-    setup -> done                   [label="inbox empty",          condition="context.has_source=false"]
-    setup -> clear_synthesize_state [label="source ready",         condition="context.has_source=true"]
-    setup -> done                   [label="else (unexpected -> done)"]
-
-    clear_synthesize_state -> run_synthesize
+    setup -> done          [label="inbox empty",          condition="context.has_source=false"]
+    setup -> run_synthesize [label="source ready",         condition="context.has_source=true"]
+    setup -> done          [label="else (unexpected -> done)"]
 
     // RUN_SYNTHESIZE routes:
     //   converged  -> tamper_check (verify LLM did not write process state)
