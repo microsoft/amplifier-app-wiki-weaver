@@ -144,8 +144,36 @@ def load_ci_config() -> dict[str, Any]:
     """Read the context-intelligence hook config from the user's settings.
 
     Reads ``overrides.hook-context-intelligence.config`` from
-    ~/.amplifier/settings.yaml (server_url + api_key). Never hardcodes the key.
-    Returns ``{}`` (hook still composed, fails soft) if absent/unreadable.
+    ~/.amplifier/settings.yaml and returns a config dict using the PRIMARY
+    ``destinations`` shape expected by the hook's current contract.
+
+    The hook's ``LoggingHandler`` is always-on: it writes per-session
+    ``events.jsonl`` + ``metadata.json`` locally regardless of config.
+    An empty return (``{}``) means local-only logging — the normal default.
+
+    ``destinations`` shape (remote fan-out, optional):
+    ::
+
+        {
+            "destinations": {
+                "<name>": {
+                    "url": "https://...",
+                    "api_key": "<key>",       # optional
+                    "include": ["**"],         # glob filter, optional
+                }
+            }
+        }
+
+    Three resolution paths:
+
+    1. ``cfg`` already has a ``destinations`` dict → pass through, expanding
+       ``${VAR}`` in every destination's ``url`` and ``api_key``.
+    2. ``cfg`` has the simple legacy scalars ``context_intelligence_server_url``
+       (+ optionally ``context_intelligence_api_key``) → translate into the
+       primary ``destinations`` shape. Only synthesises the remote destination
+       when *both* url **and** api_key are non-empty after ``${VAR}`` expansion;
+       otherwise returns local-only ``{}``.
+    3. Nothing configured → return ``{}`` (local-only, the normal default).
     """
     try:
         import yaml  # pyright: ignore[reportMissingModuleSource]
@@ -159,14 +187,39 @@ def load_ci_config() -> dict[str, Any]:
         return {}
     overrides = (data.get("overrides") or {}).get("hook-context-intelligence") or {}
     cfg = overrides.get("config") or {}
-    out: dict[str, Any] = {}
-    if cfg.get("context_intelligence_server_url"):
-        out["context_intelligence_server_url"] = str(
-            cfg["context_intelligence_server_url"]
-        )
-    if cfg.get("context_intelligence_api_key"):
-        out["context_intelligence_api_key"] = str(cfg["context_intelligence_api_key"])
-    return out
+
+    # --- Path 1: caller already supplied the destinations shape ---------------
+    if isinstance(cfg.get("destinations"), dict):
+        destinations: dict[str, Any] = {}
+        for name, dest in cfg["destinations"].items():
+            if not isinstance(dest, dict):
+                continue
+            expanded: dict[str, Any] = dict(dest)
+            if isinstance(expanded.get("url"), str):
+                expanded["url"] = os.path.expandvars(expanded["url"])
+            if isinstance(expanded.get("api_key"), str):
+                expanded["api_key"] = os.path.expandvars(expanded["api_key"])
+            destinations[name] = expanded
+        return {"destinations": destinations} if destinations else {}
+
+    # --- Path 2: legacy convenience scalars → translate to destinations -------
+    raw_url = str(cfg.get("context_intelligence_server_url") or "").strip()
+    raw_key = str(cfg.get("context_intelligence_api_key") or "").strip()
+    url = os.path.expandvars(raw_url) if raw_url else ""
+    key = os.path.expandvars(raw_key) if raw_key else ""
+    if url and key:
+        return {
+            "destinations": {
+                "default": {
+                    "url": url,
+                    "api_key": key,
+                    "include": ["**"],
+                }
+            }
+        }
+
+    # --- Path 3: nothing configured → local-only (the normal default) --------
+    return {}
 
 
 # --------------------------------------------------------------------------
