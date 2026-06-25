@@ -1102,33 +1102,35 @@ def doctor(*, wiki: str | Path | None = None) -> int:
             "WIKI_WEAVER_ATTRACTOR_PIPELINE not set; will load attractor-pipeline from git URL"
         )
 
-    # context-intelligence hook config (server_url + api_key) from settings.
+    # context-intelligence hook.
+    # The hook's LoggingHandler is ALWAYS-ON: it writes per-session events.jsonl
+    # locally regardless of config. Unconfigured = local-only = normal default.
+    _ok("context-intelligence: logging locally (per-session events.jsonl) — normal")
     ci_cfg = load_ci_config()
-    server_url = ci_cfg.get("context_intelligence_server_url")
-    if ci_cfg.get("context_intelligence_api_key"):
-        _ok("context-intelligence hook config found in settings (api_key + server_url)")
-    else:
-        _warn(
-            "no context-intelligence api_key in settings; hook composes but fails soft"
-        )
+    destinations = ci_cfg.get("destinations") or {}
+    if destinations:
+        for dest_name, dest in destinations.items():
+            dest_url = dest.get("url", "") if isinstance(dest, dict) else ""
+            if not dest_url:
+                continue
+            _ok(f"context-intelligence: remote destination '{dest_name}' → {dest_url}")
+            # Probe the destination (non-fatal info -- local logging continues regardless).
+            try:
+                import urllib.request
 
-    # Probe the CI server (GET, short timeout). DOWN is OK -- the hook fails soft
-    # and still writes local events.jsonl. No hardcoded default: if the user has
-    # not configured a server in settings, there is nothing to probe.
-    if not server_url:
-        _warn("no context-intelligence server_url in settings; skipping probe")
-    else:
-        try:
-            import urllib.request
-
-            with urllib.request.urlopen(server_url, timeout=3) as resp:  # noqa: S310
+                with urllib.request.urlopen(dest_url, timeout=3) as resp:  # noqa: S310
+                    _ok(
+                        f"context-intelligence: '{dest_name}' server UP (HTTP {resp.status})"
+                    )
+            except Exception as e:  # noqa: BLE001
                 _ok(
-                    f"context-intelligence server UP at {server_url} (HTTP {resp.status})"
+                    f"context-intelligence: '{dest_name}' server DOWN/unreachable"
+                    f" ({type(e).__name__}) — OK, local events.jsonl still written"
                 )
-        except Exception as e:  # noqa: BLE001
-            _warn(
-                f"context-intelligence server DOWN/unreachable at {server_url} ({type(e).__name__}); OK -- hook fails soft, local events.jsonl still written"
-            )
+    else:
+        _ok(
+            "context-intelligence: no remote destinations configured (local-only) — normal"
+        )
 
     if wiki:
         wiki_path = Path(wiki).resolve()
