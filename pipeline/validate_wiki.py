@@ -35,6 +35,10 @@ NAV_PAGES = {"index", "overview", "readme", "log"}
 REQUIRED_FM = ("title", "type", "sources")
 # Page types that are navigation/meta and need not cite a source.
 META_TYPES = {"index", "overview", "log", "meta"}
+# S6 (advisory): a content page built from a single source with fewer than this
+# many body words is flagged as a likely thin stub (listicle name-drop sprawl).
+# Count-based only -- never a hard failure, never a semantic judgement.
+THIN_PAGE_WORD_MIN = 200
 
 # S4 patterns: footnote-completeness check (footnote-native format).
 # Matches a footnote definition line anchored at start: `[^N]: text`
@@ -94,6 +98,7 @@ def validate(wiki_dir: Path, *, config: dict | None = None) -> dict:
         "page_count": len(pages),
         "checks": {},
         "failures": [],
+        "warnings": [],
     }
     if not pages:
         result["failures"].append("no .md pages found in wiki dir")
@@ -123,6 +128,7 @@ def validate(wiki_dir: Path, *, config: dict | None = None) -> dict:
     no_source: list[str] = []
     broken_links: list[str] = []
     obsidian_broken: list[str] = []  # S1b: target not a direct filename-stem match
+    thin_pages: list[str] = []  # S6 (advisory): single-source page under word floor
 
     for p in pages:
         text = p.read_text(encoding="utf-8", errors="replace")
@@ -137,6 +143,17 @@ def validate(wiki_dir: Path, *, config: dict | None = None) -> dict:
             srcs = fm.get("sources", "").strip().strip("[]").strip()
             if ptype not in meta_types and not srcs:
                 no_source.append(p.name)
+
+            # S6 (advisory, never a failure): count-based thin-stub detector. A
+            # content page drawn from a SINGLE source with a tiny body is the
+            # listicle name-drop sprawl pattern -- flag it for human review. No
+            # semantic judgement; just source count + body word count.
+            if ptype not in meta_types:
+                n_src = len([s for s in srcs.split(",") if s.strip()])
+                body = text.split("---", 2)[-1] if text.startswith("---") else text
+                body_words = len(body.split("## Sources", 1)[0].split())
+                if n_src <= 1 and body_words < THIN_PAGE_WORD_MIN:
+                    thin_pages.append(f"{p.name} ({body_words}w, {n_src} src)")
 
         # Link resolution: count inbound (by canonical page id), flag unresolved.
         for tgt in WIKILINK.findall(text):
@@ -240,6 +257,7 @@ def validate(wiki_dir: Path, *, config: dict | None = None) -> dict:
             "detail": bib_incomplete[:20],
         },
         "S5_provenance": {"uncited": no_source},
+        "S6_thin_pages": {"flagged": len(thin_pages), "detail": thin_pages[:20]},
     }
     if broken_links:
         result["failures"].append(f"S1: {len(broken_links)} unresolved wikilink(s)")
@@ -263,6 +281,12 @@ def validate(wiki_dir: Path, *, config: dict | None = None) -> dict:
             f"S5: {len(no_source)} content page(s) cite no source"
         )
 
+    if thin_pages:
+        result["warnings"].append(
+            f"S6: {len(thin_pages)} thin single-source page(s) under "
+            f"{THIN_PAGE_WORD_MIN}w — review for listicle sprawl"
+        )
+
     result["passed"] = not result["failures"]
     return result
 
@@ -282,6 +306,8 @@ def _render_report(r: dict) -> str:
         lines.append("FAIL:")
         for f in r["failures"]:
             lines.append(f"  - {f}")
+    for w in r.get("warnings", []):
+        lines.append(f"  WARN: {w}")
     return "\n".join(lines) + "\n"
 
 
