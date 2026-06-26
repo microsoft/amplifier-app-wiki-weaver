@@ -25,6 +25,11 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+# These tests patch wiki_weaver.engine_runner at runtime, which imports the
+# attractor engine deps. Skip cleanly in lightweight CI (no @main resolution)
+# rather than erroring. Matches test_claim_retention.py / test_preflight_gate.py.
+pytest.importorskip("wiki_weaver.engine_runner")
+
 from wiki_weaver.cli import ARCHIVE, FAILED, INBOX, cmd_ingest  # noqa: E402
 
 

@@ -36,6 +36,11 @@ from wiki_weaver.policy import (  # noqa: E402
     _DEF_PROVIDER,
     load_policy,
 )
+
+# Engine dep: skip cleanly in lightweight CI (no @main resolution) instead of
+# aborting collection. Matches test_claim_retention.py / test_preflight_gate.py.
+pytest.importorskip("wiki_weaver.engine_runner")
+
 from wiki_weaver.engine_runner import (  # noqa: E402
     CONVERGENCE_RUBRIC_PATH,
     FOOTNOTES_PY,

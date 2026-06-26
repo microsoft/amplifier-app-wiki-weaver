@@ -25,6 +25,10 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+# Engine dep: skip cleanly in lightweight CI (no @main resolution) instead of
+# aborting collection. Matches test_claim_retention.py / test_preflight_gate.py.
+pytest.importorskip("wiki_weaver.model_resolver")
+
 from wiki_weaver.model_resolver import (  # noqa: E402
     _clear_cache,
     resolve_model,

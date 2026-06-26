@@ -19,6 +19,14 @@ from unittest.mock import patch
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
+import pytest  # noqa: E402
+
+# CI is deliberately lightweight (no @main engine deps); the attractor engine is
+# validated by the DTU install proof, not CI. Skip cleanly when engine_runner
+# isn't importable instead of aborting collection. (Matches the skip convention
+# already used by test_claim_retention.py / test_preflight_gate.py.)
+pytest.importorskip("wiki_weaver.engine_runner")
+
 from wiki_weaver.engine_runner import load_ci_config  # noqa: E402
 
 
