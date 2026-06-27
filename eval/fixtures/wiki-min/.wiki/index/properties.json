@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "built": {
+    "max_mtime": 1782589747.6626666,
+    "content_hash": "sha256:e195c6522f886964e1abaaeab11ce447cf55f1906a6f19ab7baf024c1bb60a66",
+    "weave_commit": "65d2a46",
+    "built_at": "2026-06-27T20:48:32+00:00"
+  },
+  "data": {
+    "alpha": {
+      "title": "Alpha",
+      "type": "concept",
+      "tags": [
+        "x"
+      ],
+      "aliases": [
+        "a-overview"
+      ],
+      "sources": [],
+      "last_updated": "2024-01-01"
+    },
+    "beta": {
+      "title": "Beta",
+      "type": "concept",
+      "aliases": [
+        "b-overview"
+      ],
+      "sources": [
+        1
+      ],
+      "last_updated": "2024-01-01"
+    },
+    "delta": {
+      "title": "Delta",
+      "type": "note",
+      "sources": [],
+      "last_updated": "2024-01-01"
+    },
+    "gamma": {
+      "title": "Gamma",
+      "type": "concept",
+      "tags": [
+        "x",
+        "y"
+      ],
+      "sources": [],
+      "last_updated": "2024-01-01"
+    },
+    "loop-a": {
+      "title": "Loop A",
+      "aliases": [
+        "loop-b"
+      ],
+      "sources": [],
+      "last_updated": "2024-01-01"
+    },
+    "loop-b": {
+      "title": "Loop B",
+      "aliases": [
+        "loop-a"
+      ],
+      "sources": [],
+      "last_updated": "2024-01-01"
+    }
+  }
+}

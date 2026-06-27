@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "built": {
+    "max_mtime": 1782589747.6626666,
+    "content_hash": "sha256:e195c6522f886964e1abaaeab11ce447cf55f1906a6f19ab7baf024c1bb60a66",
+    "weave_commit": "65d2a46",
+    "built_at": "2026-06-27T20:48:32+00:00"
+  },
+  "data": {
+    "a-overview": "alpha",
+    "b-overview": "beta",
+    "_broken": [
+      {
+        "from": "delta",
+        "target": "nonexistent"
+      }
+    ],
+    "_cycles": [
+      [
+        "loop-a",
+        "loop-b",
+        "loop-a"
+      ]
+    ]
+  }
+}

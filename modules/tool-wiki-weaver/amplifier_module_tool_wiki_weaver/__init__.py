@@ -1,29 +1,26 @@
 """Amplifier tool module: wiki-weaver commands as mountable tools.
 
-Registers 4 tools — one per wiki-weaver user command — that an AmplifierSession
-agent can invoke. Each tool is a thin wrapper over the importable
-``wiki_weaver.engine_runner.run_*`` functions:
+Registers 9 tools in two groups:
 
-    tool.execute(input_data)
-      → await asyncio.to_thread(run_<cmd>, ...)   (run_* are SYNCHRONOUS)
-      → returns ToolResult(success=..., output=<answer/status/report>)
+GROUP 1 — Pipeline commands (4 existing tools)
+    wiki_weaver_init / ingest / ask / lint
 
-WHY asyncio.to_thread (the one non-obvious wrinkle):
-    wiki-weaver's run_init / run_ingest / run_ask / run_lint are *synchronous*
-    wrappers that each call ``asyncio.run(...)`` internally to drive the
-    attractor engine. A tool's ``execute()`` is itself awaited inside the host
-    session's running event loop, and ``asyncio.run()`` cannot be called from a
-    running loop. Running each sync function in a worker thread (to_thread) gives
-    it a fresh thread with no active loop, so its internal ``asyncio.run`` works.
-    (This differs from attractor-wiki's module, whose ``run_pipeline`` is already
-    async and is awaited directly.)
+    These wrap the importable ``wiki_weaver.engine_runner.run_*`` functions.
+    Each uses ``asyncio.to_thread`` because run_* call ``asyncio.run()``
+    internally — they cannot be called from a running event loop.
 
-All real work lives in ``wiki_weaver`` (the bundle's root package, installed
-editable by Bundle.prepare() before this module activates). This module adds NO
-logic beyond mapping tool arguments to run_* arguments and shaping the result.
+GROUP 2 — Index query tools (5 new tools, INCREMENT 1)
+    wiki_backlinks / wiki_graph_neighbors / wiki_tags /
+    wiki_properties / wiki_resolve_citation
 
-The Iron Law (creating-amplifier-modules skill): mount() MUST call
-coordinator.mount() for each tool, or protocol_compliance validation fails.
+    These wrap ``wiki_weaver.index.query_*`` — pure synchronous filesystem
+    reads that do NOT call asyncio.run() internally.  They are called
+    directly from the async execute() method (no asyncio.to_thread needed).
+    All five require ``build_indexes(wiki_dir)`` to have been run first.
+
+All tools share the Iron Law (creating-amplifier-modules skill):
+    mount() MUST call coordinator.mount() for each tool, or
+    protocol_compliance validation fails.
 """
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import logging
 from typing import Any
 
@@ -39,12 +37,24 @@ from amplifier_core import ToolResult
 # wiki_weaver is the bundle's root package (installed editable in the same venv
 # by Bundle.prepare()/activate_bundle_package before modules activate).
 from wiki_weaver.engine_runner import run_ask, run_ingest, run_init, run_lint
+from wiki_weaver.index import (
+    CitationNotFound,
+    CycleDetectedError,
+    PageNotFound,
+    SchemaVersionError,
+    WikiIndexError,
+    query_backlinks,
+    query_graph_neighbors,
+    query_properties,
+    query_resolve_citation,
+    query_tags,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Tool classes — one per command. Each maps arguments → real run_* call.
+# GROUP 1: Pipeline command tool classes (unchanged from v0.1.0)
 # ---------------------------------------------------------------------------
 
 
@@ -263,22 +273,284 @@ class WikiWeaverLintTool:
 
 
 # ---------------------------------------------------------------------------
-# mount() — THE required entry point. Iron Law: must call coordinator.mount()
-# for every tool, or protocol_compliance validation fails.
+# GROUP 2: Index query tool classes (INCREMENT 1 — 5 new tools)
+# ---------------------------------------------------------------------------
+# All five share these conventions:
+#
+#   - execute() is synchronous internally (pure filesystem reads).
+#     query_* functions do not call asyncio.run(), so we call them directly.
+#   - On WikiIndexError subclasses: ToolResult(success=False, output=<message>)
+#   - On FileNotFoundError (index not built): ToolResult(success=False, hint to user)
+#   - Return envelope: { ...result..., "stale": bool, "built": "<iso8601>" }
+#     serialised as JSON in ToolResult.output.
+# ---------------------------------------------------------------------------
+
+
+def _index_error_result(exc: Exception) -> ToolResult:
+    """Convert a wiki-index error to a ToolResult(success=False).
+
+    Specific error subclasses produce more actionable messages than the generic
+    WikiIndexError base-class string, so we pattern-match in preference order.
+    """
+    if isinstance(exc, SchemaVersionError):
+        msg = (
+            f"Index schema mismatch on {exc.index_name!r}: "
+            f"found version {exc.found}, expected {exc.expected}. "
+            "Re-run build_indexes to regenerate."
+        )
+    elif isinstance(exc, CycleDetectedError):
+        msg = f"Alias cycle detected: {' -> '.join(exc.chain)}"
+    elif isinstance(exc, PageNotFound):
+        msg = f"Page not found in index: {exc.page!r}"
+    elif isinstance(exc, CitationNotFound):
+        msg = f"Citation {exc.n} out of range on page {exc.page!r}"
+    elif isinstance(exc, FileNotFoundError):
+        msg = f"Index file not found — run build_indexes first. ({exc})"
+    else:
+        msg = str(exc)
+    return ToolResult(success=False, output=msg[:4000])
+
+
+class WikiBacklinksTool:
+    """Return pages that link to a given wiki page (requires built indexes)."""
+
+    @property
+    def name(self) -> str:
+        return "wiki_backlinks"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Return all pages that contain a [[wikilink]] pointing at the given page. "
+            "Requires wiki_dir to have a built index (run build_indexes first). "
+            "Returns stale=true when corpus has changed since the last index build — "
+            "data is still returned; callers should surface the stale warning."
+        )
+
+    @property
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "wiki_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the wiki corpus directory.",
+                },
+                "page": {
+                    "type": "string",
+                    "description": "Slug (or filename stem) of the page to look up.",
+                },
+            },
+            "required": ["wiki_dir", "page"],
+        }
+
+    async def execute(self, input_data: dict[str, Any]) -> ToolResult:
+        try:
+            result = query_backlinks(input_data["wiki_dir"], input_data["page"])
+            return ToolResult(success=True, output=json.dumps(result)[:8000])
+        except (WikiIndexError, FileNotFoundError) as exc:
+            return _index_error_result(exc)
+
+
+class WikiGraphNeighborsTool:
+    """Return immediate outbound and inbound link neighbours of a wiki page."""
+
+    @property
+    def name(self) -> str:
+        return "wiki_graph_neighbors"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Return the immediate link graph neighbourhood of a page: "
+            "out=pages this page links to, in=pages that link to this page. "
+            "Immediate neighbours only — no depth parameter. "
+            "Requires a built index. Returns stale flag when corpus has changed."
+        )
+
+    @property
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "wiki_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the wiki corpus directory.",
+                },
+                "page": {
+                    "type": "string",
+                    "description": "Slug (or filename stem) of the page.",
+                },
+            },
+            "required": ["wiki_dir", "page"],
+        }
+
+    async def execute(self, input_data: dict[str, Any]) -> ToolResult:
+        try:
+            result = query_graph_neighbors(input_data["wiki_dir"], input_data["page"])
+            return ToolResult(success=True, output=json.dumps(result)[:8000])
+        except (WikiIndexError, FileNotFoundError) as exc:
+            return _index_error_result(exc)
+
+
+class WikiTagsTool:
+    """List pages for a tag, or summarise all tags when no tag is given."""
+
+    @property
+    def name(self) -> str:
+        return "wiki_tags"
+
+    @property
+    def description(self) -> str:
+        return (
+            "When tag is provided: return pages carrying that tag. "
+            "When tag is omitted: return a tag→count summary for the whole corpus. "
+            "Requires a built index. Returns stale flag when corpus has changed."
+        )
+
+    @property
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "wiki_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the wiki corpus directory.",
+                },
+                "tag": {
+                    "type": "string",
+                    "description": (
+                        "Tag to look up. Omit to get the full tag→count summary."
+                    ),
+                },
+            },
+            "required": ["wiki_dir"],
+        }
+
+    async def execute(self, input_data: dict[str, Any]) -> ToolResult:
+        try:
+            result = query_tags(input_data["wiki_dir"], input_data.get("tag"))
+            return ToolResult(success=True, output=json.dumps(result)[:8000])
+        except (WikiIndexError, FileNotFoundError) as exc:
+            return _index_error_result(exc)
+
+
+class WikiPropertiesTool:
+    """Return all frontmatter properties (type, tags, aliases, …) for a page."""
+
+    @property
+    def name(self) -> str:
+        return "wiki_properties"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Return the full set of frontmatter key-value pairs for a page "
+            "(type, tags, aliases, sources, last_updated, …). "
+            "Requires a built index. Returns stale flag when corpus has changed."
+        )
+
+    @property
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "wiki_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the wiki corpus directory.",
+                },
+                "page": {
+                    "type": "string",
+                    "description": "Slug (or filename stem) of the page.",
+                },
+            },
+            "required": ["wiki_dir", "page"],
+        }
+
+    async def execute(self, input_data: dict[str, Any]) -> ToolResult:
+        try:
+            result = query_properties(input_data["wiki_dir"], input_data["page"])
+            return ToolResult(success=True, output=json.dumps(result)[:8000])
+        except (WikiIndexError, FileNotFoundError) as exc:
+            return _index_error_result(exc)
+
+
+class WikiResolveCitationTool:
+    """Map a page citation ordinal (1-based) to its source record."""
+
+    @property
+    def name(self) -> str:
+        return "wiki_resolve_citation"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Resolve citation ordinal n (1-based) on a page to a source record "
+            "from .sources.json.  The page's frontmatter 'sources' field is a list "
+            "of source IDs; ordinal n indexes into that list. "
+            "Returns: source {id, slug, path, title, url?} + stale + built. "
+            "Raises CitationNotFound when n is out of range; PageNotFound when the "
+            "slug does not exist."
+        )
+
+    @property
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "wiki_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the wiki corpus directory.",
+                },
+                "page": {
+                    "type": "string",
+                    "description": "Slug (or filename stem) of the citing page.",
+                },
+                "n": {
+                    "type": "integer",
+                    "description": "1-based citation ordinal (position in the page's sources list).",
+                    "minimum": 1,
+                },
+            },
+            "required": ["wiki_dir", "page", "n"],
+        }
+
+    async def execute(self, input_data: dict[str, Any]) -> ToolResult:
+        try:
+            result = query_resolve_citation(
+                input_data["wiki_dir"],
+                input_data["page"],
+                int(input_data["n"]),
+            )
+            return ToolResult(success=True, output=json.dumps(result)[:8000])
+        except (WikiIndexError, FileNotFoundError) as exc:
+            return _index_error_result(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tool registry + mount() — the required entry point.
+# Iron Law: must call coordinator.mount() for every tool.
 # ---------------------------------------------------------------------------
 
 _TOOLS = [
+    # GROUP 1 — pipeline commands (existing)
     WikiWeaverInitTool(),
     WikiWeaverIngestTool(),
     WikiWeaverAskTool(),
     WikiWeaverLintTool(),
+    # GROUP 2 — index query tools (INCREMENT 1)
+    WikiBacklinksTool(),
+    WikiGraphNeighborsTool(),
+    WikiTagsTool(),
+    WikiPropertiesTool(),
+    WikiResolveCitationTool(),
 ]
 
 
 async def mount(
     coordinator: Any, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Mount all 4 wiki-weaver tools into the coordinator.
+    """Mount all 9 wiki-weaver tools into the coordinator.
 
     Satisfies the Iron Law: calls coordinator.mount() for each tool.
     """
@@ -290,6 +562,6 @@ async def mount(
     logger.info("tool-wiki-weaver: mounted %d tools: %s", len(names), names)
     return {
         "name": "tool-wiki-weaver",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "provides": names,
     }
