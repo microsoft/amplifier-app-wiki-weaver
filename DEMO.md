@@ -24,7 +24,15 @@ cp ~/some_articles/*.md mywiki/_inbox/                  # drop in source materia
 wiki-weaver ingest --wiki mywiki --max-cycles 5          # weave it in (one source at a time)
 wiki-weaver ask "what are the trade-offs of X vs Y?" --wiki mywiki   # query the compiled wiki
 wiki-weaver lint --wiki mywiki                           # structural validation -> PASS (exit 0)
+
+wiki-weaver build-dashboard mywiki --out mywiki.html     # one self-contained HTML view (no LLM)
 ```
+
+`build-dashboard` is **deterministic** (no LLM, no Amplifier runtime): it builds the corpus indexes,
+then renders the whole wiki into a single portable HTML file — a navigable reading view with a
+type-grouped sidebar, type badges, and a "Linked from" backlinks panel. Open it in a browser or drop
+it into Obsidian. Restyle it without touching code via `<corpus>/.wiki-dashboard/theme.json`
+(`--wiki-*` token overrides + optional `title`) or `custom.css`; see the README's Dashboard section.
 
 Prefer a generic, no-LLM scaffold? Use `wiki-weaver init mywiki --plain` (free, instant) and
 `ingest`/`ask`/`lint` the same way. (From a clone, swap `wiki-weaver` for
