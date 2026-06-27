@@ -20,10 +20,32 @@ authors = [{name = "Microsoft Corporation"}]
 dependencies = [
     "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
     "amplifier-unified-llm-client @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/unified-llm-client",
+    "tinycss2>=1.0",
+    "markdown>=3.0",
 ]
 
 [project.urls]
 Repository = "https://github.com/microsoft/amplifier-bundle-wiki-weaver"
+
+# Dev-only tooling (PEP 735 dependency group). Installed by default with
+# `uv sync` / `uv run`, so the project venv has the test runner alongside the
+# real runtime deps (tinycss2 + markdown). The canonical test command is:
+#
+#     uv run pytest eval/ -q
+#
+# which runs the FULL deterministic eval suite with tinycss2 ACTIVE (the CSS
+# sanitizer's dependency). pytest-asyncio is declared because parts of the
+# broader eval suite use async tests.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pyyaml>=6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["eval"]
+asyncio_mode = "auto"
 
 [project.scripts]
 wiki-weaver = "wiki_weaver.wiki_weaver:main"

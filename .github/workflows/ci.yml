@@ -26,7 +26,13 @@ jobs:
         # amplifier_foundation is absent.
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pyyaml
+          # Test runner + the lightweight PyPI runtime deps the deterministic
+          # suite needs. tinycss2 + markdown are REAL runtime deps (dashboard
+          # CSS sanitizer + markdown rendering); they must be present because
+          # dashboard.py imports them at top level (no silent-degrade). They are
+          # installed explicitly here because the package install below uses
+          # --no-deps to avoid git-cloning the two @main Amplifier deps.
+          pip install pytest pytest-asyncio pyyaml tinycss2 markdown
           pip install --no-deps -e .
 
       - name: Run eval tests
