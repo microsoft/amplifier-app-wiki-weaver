@@ -1,0 +1,34 @@
+// build-dashboard.dot -- Deterministic dashboard builder: shells the CLI.
+//
+// Single-node pipeline: shells `wiki-weaver build-dashboard` to generate a
+// self-contained HTML dashboard from a wiki corpus.  No LLM, no engine, no
+// Amplifier runtime -- pure CLI delegation.
+//
+// Runtime params substituted by the pipeline engine at dispatch time:
+//   $corpus -- path to the wiki corpus directory
+//   $out    -- destination .html file path
+//
+// A matching build-dashboard.resolver.yaml sidecar declares this pipeline
+// to the dot-graph resolver so it appears in the Resolve UI form picker.
+// The pipeline is Resolve-composable (design goal G3) and can be composed
+// as a step inside larger pipelines that already have wiki data available.
+
+digraph build_dashboard {
+    graph [
+        goal="Build a self-contained HTML dashboard from a wiki corpus",
+        "param.corpus"="Path to the wiki corpus directory",
+        "param.out"="Destination .html file path"
+    ]
+
+    start [shape=Mdiamond, label="Start"]
+
+    build [
+        shape=parallelogram,
+        label="Build Dashboard",
+        tool_command="wiki-weaver build-dashboard $corpus --out $out"
+    ]
+
+    done [shape=Msquare, label="Done"]
+
+    start -> build -> done
+}
