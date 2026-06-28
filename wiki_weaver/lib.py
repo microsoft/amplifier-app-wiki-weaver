@@ -20,10 +20,12 @@ behaviour) and return an integer exit code (0 = success).
 
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -38,15 +40,66 @@ RED = "\033[31m"
 YELLOW = "\033[33m"
 RESET = "\033[0m"
 
+WIKI_DIR = ".wiki"  # hidden machine-only subtree root
 LEDGER_NAME = ".processed.jsonl"
 INBOX = "_inbox"
-ARCHIVE = "_archive"
-FAILED = "_failed"
+SOURCES = "_sources"  # was ARCHIVE; stays visible at corpus root
+FAILED = "_failed"  # logical name; actual path via wiki_failed()
 
 # Pipeline assets resolve to the wheel sibling (wiki_weaver_pipeline/) on a real
 # install or the repo-root pipeline/ in a dev tree -- see wiki_weaver._assets.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VALIDATE_PY = pipeline_dir() / "validate_wiki.py"
+
+
+# ---------------------------------------------------------------------------
+# Path helpers — single place that spells every machine/user path
+# ---------------------------------------------------------------------------
+
+
+def wiki_hidden_dir(wiki: Path) -> Path:
+    """Return the hidden machine-only root: ``<wiki>/.wiki``."""
+    return wiki / WIKI_DIR
+
+
+def wiki_ledger(wiki: Path) -> Path:
+    """Return the ledger path: ``<wiki>/.wiki/.processed.jsonl``."""
+    return wiki / WIKI_DIR / LEDGER_NAME
+
+
+def wiki_registry(wiki: Path) -> Path:
+    """Return the source registry path: ``<wiki>/.wiki/.sources.json``."""
+    return wiki / WIKI_DIR / REGISTRY_NAME  # REGISTRY_NAME defined below
+
+
+def wiki_failed(wiki: Path) -> Path:
+    """Return the failed-sources dir: ``<wiki>/.wiki/failed``."""
+    return wiki / WIKI_DIR / "failed"
+
+
+def wiki_runs(wiki: Path) -> Path:
+    """Return the run-logs dir: ``<wiki>/.wiki/runs``."""
+    return wiki / WIKI_DIR / "runs"
+
+
+def wiki_sources(wiki: Path) -> Path:
+    """Return the archived-sources dir: ``<wiki>/_sources`` (visible)."""
+    return wiki / SOURCES
+
+
+def wiki_inbox(wiki: Path) -> Path:
+    """Return the inbox dir: ``<wiki>/_inbox`` (visible)."""
+    return wiki / INBOX
+
+
+def wiki_dashboard(wiki: Path) -> Path:
+    """Return the dashboard assets dir: ``<wiki>/.wiki/dashboard``."""
+    return wiki / WIKI_DIR / "dashboard"
+
+
+def wiki_policy_dir(wiki: Path) -> Path:
+    """Return the per-wiki policy override dir: ``<wiki>/.wiki/policy``."""
+    return wiki / WIKI_DIR / "policy"
 
 
 def _ok(msg: str) -> None:
@@ -59,6 +112,97 @@ def _fail(msg: str) -> None:
 
 def _warn(msg: str) -> None:
     print(f"{YELLOW}!{RESET} {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Obsidian-readiness helpers
+# ---------------------------------------------------------------------------
+
+# Marker line that wiki-weaver writes as the first line of its .gitignore block.
+# Its presence is used to detect idempotency — if already in the file, skip.
+_OBSIDIAN_GITIGNORE_MARKER = "# --- wiki-weaver: Obsidian ---"
+
+# §14 F5 entries: user-specific Obsidian files + macOS junk
+_OBSIDIAN_GITIGNORE_LINES: list[str] = [
+    "# Obsidian user-specific (not shared)",
+    ".obsidian/workspace.json",
+    ".obsidian/app.json",
+    ".obsidian/graph.json",
+    ".obsidian/hotkeys.json",
+    ".obsidian/graph-analysis.json",
+    "# macOS junk",
+    "._*",
+    ".DS_Store",
+]
+
+# Bundled Obsidian template directory (lives inside the installed package).
+# Resolution: wiki_weaver/templates/obsidian/ — always co-located with this file.
+_OBSIDIAN_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates" / "obsidian"
+
+
+def ensure_obsidian_ready(corpus: Path) -> None:
+    """Seed Obsidian vault config and update ``.gitignore`` at the corpus root.
+
+    Called by both ``init()`` (fresh corpora) and ``migrate()`` (existing
+    corpora). Both operations are idempotent:
+
+    * **``.gitignore``** — if the wiki-weaver marker line is absent the F5
+      block is appended once.  Existing user entries are never modified.
+    * **``.obsidian/``** — seeded from the package template *only* if the
+      directory does not already exist.  A user's existing vault is never
+      touched.
+
+    Note on ``.wiki/`` visibility: Obsidian excludes dot-prefixed folders
+    (``.*``) from its vault graph by default, so ``.wiki/`` is already hidden
+    without any extra configuration.  The seeded ``app.json`` adds
+    ``userIgnoreFilters`` as a belt-and-suspenders measure.
+    """
+    _ensure_corpus_gitignore(corpus)
+    _seed_obsidian_config(corpus)
+
+
+def _ensure_corpus_gitignore(corpus: Path) -> None:
+    """Append the Obsidian gitignore block if the marker is absent."""
+    gitignore_path = corpus / ".gitignore"
+
+    if gitignore_path.exists():
+        existing = gitignore_path.read_text(encoding="utf-8")
+        if _OBSIDIAN_GITIGNORE_MARKER in existing:
+            return  # block already present — idempotent no-op
+        # Separate from existing content with a blank line
+        sep = "\n" if existing.endswith("\n") else "\n\n"
+        block = (
+            sep
+            + _OBSIDIAN_GITIGNORE_MARKER
+            + "\n"
+            + "\n".join(_OBSIDIAN_GITIGNORE_LINES)
+            + "\n"
+        )
+        with gitignore_path.open("a", encoding="utf-8") as fh:
+            fh.write(block)
+    else:
+        # Fresh corpus — write the whole block
+        block = (
+            _OBSIDIAN_GITIGNORE_MARKER
+            + "\n"
+            + "\n".join(_OBSIDIAN_GITIGNORE_LINES)
+            + "\n"
+        )
+        gitignore_path.write_text(block, encoding="utf-8")
+
+
+def _seed_obsidian_config(corpus: Path) -> None:
+    """Copy the package Obsidian template into the corpus if absent."""
+    obsidian_dir = corpus / ".obsidian"
+    if obsidian_dir.is_dir():
+        return  # user's vault already exists — never overwrite
+    if not _OBSIDIAN_TEMPLATE_DIR.is_dir():
+        _warn(
+            "Obsidian template directory not found; skipping .obsidian/ seed. "
+            f"(Expected: {_OBSIDIAN_TEMPLATE_DIR})"
+        )
+        return
+    shutil.copytree(str(_OBSIDIAN_TEMPLATE_DIR), str(obsidian_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +239,11 @@ One-paragraph orientation to this wiki. (Maintained by the ingest pipeline.)
 def init(wiki_dir: str | Path) -> int:
     """Scaffold a fresh wiki directory."""
     wiki = Path(wiki_dir).resolve()
-    (wiki / INBOX).mkdir(parents=True, exist_ok=True)
-    (wiki / ARCHIVE).mkdir(parents=True, exist_ok=True)
+    # Hidden machine-only subtree
+    wiki_hidden_dir(wiki).mkdir(parents=True, exist_ok=True)
+    # Visible user-facing dirs
+    wiki_inbox(wiki).mkdir(parents=True, exist_ok=True)
+    wiki_sources(wiki).mkdir(parents=True, exist_ok=True)
     (wiki / ".ai" / "feedback").mkdir(parents=True, exist_ok=True)
 
     today = date.today().isoformat()
@@ -107,14 +254,13 @@ def init(wiki_dir: str | Path) -> int:
     if not overview.exists():
         overview.write_text(OVERVIEW_TEMPLATE.format(today=today), encoding="utf-8")
 
-    ledger = wiki / LEDGER_NAME
+    ledger = wiki_ledger(wiki)
     if not ledger.exists():
         ledger.touch()
 
     _ok(f"initialized wiki at {wiki}")
-    print(
-        f"  {INBOX}/  {ARCHIVE}/  .ai/feedback/  index.md  overview.md  {LEDGER_NAME}"
-    )
+    print(f"  {INBOX}/  {SOURCES}/  .ai/feedback/  .wiki/  index.md  overview.md")
+    ensure_obsidian_ready(wiki)
     return 0
 
 
@@ -124,7 +270,7 @@ def init(wiki_dir: str | Path) -> int:
 
 
 def _read_ledger(wiki: Path) -> list[dict]:
-    ledger = wiki / LEDGER_NAME
+    ledger = wiki_ledger(wiki)
     if not ledger.exists():
         return []
     rows: list[dict] = []
@@ -143,7 +289,7 @@ def _processed_sources(wiki: Path) -> set[str]:
 
 
 def _append_ledger(wiki: Path, entry: dict) -> None:
-    with (wiki / LEDGER_NAME).open("a", encoding="utf-8") as f:
+    with wiki_ledger(wiki).open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
@@ -325,7 +471,7 @@ def _source_hash(src: Path) -> str:
 
 
 def _load_registry(wiki: Path) -> dict:
-    reg_path = wiki / REGISTRY_NAME
+    reg_path = wiki_registry(wiki)
     if not reg_path.exists():
         return {"version": 1, "next_id": 1, "sources": []}
     try:
@@ -342,7 +488,7 @@ def _load_registry(wiki: Path) -> dict:
 
 def _save_registry(wiki: Path, registry: dict) -> None:
     """Atomic write of the registry (tmp + replace)."""
-    reg_path = wiki / REGISTRY_NAME
+    reg_path = wiki_registry(wiki)
     tmp = reg_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
     tmp.replace(reg_path)
@@ -409,7 +555,7 @@ def _mark_source_ingested(wiki: Path, file_hash: str) -> None:
 # Fix 1b -- deterministic tamper guard (the safety net under fs sandboxing)
 # ---------------------------------------------------------------------------
 #
-# Process state (the ledger + _archive/) is the CLI's EXCLUSIVE job and is
+# Process state (the ledger + _sources/) is the CLI's EXCLUSIVE job and is
 # written ONLY here, AFTER a real convergence. The spawned ingest node is
 # additionally sandboxed at the filesystem-tool layer (engine_runner Fix 1),
 # but tool-bash has no path sandbox, so we ALSO verify deterministically: snap
@@ -420,13 +566,13 @@ def _mark_source_ingested(wiki: Path, file_hash: str) -> None:
 
 
 def _snapshot_process_state(wiki: Path) -> tuple[int, set[str]]:
-    ledger = wiki / LEDGER_NAME
+    ledger = wiki_ledger(wiki)
     ledger_lines = (
         len(ledger.read_text(encoding="utf-8").splitlines()) if ledger.exists() else 0
     )
-    archive = wiki / ARCHIVE
-    archive_files = {p.name for p in archive.iterdir()} if archive.is_dir() else set()
-    return ledger_lines, archive_files
+    sources = wiki_sources(wiki)
+    sources_files = {p.name for p in sources.iterdir()} if sources.is_dir() else set()
+    return ledger_lines, sources_files
 
 
 def _detect_and_undo_tamper(wiki: Path, before: tuple[int, set[str]]) -> list[str]:
@@ -434,12 +580,12 @@ def _detect_and_undo_tamper(wiki: Path, before: tuple[int, set[str]]) -> list[st
 
     Returns a list of human-readable violation strings (empty == clean).
     """
-    before_lines, before_archive = before
+    before_lines, before_sources = before
     violations: list[str] = []
 
     # (1) Ledger: any new line during the inner run is agent-fabricated, since
     # the lib appends only after this guard runs. Truncate back to before_lines.
-    ledger = wiki / LEDGER_NAME
+    ledger = wiki_ledger(wiki)
     if ledger.exists():
         lines = ledger.read_text(encoding="utf-8").splitlines()
         if len(lines) > before_lines:
@@ -453,23 +599,23 @@ def _detect_and_undo_tamper(wiki: Path, before: tuple[int, set[str]]) -> list[st
                 ("\n".join(kept) + "\n") if kept else "", encoding="utf-8"
             )
 
-    # (2) Archive: any file that appeared during the inner run is an
+    # (2) Sources: any file that appeared during the inner run is an
     # agent-performed move. Return it to the inbox so it is NOT falsely treated
     # as processed, and so the source can be re-ingested honestly.
-    archive = wiki / ARCHIVE
-    inbox = wiki / INBOX
-    if archive.is_dir():
-        now_archive = {p.name for p in archive.iterdir()}
-        new_files = sorted(now_archive - before_archive)
+    sources = wiki_sources(wiki)
+    inbox = wiki_inbox(wiki)
+    if sources.is_dir():
+        now_sources = {p.name for p in sources.iterdir()}
+        new_files = sorted(now_sources - before_sources)
         if new_files:
             violations.append(
-                "agent moved source(s) into _archive/ (CLI-exclusive): "
+                "agent moved source(s) into _sources/ (CLI-exclusive): "
                 + ", ".join(new_files)
             )
             inbox.mkdir(exist_ok=True)
             for name in new_files:
                 try:
-                    (archive / name).replace(inbox / name)
+                    (sources / name).replace(inbox / name)
                 except OSError:
                     pass
 
@@ -576,10 +722,10 @@ def ingest(
         _fail(f"wiki dir not found: {wiki} (run `wiki-weaver init {wiki}` first)")
         return 1
 
-    inbox = wiki / INBOX
-    archive = wiki / ARCHIVE
+    inbox = wiki_inbox(wiki)
+    sources_dir = wiki_sources(wiki)
     inbox.mkdir(exist_ok=True)
-    archive.mkdir(exist_ok=True)
+    sources_dir.mkdir(exist_ok=True)
 
     if source:
         # ------------------------------------------------------------------ #
@@ -660,7 +806,7 @@ def ingest(
                 continue
 
             if result.converged:
-                dest = archive / name
+                dest = sources_dir / name
                 if src.is_file() and src.parent == inbox:
                     src.replace(dest)
                 _append_ledger(
@@ -701,8 +847,8 @@ def ingest(
     # guarantees termination — no infinite spin on bad files.                 #
     #                                                                         #
     # Terminal dispositions:                                                  #
-    #   converged   → _archive/  (existing behaviour)                        #
-    #   duplicate   → _archive/  (collision-safe; was: left in inbox → spin) #
+    #   converged   → _sources/  (existing behaviour)                        #
+    #   duplicate   → _sources/  (collision-safe; was: left in inbox → spin) #
     #   error/tamper/non-convergence → _failed/ (new; was: halted the run)   #
     #                                                                         #
     # --keep-going is accepted but is a NO-OP in drain mode: failures always  #
@@ -724,8 +870,8 @@ def ingest(
     processed = _processed_sources(wiki)
     summary_drain: list[tuple[str, str]] = []
 
-    failed_dir = wiki / FAILED
-    failed_dir.mkdir(exist_ok=True)
+    failed_dir = wiki_failed(wiki)
+    failed_dir.mkdir(parents=True, exist_ok=True)
 
     # Debounce: skip files written < 2 s ago (half-written by a concurrent
     # producer).  If all pending files are too-fresh, sleep briefly and retry
@@ -776,7 +922,7 @@ def ingest(
                 f"hash {file_hash[:12]}): {name}"
             )
             # Drain mode: move dup out of inbox to clear it (prevents spin).
-            _collision_safe_move(src, archive)
+            _collision_safe_move(src, sources_dir)
             summary_drain.append((name, "skipped"))
             continue
         if is_new:
@@ -816,7 +962,7 @@ def ingest(
             continue
 
         if result.converged:
-            dest = archive / name
+            dest = sources_dir / name
             if src.is_file() and src.parent == inbox:
                 src.replace(dest)
             _append_ledger(
@@ -882,7 +1028,7 @@ def lint(wiki: str | Path = ".") -> int:
     # Use the same validator config as the in-pipeline validate node so that
     # `wiki-weaver lint` and the pipeline `validate` step always agree.
     argv = [sys.executable, str(VALIDATE_PY), str(wiki)]
-    validator_cfg = wiki / "policy" / "validator.yaml"
+    validator_cfg = wiki_policy_dir(wiki) / "validator.yaml"
     if validator_cfg.is_file():
         argv += ["--config", str(validator_cfg)]
     proc = subprocess.run(
@@ -1151,7 +1297,7 @@ def doctor(*, wiki: str | Path | None = None) -> int:
     if wiki:
         wiki_path = Path(wiki).resolve()
         missing = [
-            d for d in (INBOX, ARCHIVE, ".ai/feedback") if not (wiki_path / d).is_dir()
+            d for d in (INBOX, SOURCES, ".ai/feedback") if not (wiki_path / d).is_dir()
         ]
         if wiki_path.is_dir() and not missing:
             _ok(f"wiki structure OK: {wiki_path}")
@@ -1398,6 +1544,475 @@ def query(wiki: str | Path, term: str) -> int:
             print(f"  {page.name}")
             hits += 1
     print(f"\n{hits} page(s) match {term!r} (query is a minimal stub)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# migrate -- move corpus from OLD layout to NEW layout
+# ---------------------------------------------------------------------------
+#
+# OLD layout (pre-0.5.0):
+#   <corpus>/.processed.jsonl   ledger at corpus root
+#   <corpus>/.sources.json      registry at corpus root
+#   <corpus>/_archive/          archived source files (visible)
+#   <corpus>/_failed/           failed-ingest files (visible)
+#   <corpus>/.runs/             run logs (hidden but at root)
+#   <corpus>/policy/            per-wiki schema overrides (visible)
+#   <corpus>/.wiki-dashboard/   dashboard theme (hidden but at root)
+#
+# NEW layout (0.5.0+):
+#   <corpus>/.wiki/.processed.jsonl   ledger under hidden subtree
+#   <corpus>/.wiki/.sources.json      registry under hidden subtree
+#   <corpus>/_sources/                archived sources (renamed, stays visible)
+#   <corpus>/.wiki/failed/            failed-ingest files
+#   <corpus>/.wiki/runs/              run logs
+#   <corpus>/.wiki/policy/            per-wiki schema overrides
+#   <corpus>/.wiki/dashboard/         dashboard theme
+#
+# Ledger field rewrites (absolute paths in the entries):
+#   archived_to:  /<wiki>/_archive/…  →  /<wiki>/_sources/…
+#   logs_dir:     /<wiki>/.runs/…     →  /<wiki>/.wiki/runs/…
+
+MIGRATION_LOCK_NAME = ".wiki-migration.lock"
+MIGRATION_SENTINEL = ".migration-complete"
+
+
+def _migration_plan(wiki: Path) -> list[tuple[str, Path, Path, bool]]:
+    """Return ``(description, old_path, new_path, is_dir)`` for OLD paths that exist."""
+    candidates: list[tuple[str, Path, Path, bool]] = [
+        ("ledger", wiki / ".processed.jsonl", wiki_ledger(wiki), False),
+        ("registry", wiki / ".sources.json", wiki_registry(wiki), False),
+        ("archive", wiki / "_archive", wiki_sources(wiki), True),
+        ("failed", wiki / "_failed", wiki_failed(wiki), True),
+        ("runs", wiki / ".runs", wiki_runs(wiki), True),
+        ("policy", wiki / "policy", wiki_policy_dir(wiki), True),
+        ("dashboard", wiki / ".wiki-dashboard", wiki_dashboard(wiki), True),
+    ]
+    return [item for item in candidates if item[1].exists()]
+
+
+def _rewrite_ledger_keys(ledger_path: Path, wiki: Path) -> tuple[int, int]:
+    """Rewrite path-valued fields in the NEW ledger after it has been copied.
+
+    Rewrites:
+    - ``archived_to``: replaces the ``<wiki>/_archive`` prefix with
+      ``<wiki>/_sources`` (the new visible sources dir).
+    - ``logs_dir``: replaces the ``<wiki>/.runs`` prefix with
+      ``<wiki>/.wiki/runs``.
+
+    Returns ``(changed, path_field_lines)``:
+    - ``changed``: number of lines actually rewritten (prefix matched this corpus).
+    - ``path_field_lines``: number of non-empty lines that carry a non-empty
+      ``archived_to`` or ``logs_dir`` field at all (whether or not the prefix
+      matched).  The caller uses this for the C1 mismatch guard: a ledger that
+      HAS path fields but rewrote NONE means its absolute paths point at a
+      different corpus location (moved/copied since processing).
+
+    Writes atomically via a temp file + rename.  Raises ``RuntimeError`` if the
+    line count changes.
+    """
+    if not ledger_path.exists():
+        return 0, 0
+
+    old_archive = str(wiki / "_archive")
+    new_sources_str = str(wiki_sources(wiki))
+    old_runs = str(wiki / ".runs")
+    new_runs_str = str(wiki_runs(wiki))
+
+    raw = ledger_path.read_text(encoding="utf-8")
+    lines_in = raw.splitlines(keepends=True)
+    lines_out: list[str] = []
+    changed = 0
+    path_field_lines = 0
+
+    for line in lines_in:
+        stripped = line.rstrip("\n").rstrip("\r")
+        if not stripped:
+            lines_out.append(line)
+            continue
+        try:
+            entry = json.loads(stripped)
+        except json.JSONDecodeError:
+            lines_out.append(line)
+            continue
+
+        at = entry.get("archived_to")
+        ld = entry.get("logs_dir")
+
+        # Does this line carry ANY non-empty path field? (C1 denominator.)
+        if (isinstance(at, str) and at) or (isinstance(ld, str) and ld):
+            path_field_lines += 1
+
+        modified = False
+        if isinstance(at, str) and at.startswith(old_archive):
+            entry["archived_to"] = new_sources_str + at[len(old_archive) :]
+            modified = True
+
+        if isinstance(ld, str) and ld.startswith(old_runs):
+            entry["logs_dir"] = new_runs_str + ld[len(old_runs) :]
+            modified = True
+
+        if modified:
+            changed += 1
+
+        ending = "\n" if line.endswith("\n") else ""
+        lines_out.append(json.dumps(entry) + ending)
+
+    if len(lines_out) != len(lines_in):
+        raise RuntimeError(
+            f"ledger line count changed during rewrite: "
+            f"{len(lines_in)} → {len(lines_out)}"
+        )
+
+    tmp = ledger_path.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(lines_out), encoding="utf-8")
+    tmp.replace(ledger_path)
+    return changed, path_field_lines
+
+
+def _write_migration_sentinel(sentinel: Path) -> None:
+    """Write the completion sentinel with a timestamp."""
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_text(
+        json.dumps(
+            {
+                "migrated_at": datetime.now().isoformat(timespec="seconds"),
+                "from_layout": "pre-0.5.0",
+                "to_layout": "0.5.0",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _safe_rel(path: Path, base: Path) -> str:
+    """Return *path* relative to *base*, or the absolute string if not under it."""
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
+def _files_differ(a: Path, b: Path) -> bool:
+    """Return True when *a* and *b* differ in content (or comparison fails).
+
+    Used by the no-clobber copy guard (M1): a differing existing target must be
+    preserved, never silently overwritten with OLD content.  On any OS error we
+    conservatively report "differ" so the target is preserved rather than lost.
+    """
+    try:
+        return not filecmp.cmp(str(a), str(b), shallow=False)
+    except OSError:
+        return True
+
+
+def _guarded_copytree(old: Path, new: Path, wiki: Path) -> list[str]:
+    """Copy *old* → *new* file-by-file, preserving any newer/differing target (M1).
+
+    Unlike ``shutil.copytree(dirs_exist_ok=True)``, this never overwrites an
+    existing target file whose content differs from the OLD source — that target
+    may be post-upgrade content (e.g. a ``build-dashboard``-written
+    ``theme.json``) that the user does not want clobbered with OLD data.  Such
+    files are skipped with a WARN and their relative paths returned.
+
+    Identical existing targets are skipped silently (idempotent re-run).
+    Missing targets are copied with ``copy2`` (preserves mtime).  Raises
+    ``OSError`` on a real copy failure (e.g. ENOSPC) — handled by the caller.
+    """
+    new.mkdir(parents=True, exist_ok=True)
+    preserved: list[str] = []
+    for src in sorted(old.rglob("*")):
+        rel = src.relative_to(old)
+        dst = new / rel
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and _files_differ(src, dst):
+            preserved.append(_safe_rel(dst, wiki))
+            _warn(
+                f"    preserved existing {_safe_rel(dst, wiki)} "
+                f"(differs from OLD; not overwritten)"
+            )
+            continue
+        shutil.copy2(str(src), str(dst))
+    return preserved
+
+
+def migrate(wiki_dir: str | Path, *, dry_run: bool = False, force: bool = False) -> int:
+    """Migrate a corpus from the OLD (pre-0.5.0) layout to the NEW layout.
+
+    Safety invariants (all non-negotiable):
+
+    * **PID lock** — ``<corpus>/.wiki-migration.lock`` prevents concurrent runs.
+      A stale lock whose PID is gone is silently removed and migration proceeds.
+    * **Idempotency sentinel** — ``<corpus>/.wiki/.migration-complete`` makes a
+      second run a clean no-op.  ``--force`` bypasses the sentinel.
+    * **Copy → rewrite → verify → delete** — old data is never removed before
+      the new data has been copied and verified.  A failed verification aborts
+      before any deletion occurs.
+    * **``--dry-run``** — prints the full migration plan and exits without
+      touching the filesystem.
+
+    Ledger rewrites (in ``.wiki/.processed.jsonl`` after copying):
+
+    * ``archived_to``: ``/_archive/…`` → ``/_sources/…``
+    * ``logs_dir``:    ``/.runs/…``    → ``/.wiki/runs/…``
+
+    ``sources.json`` filenames are bare identifiers — no path rewrite.
+    """
+    wiki = Path(wiki_dir).expanduser().resolve()
+
+    if not wiki.is_dir():
+        _fail(f"corpus directory not found: {wiki}")
+        return 1
+
+    lock_path = wiki / MIGRATION_LOCK_NAME
+    sentinel = wiki_hidden_dir(wiki) / MIGRATION_SENTINEL
+
+    # ── PID lock (atomic, TOCTOU-free) ──────────────────────────────────────
+    # Create the lock with O_EXCL so the existence check and the write are a
+    # single atomic syscall — two concurrent migrations cannot both win the
+    # race. Only on FileExistsError do we inspect the holder's PID to decide
+    # whether it is a live run (abort) or a stale lock to reclaim.
+    if not _acquire_migration_lock(lock_path):
+        return 1
+
+    try:
+        return _run_migration(wiki, sentinel, dry_run=dry_run, force=force)
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _acquire_migration_lock(lock_path: Path) -> bool:
+    """Atomically acquire the migration PID lock; return True on success.
+
+    Uses ``open(path, "x")`` (O_EXCL) so creation is atomic. If the lock already
+    exists, inspects the recorded PID: a live process means a real concurrent
+    migration (return False, do NOT touch its lock); a gone/invalid PID is a
+    stale lock that is reclaimed, after which we re-attempt the atomic create
+    once (losing that second race also returns False).
+    """
+
+    def _try_create() -> bool:
+        try:
+            with open(lock_path, "x", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            return True
+        except FileExistsError:
+            return False
+
+    if _try_create():
+        return True
+
+    # Lock exists — inspect the holder.
+    raw_pid = ""
+    try:
+        raw_pid = lock_path.read_text(encoding="utf-8").strip()
+        existing_pid = int(raw_pid)
+    except (ValueError, OSError):
+        _warn(f"stale migration lock (invalid PID {raw_pid!r}); removing: {lock_path}")
+        lock_path.unlink(missing_ok=True)
+    else:
+        alive = False
+        try:
+            os.kill(existing_pid, 0)
+            alive = True
+        except ProcessLookupError:
+            pass  # process gone → stale lock
+        except PermissionError:
+            alive = True  # process exists, different user
+        except OSError:
+            pass  # other error → assume stale
+
+        if alive:
+            _fail(
+                f"migration already in progress (PID {existing_pid}); "
+                f"remove {lock_path} if the process is gone and retry."
+            )
+            return False
+        _warn(f"stale migration lock (PID {existing_pid} gone); removing: {lock_path}")
+        lock_path.unlink(missing_ok=True)
+
+    # Stale lock cleared — re-attempt the atomic create once. Losing this race
+    # means another process grabbed it in the gap, so we yield to it.
+    if _try_create():
+        return True
+    _fail(
+        f"migration lock contention at {lock_path}; another run won the race — retry."
+    )
+    return False
+
+
+def _run_migration(
+    wiki: Path,
+    sentinel: Path,
+    *,
+    dry_run: bool,
+    force: bool,
+) -> int:
+    """Inner migration logic (called inside the PID lock context)."""
+    # ── Idempotency ────────────────────────────────────────────────────────
+    if sentinel.exists() and not force:
+        try:
+            info = json.loads(sentinel.read_text(encoding="utf-8"))
+            migrated_at = info.get("migrated_at", "unknown")
+        except Exception:  # noqa: BLE001
+            migrated_at = "unknown"
+        print(f"corpus already migrated at {migrated_at}. Use --force to re-run.")
+        return 0
+
+    # ── Build plan ─────────────────────────────────────────────────────────
+    plan = _migration_plan(wiki)
+
+    if not plan:
+        if dry_run:
+            print("Nothing to migrate (no OLD-layout paths found).")
+            return 0
+        # Mark as clean even if already on the new layout
+        wiki_hidden_dir(wiki).mkdir(parents=True, exist_ok=True)
+        _write_migration_sentinel(sentinel)
+        _ok("Nothing to migrate (no OLD-layout paths found); sentinel written.")
+        return 0
+
+    # ── Dry-run report ─────────────────────────────────────────────────────
+    if dry_run:
+        print(f"Migration plan for: {wiki}")
+        print()
+        for desc, old, new, is_dir in plan:
+            kind = "dir " if is_dir else "file"
+            print(f"  [{kind}] {_safe_rel(old, wiki)}  →  {_safe_rel(new, wiki)}")
+        print()
+        print("Ledger rewrites (after copy):")
+        print("  archived_to : /_archive/…  →  /_sources/…")
+        print("  logs_dir    : /.runs/…     →  /.wiki/runs/…")
+        print()
+        print("No changes made (--dry-run).")
+        return 0
+
+    # ── Create hidden subtree root ─────────────────────────────────────────
+    wiki_hidden_dir(wiki).mkdir(parents=True, exist_ok=True)
+
+    # ── Phase 1: Copy OLD → NEW ────────────────────────────────────────────
+    # H4: a copy failure (e.g. ENOSPC) must leave OLD intact and exit non-zero;
+    # re-running resumes because every copy is idempotent (guarded file-by-file
+    # copy for dirs; existence check for the single files).
+    print(f"Migrating {wiki} …")
+    print()
+    print("Phase 1/4  copy OLD → NEW")
+    try:
+        for desc, old, new, is_dir in plan:
+            old_rel = _safe_rel(old, wiki)
+            new_rel = _safe_rel(new, wiki)
+            if is_dir:
+                # M1: never clobber a newer/differing target inside the dir.
+                _guarded_copytree(old, new, wiki)
+            else:
+                new.parent.mkdir(parents=True, exist_ok=True)
+                # M1: preserve an existing target file that differs from OLD.
+                if new.exists() and _files_differ(old, new):
+                    _warn(
+                        f"  preserved existing {new_rel} "
+                        f"(differs from OLD {old_rel}; not overwritten)"
+                    )
+                    continue
+                shutil.copy2(str(old), str(new))
+            _ok(f"  {old_rel}  →  {new_rel}")
+    except OSError as e:
+        _fail(f"copy failed: {e}; OLD paths are intact, re-run to resume")
+        return 1
+
+    # ── Phase 2: Ledger key rewrite ────────────────────────────────────────
+    print()
+    print("Phase 2/4  rewrite ledger keys")
+    new_ledger_path = wiki_ledger(wiki)
+    if new_ledger_path.exists():
+        changed, path_field_lines = _rewrite_ledger_keys(new_ledger_path, wiki)
+        _ok(
+            f"  {_safe_rel(new_ledger_path, wiki)}: {changed} line(s) rewritten"
+            f" (archived_to + logs_dir)"
+        )
+        # C1: if the ledger HAS absolute-path fields but NONE matched this
+        # corpus's location, the prefixes are stale (corpus moved/copied since
+        # processing). Deleting _archive/ now would orphan the ledger forever.
+        # Abort BEFORE Phase 3/4 — nothing has been deleted yet; the lock is
+        # still released by migrate()'s finally.
+        if path_field_lines > 0 and changed == 0:
+            _fail(
+                f"Ledger path fields do not match this corpus location "
+                f"(0 of {path_field_lines} rewritten) — aborting to avoid "
+                f"corrupting the ledger. Inspect with --dry-run."
+            )
+            return 1
+    else:
+        _warn("  no ledger found; skipping key rewrite")
+
+    # ── Phase 3: Verify ────────────────────────────────────────────────────
+    print()
+    print("Phase 3/4  verify")
+    failures: list[str] = []
+    for desc, old, new, is_dir in plan:
+        old_rel = _safe_rel(old, wiki)
+        new_rel = _safe_rel(new, wiki)
+        if is_dir:
+            old_count = sum(1 for p in old.rglob("*") if p.is_file())
+            new_count = sum(1 for p in new.rglob("*") if p.is_file())
+            # C2: runs/ holds run-LOGS, not user data. A post-upgrade `weave`
+            # may have already written NEW run-logs into the destination, so the
+            # target legitimately holds MORE files than OLD .runs/. Accept >= for
+            # runs/ only; keep STRICT equality for _sources/, policy, failed.
+            ok = (
+                (new_count >= old_count) if desc == "runs" else (new_count == old_count)
+            )
+            if not ok:
+                failures.append(f"{old_rel}: file count {old_count} ≠ {new_count}")
+            else:
+                _ok(f"  {new_rel}: {new_count} file(s)")
+        elif desc == "ledger":
+            # The ledger is intentionally rewritten (path values change so byte
+            # size differs).  Verify by non-empty entry count instead.
+            old_entries = [
+                ln for ln in old.read_text(encoding="utf-8").splitlines() if ln.strip()
+            ]
+            new_text = new.read_text(encoding="utf-8") if new.exists() else ""
+            new_entries = [ln for ln in new_text.splitlines() if ln.strip()]
+            if len(old_entries) != len(new_entries):
+                failures.append(
+                    f"{old_rel}: entry count {len(old_entries)} ≠ {len(new_entries)}"
+                )
+            else:
+                _ok(f"  {new_rel}: {len(new_entries)} entries")
+        else:
+            old_size = old.stat().st_size
+            new_size = new.stat().st_size if new.exists() else -1
+            if old_size != new_size:
+                failures.append(f"{old_rel}: size {old_size} B ≠ {new_size} B")
+            else:
+                _ok(f"  {new_rel}: {new_size} B")
+
+    if failures:
+        _fail("Verification failed — aborting before any deletion:")
+        for msg in failures:
+            _fail(f"  {msg}")
+        return 1
+
+    # ── Phase 4: Delete OLD ────────────────────────────────────────────────
+    print()
+    print("Phase 4/4  delete OLD paths")
+    for desc, old, new, is_dir in plan:
+        old_rel = _safe_rel(old, wiki)
+        if is_dir:
+            shutil.rmtree(str(old))
+        else:
+            old.unlink()
+        _ok(f"  deleted {old_rel}")
+
+    # ── Sentinel ───────────────────────────────────────────────────────────
+    _write_migration_sentinel(sentinel)
+    print()
+    _ok(f"Migration complete. Sentinel: {_safe_rel(sentinel, wiki)}")
+    ensure_obsidian_ready(wiki)
     return 0
 
 

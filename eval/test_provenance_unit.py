@@ -160,8 +160,9 @@ def _make_wiki(tmp_path: Path) -> Path:
     """Scaffold a minimal wiki directory structure."""
     wiki = tmp_path / "wiki"
     wiki.mkdir()
+    (wiki / ".wiki").mkdir()  # hidden machine-only subtree
     (wiki / "_inbox").mkdir()
-    (wiki / "_archive").mkdir()
+    (wiki / "_sources").mkdir()
     (wiki / ".ai" / "feedback").mkdir(parents=True)
     return wiki
 
@@ -182,7 +183,7 @@ class TestAssignSourceIdProvenance:
         assert entry["url"] == "https://example.com/sample-article-abc123"
         assert entry.get("date") == "2024-05-01"
         # Verify persisted to .sources.json
-        data = json.loads((wiki / REGISTRY_NAME).read_text(encoding="utf-8"))
+        data = json.loads((wiki / ".wiki" / REGISTRY_NAME).read_text(encoding="utf-8"))
         saved = data["sources"][0]
         assert saved["author"] == "Jane Doe"
         assert saved["url"] == "https://example.com/sample-article-abc123"
@@ -202,7 +203,7 @@ class TestAssignSourceIdProvenance:
         assert "url" not in entry
         assert "date" not in entry
         # Registry valid
-        data = json.loads((wiki / REGISTRY_NAME).read_text(encoding="utf-8"))
+        data = json.loads((wiki / ".wiki" / REGISTRY_NAME).read_text(encoding="utf-8"))
         assert len(data["sources"]) == 1
         assert data["sources"][0]["id"] == 1
         assert "author" not in data["sources"][0]
@@ -236,7 +237,7 @@ class TestAssignSourceIdProvenance:
         assert e1["author"] == "Jane Doe"
         assert e2["author"] == "Murat Aslan"
 
-        data = json.loads((wiki / REGISTRY_NAME).read_text(encoding="utf-8"))
+        data = json.loads((wiki / ".wiki" / REGISTRY_NAME).read_text(encoding="utf-8"))
         assert len(data["sources"]) == 2
 
     def test_grade_provenance_would_pass(self, tmp_path):

@@ -13,6 +13,7 @@ Subcommands:
     query  [--wiki] <q>        (stub) list pages matching a term
     ask    <question> [--wiki] answer a question by reading the compiled wiki
     build-dashboard <corpus>   build a self-contained HTML dashboard
+    migrate <corpus>           relocate an old-layout corpus to the .wiki/ layout
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from wiki_weaver._version import __version__
 # Re-exports: symbols imported by tests from wiki_weaver.cli
 # ---------------------------------------------------------------------------
 from wiki_weaver.lib import (
-    ARCHIVE,
+    SOURCES,
     FAILED,
     INBOX,
     REGISTRY_NAME,
@@ -38,6 +39,7 @@ from wiki_weaver.lib import (
     ingest,
     init,
     lint,
+    migrate,
     preflight,
     query,
     update,
@@ -45,7 +47,7 @@ from wiki_weaver.lib import (
 
 __all__ = [
     # constants (test imports)
-    "ARCHIVE",
+    "SOURCES",
     "FAILED",
     "INBOX",
     "REGISTRY_NAME",
@@ -61,6 +63,7 @@ __all__ = [
     "update",
     "query",
     "ask",
+    "migrate",
 ]
 
 
@@ -150,6 +153,17 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return ask(args.wiki, args.question, json_out=args.json_out)
 
 
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Migrate a corpus from the OLD (pre-0.5.0) layout to the NEW layout.
+
+    Deterministic — no LLM, no Amplifier runtime required.
+    """
+    from pathlib import Path
+
+    corpus = Path(args.corpus).expanduser().resolve()
+    return migrate(corpus, dry_run=args.dry_run, force=args.force)
+
+
 def cmd_build_dashboard(args: argparse.Namespace) -> int:
     """Build a self-contained HTML dashboard from a wiki corpus.
 
@@ -222,7 +236,7 @@ def main() -> None:
         help=(
             "Rich free-text description of the wiki's intended use and desired outcomes. "
             "When provided (and ANTHROPIC_API_KEY is set), the LLM designs a domain-fit "
-            "schema and writes it to <wiki>/policy/schema.md. "
+            "schema and writes it to <wiki>/.wiki/policy/schema.md. "
             "Example: --purpose 'AI coding tools second brain for answering which tool "
             "to use for X and comparing alternatives'"
         ),
@@ -319,7 +333,7 @@ def main() -> None:
         "--theme",
         default=None,
         metavar="PATH",
-        help="path to theme.json (optional; overrides .wiki-dashboard/theme.json in corpus)",
+        help="path to theme.json (optional; overrides .wiki/dashboard/theme.json in corpus)",
     )
     p_build_dashboard.add_argument(
         "--group-by",
@@ -347,6 +361,26 @@ def main() -> None:
         help="skip index rebuild (use existing .wiki/index/ files)",
     )
 
+    p_migrate = sub.add_parser(
+        "migrate",
+        help=(
+            "migrate a corpus from the OLD layout (pre-0.5.0) to the NEW layout "
+            "(machine files under .wiki/, _archive/ renamed to _sources/)"
+        ),
+    )
+    p_migrate.add_argument("corpus", help="wiki corpus directory to migrate")
+    p_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="print the migration plan without making any changes",
+    )
+    p_migrate.add_argument(
+        "--force",
+        action="store_true",
+        help="re-run even if the migration sentinel already exists",
+    )
+
     args = parser.parse_args()
 
     dispatch = {
@@ -358,6 +392,7 @@ def main() -> None:
         "query": cmd_query,
         "ask": cmd_ask,
         "build-dashboard": cmd_build_dashboard,
+        "migrate": cmd_migrate,
     }
     if args.command is None:
         parser.print_help()

@@ -121,8 +121,9 @@ def _make_wiki(tmp_path: Path) -> Path:
     """Scaffold a minimal wiki directory (same as test_provenance_unit.py)."""
     wiki = tmp_path / "wiki"
     wiki.mkdir()
+    (wiki / ".wiki").mkdir()  # hidden machine-only subtree
     (wiki / "_inbox").mkdir()
-    (wiki / "_archive").mkdir()
+    (wiki / "_sources").mkdir()
     (wiki / ".ai" / "feedback").mkdir(parents=True)
     return wiki
 
@@ -248,7 +249,7 @@ class TestNegativeGradeProvenance:
             )
             _assign_source_id(wiki, src)
 
-        data = json.loads((wiki / REGISTRY_NAME).read_text(encoding="utf-8"))
+        data = json.loads((wiki / ".wiki" / REGISTRY_NAME).read_text(encoding="utf-8"))
         # Confirm no author/url in any entry
         for entry in data["sources"]:
             assert "author" not in entry, (

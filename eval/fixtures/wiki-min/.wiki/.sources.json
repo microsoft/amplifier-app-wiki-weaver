@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "next_id": 2,
+  "sources": [
+    {
+      "id": 1,
+      "filename": "source1.md",
+      "hash": "abc123def456abc123def456abc123def456abc123def456abc123def456abc123",
+      "first_seen": "2024-01-01T00:00:00",
+      "ingested": true,
+      "author": "Test Author",
+      "url": "https://example.com/source1"
+    }
+  ]
+}

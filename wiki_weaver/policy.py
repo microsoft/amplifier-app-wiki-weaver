@@ -1,14 +1,14 @@
 """Project-policy loader for wiki-weaver (Phase D — schema externalization).
 
-Each wiki MAY carry project-supplied policy files under <wiki>/policy/ and a
+Each wiki MAY carry project-supplied policy files under <wiki>/.wiki/policy/ and a
 knobs file at <wiki>/wiki.config.yaml.  Everything is optional: a wiki with no
-policy/ dir and no wiki.config.yaml behaves byte-identically to pre-Phase-D.
+.wiki/policy/ dir and no wiki.config.yaml behaves byte-identically to pre-Phase-D.
 
 Policy files (all optional, each falls back to the built-in pipeline/ default):
-  <wiki>/policy/schema.md           overrides pipeline/SCHEMA.md
-  <wiki>/policy/convergence-rubric.md  overrides pipeline/CONVERGENCE_RUBRIC.md
-  <wiki>/policy/validator.yaml      overrides validate_wiki.py constants
-  <wiki>/policy/inner.dot           ADVANCED: override the whole inner pipeline DOT
+  <wiki>/.wiki/policy/schema.md           overrides pipeline/SCHEMA.md
+  <wiki>/.wiki/policy/convergence-rubric.md  overrides pipeline/CONVERGENCE_RUBRIC.md
+  <wiki>/.wiki/policy/validator.yaml      overrides validate_wiki.py constants
+  <wiki>/.wiki/policy/inner.dot           ADVANCED: override the whole inner pipeline DOT
 
 Knobs file (<wiki>/wiki.config.yaml, all keys optional):
   provider: anthropic
@@ -81,15 +81,19 @@ class WikiPolicy:
 def load_policy(wiki_dir: Path, *, cli_max_cycles: int | None = None) -> WikiPolicy:
     """Load the project policy for *wiki_dir*.
 
-    Reads <wiki_dir>/wiki.config.yaml and <wiki_dir>/policy/*.  Every element
+    Reads <wiki_dir>/wiki.config.yaml and <wiki_dir>/.wiki/policy/*.  Every element
     is optional: a wiki with neither file behaves byte-identically to pre-Phase-D
     because the built-in defaults are the same constants the engine previously used.
 
     ``cli_max_cycles`` — when set, overrides wiki.config.yaml's max_cycles (CLI
     flag beats config file).
     """
+    from .lib import (
+        WIKI_DIR,
+    )  # avoid circular at module-level; lib imports policy lazily
+
     wiki_dir = Path(wiki_dir).expanduser().resolve()
-    pol = wiki_dir / "policy"
+    pol = wiki_dir / WIKI_DIR / "policy"
 
     def _pick(name: str, default: Path) -> Path:
         """Return the project override if it exists, else the built-in default."""

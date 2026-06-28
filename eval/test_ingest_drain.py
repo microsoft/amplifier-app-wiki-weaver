@@ -30,7 +30,7 @@ sys.path.insert(0, str(_REPO))
 # rather than erroring. Matches test_claim_retention.py / test_preflight_gate.py.
 pytest.importorskip("wiki_weaver.engine_runner")
 
-from wiki_weaver.cli import ARCHIVE, FAILED, INBOX, cmd_ingest  # noqa: E402
+from wiki_weaver.cli import FAILED, INBOX, SOURCES, cmd_ingest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -56,9 +56,10 @@ def _make_wiki(tmp_path: Path) -> Path:
     """Minimal wiki scaffold that satisfies cmd_ingest's prerequisite checks."""
     wiki = tmp_path / "wiki"
     wiki.mkdir()
+    (wiki / ".wiki").mkdir()  # hidden machine-only subtree
     (wiki / INBOX).mkdir()
-    (wiki / ARCHIVE).mkdir()
-    (wiki / ".processed.jsonl").touch()
+    (wiki / SOURCES).mkdir()
+    (wiki / ".wiki" / ".processed.jsonl").touch()
     return wiki
 
 
@@ -121,7 +122,7 @@ def test_a_reglov_picks_up_mid_drain_addition(tmp_path: Path) -> None:
     """
     wiki = _make_wiki(tmp_path)
     inbox = wiki / INBOX
-    archive = wiki / ARCHIVE
+    sources = wiki / SOURCES
 
     _seed_inbox(inbox, "a.md")
     _seed_inbox(inbox, "b.md")
@@ -152,9 +153,9 @@ def test_a_reglov_picks_up_mid_drain_addition(tmp_path: Path) -> None:
     remaining = list(inbox.glob("*.md"))
     assert not remaining, f"inbox should be empty; found: {[p.name for p in remaining]}"
 
-    assert (archive / "a.md").exists(), "a.md must be in _archive/"
-    assert (archive / "b.md").exists(), "b.md must be in _archive/"
-    assert (archive / "c.md").exists(), "c.md must be in _archive/"
+    assert (sources / "a.md").exists(), "a.md must be in _sources/"
+    assert (sources / "b.md").exists(), "b.md must be in _sources/"
+    assert (sources / "c.md").exists(), "c.md must be in _sources/"
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +175,7 @@ def test_b_failed_source_routes_to_failed_dir(tmp_path: Path) -> None:
     """
     wiki = _make_wiki(tmp_path)
     inbox = wiki / INBOX
-    archive = wiki / ARCHIVE
+    sources = wiki / SOURCES
 
     _seed_inbox(inbox, "a.md")
     _seed_inbox(inbox, "b.md")  # this one will raise
@@ -196,15 +197,15 @@ def test_b_failed_source_routes_to_failed_dir(tmp_path: Path) -> None:
     remaining = list(inbox.glob("*.md"))
     assert not remaining, f"inbox should be empty; found: {[p.name for p in remaining]}"
 
-    # Successful files land in _archive/.
-    assert (archive / "a.md").exists(), "a.md must be in _archive/"
-    assert (archive / "c.md").exists(), "c.md must be in _archive/"
+    # Successful files land in _sources/.
+    assert (sources / "a.md").exists(), "a.md must be in _sources/"
+    assert (sources / "c.md").exists(), "c.md must be in _sources/"
 
-    # Failed file lands in _failed/ (name may have a suffix due to collision-safe move).
-    failed_dir = wiki / FAILED
-    assert failed_dir.exists(), "_failed/ directory must be created"
+    # Failed file lands in .wiki/failed/ (name may have a suffix due to collision-safe move).
+    failed_dir = wiki / ".wiki" / "failed"
+    assert failed_dir.exists(), ".wiki/failed/ directory must be created"
     failed_files = list(failed_dir.glob("b*.md"))
-    assert failed_files, "_failed/ should contain b.md (or a b*.md variant)"
+    assert failed_files, ".wiki/failed/ should contain b.md (or a b*.md variant)"
 
     # Exit code must be nonzero.
     assert rc != 0, "at least one failure → exit code must be nonzero"
@@ -223,12 +224,12 @@ def test_c_duplicate_cleared_from_inbox_no_spin(tmp_path: Path) -> None:
     """
     wiki = _make_wiki(tmp_path)
     inbox = wiki / INBOX
-    archive = wiki / ARCHIVE
+    sources = wiki / SOURCES
 
     content = "# Already ingested\n\nThis content was previously processed.\n"
     dup_file = _seed_inbox(inbox, "dup.md", content)
 
-    # Pre-populate .sources.json with an entry marked ingested=True.
+    # Pre-populate .wiki/.sources.json with an entry marked ingested=True.
     file_hash = hashlib.sha256(dup_file.read_bytes()).hexdigest()
     registry = {
         "version": 1,
@@ -243,7 +244,7 @@ def test_c_duplicate_cleared_from_inbox_no_spin(tmp_path: Path) -> None:
             }
         ],
     }
-    (wiki / ".sources.json").write_text(
+    (wiki / ".wiki" / ".sources.json").write_text(
         json.dumps(registry, indent=2), encoding="utf-8"
     )
 
@@ -259,10 +260,10 @@ def test_c_duplicate_cleared_from_inbox_no_spin(tmp_path: Path) -> None:
     remaining = list(inbox.glob("*.md"))
     assert not remaining, f"inbox should be empty; found: {[p.name for p in remaining]}"
 
-    # Dup must have been moved to _archive/ (name may carry a suffix).
-    archived = list(archive.glob("dup*.md"))
+    # Dup must have been moved to _sources/ (name may carry a suffix).
+    archived = list(sources.glob("dup*.md"))
     assert archived, (
-        f"_archive/ should contain the dup file; found: {list(archive.iterdir())}"
+        f"_sources/ should contain the dup file; found: {list(sources.iterdir())}"
     )
 
 

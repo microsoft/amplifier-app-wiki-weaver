@@ -585,7 +585,7 @@ def query_resolve_citation(corpus_dir: str | Path, page: str, n: int) -> dict[st
     - The page's frontmatter ``sources`` field is a list of source IDs
       (e.g. ``sources: [1, 3]``).
     - Ordinal *n* (1-based) indexes into that list.
-    - The source record is looked up by id in ``<corpus>/.sources.json``.
+    - The source record is looked up by id in ``<corpus>/.wiki/.sources.json``.
 
     Returns::
 
@@ -627,8 +627,12 @@ def query_resolve_citation(corpus_dir: str | Path, page: str, n: int) -> dict[st
         raise CitationNotFound(page, n)
     source_id = int(sources_field[n - 1])
 
-    # Look up the source record in .sources.json
-    registry_path = corpus / ".sources.json"
+    # Look up the source record in .wiki/.sources.json
+    from wiki_weaver.lib import (
+        wiki_registry as _wiki_registry,
+    )  # avoid circular at top level
+
+    registry_path = _wiki_registry(corpus)
     if not registry_path.exists():
         raise CitationNotFound(page, n)
     registry: dict[str, Any] = json.loads(registry_path.read_text(encoding="utf-8"))

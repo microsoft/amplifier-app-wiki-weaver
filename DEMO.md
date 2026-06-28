@@ -31,7 +31,7 @@ wiki-weaver build-dashboard mywiki --out mywiki.html     # one self-contained HT
 `build-dashboard` is **deterministic** (no LLM, no Amplifier runtime): it builds the corpus indexes,
 then renders the whole wiki into a single portable HTML file — a navigable reading view with a
 type-grouped sidebar, type badges, and a "Linked from" backlinks panel. Open it in a browser or drop
-it into Obsidian. Restyle it without touching code via `<corpus>/.wiki-dashboard/theme.json`
+it into Obsidian. Restyle it without touching code via `<corpus>/.wiki/dashboard/theme.json`
 (`--wiki-*` token overrides + optional `title`) or `custom.css`; see the README's Dashboard section.
 
 Prefer a generic, no-LLM scaffold? Use `wiki-weaver init mywiki --plain` (free, instant) and
@@ -54,7 +54,7 @@ into `_inbox/` and re-running `ingest` over time.
 | **Compounds correctly** | `sources:` accrue in place (`[1] → [1, 2, 4]`); pages grow rather than fork; **0 duplicate** concept pages on re-ingest. |
 | **Surfaces contradictions** | when sources disagree, an `## Open Tensions` section records **both sides + provenance**, rather than averaging them. |
 | **Error-free** | the structural validator (links, orphans, frontmatter, provenance) exits 0 on every convergence. |
-| **Dependable (no lying)** | the ledger/`_archive/` are written by code *only on real convergence*; an agent cannot fake "converged" (a deterministic tamper guard reverts and fails loud). |
+| **Dependable (no lying)** | the ledger/`_sources/` are written by code *only on real convergence*; an agent cannot fake "converged" (a deterministic tamper guard reverts and fails loud). |
 | **Self-heals** | a broken `[[link]]` is repaired by the validate → feedback → ingest loop, which re-converges. |
 | **Robust routing** | a flaky/empty `assess` verdict routes to *refine* (more work), never a dead-end or a false "converged". |
 

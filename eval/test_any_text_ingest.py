@@ -31,7 +31,7 @@ sys.path.insert(0, str(_REPO))
 # rather than erroring. Matches test_claim_retention.py / test_preflight_gate.py.
 pytest.importorskip("wiki_weaver.engine_runner")
 
-from wiki_weaver.cli import ARCHIVE, FAILED, INBOX, cmd_ingest  # noqa: E402
+from wiki_weaver.cli import FAILED, INBOX, SOURCES, cmd_ingest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -57,9 +57,10 @@ def _make_wiki(tmp_path: Path) -> Path:
     """Minimal wiki scaffold that satisfies cmd_ingest's prerequisite checks."""
     wiki = tmp_path / "wiki"
     wiki.mkdir()
+    (wiki / ".wiki").mkdir()  # hidden machine-only subtree
     (wiki / INBOX).mkdir()
-    (wiki / ARCHIVE).mkdir()
-    (wiki / ".processed.jsonl").touch()
+    (wiki / SOURCES).mkdir()
+    (wiki / ".wiki" / ".processed.jsonl").touch()
     return wiki
 
 
@@ -121,7 +122,7 @@ def test_a_non_md_text_files_are_ingested(tmp_path: Path) -> None:
     """
     wiki = _make_wiki(tmp_path)
     inbox = wiki / INBOX
-    archive = wiki / ARCHIVE
+    sources = wiki / SOURCES
 
     _seed_text(inbox, "foo.py", "def hello():\n    return 'hello world'\n")
     _seed_text(inbox, "notes.txt", "Meeting notes:\n- item 1\n- item 2\n")
@@ -141,9 +142,9 @@ def test_a_non_md_text_files_are_ingested(tmp_path: Path) -> None:
         f"expected run_inner called 2 times (foo.py, notes.txt); got {call_count[0]}"
     )
 
-    # Both files must be in _archive/.
-    assert (archive / "foo.py").exists(), "foo.py must be in _archive/"
-    assert (archive / "notes.txt").exists(), "notes.txt must be in _archive/"
+    # Both files must be in _sources/.
+    assert (sources / "foo.py").exists(), "foo.py must be in _sources/"
+    assert (sources / "notes.txt").exists(), "notes.txt must be in _sources/"
 
     # Inbox must be empty (no non-hidden files).
     remaining = [
@@ -170,7 +171,7 @@ def test_b_binary_routes_to_failed_no_run_inner(tmp_path: Path) -> None:
     """
     wiki = _make_wiki(tmp_path)
     inbox = wiki / INBOX
-    failed_dir = wiki / FAILED
+    failed_dir = wiki / ".wiki" / "failed"
 
     _seed_binary(inbox, "blob.png")
 
@@ -183,11 +184,11 @@ def test_b_binary_routes_to_failed_no_run_inner(tmp_path: Path) -> None:
     # Exit code must be nonzero (binary = failure).
     assert rc != 0, "binary source → exit code must be nonzero"
 
-    # _failed/ must exist and contain the binary file.
-    assert failed_dir.exists(), "_failed/ directory must be created"
+    # .wiki/failed/ must exist and contain the binary file.
+    assert failed_dir.exists(), ".wiki/failed/ directory must be created"
     failed_files = list(failed_dir.glob("blob*"))
     assert failed_files, (
-        f"_failed/ must contain blob.png; found: {list(failed_dir.iterdir())}"
+        f".wiki/failed/ must contain blob.png; found: {list(failed_dir.iterdir())}"
     )
 
     # Inbox must be empty (file was moved to _failed/, loop terminated).
@@ -218,8 +219,8 @@ def test_c_mixed_inbox_md_rs_binary_ds_store(tmp_path: Path) -> None:
     """
     wiki = _make_wiki(tmp_path)
     inbox = wiki / INBOX
-    archive = wiki / ARCHIVE
-    failed_dir = wiki / FAILED
+    sources = wiki / SOURCES
+    failed_dir = wiki / ".wiki" / "failed"
 
     _seed_text(inbox, "a.md", "# Article\n\nBody text about something interesting.\n")
     _seed_text(inbox, "b.rs", 'fn main() {\n    println!("hello");\n}\n')
@@ -249,15 +250,15 @@ def test_c_mixed_inbox_md_rs_binary_ds_store(tmp_path: Path) -> None:
     assert "a.md" in ingested_names, "a.md must have been passed to run_inner"
     assert "b.rs" in ingested_names, "b.rs must have been passed to run_inner"
 
-    # .md and .rs land in _archive/.
-    assert (archive / "a.md").exists(), "a.md must be in _archive/"
-    assert (archive / "b.rs").exists(), "b.rs must be in _archive/"
+    # .md and .rs land in _sources/.
+    assert (sources / "a.md").exists(), "a.md must be in _sources/"
+    assert (sources / "b.rs").exists(), "b.rs must be in _sources/"
 
-    # Binary lands in _failed/.
-    assert failed_dir.exists(), "_failed/ directory must be created"
+    # Binary lands in .wiki/failed/.
+    assert failed_dir.exists(), ".wiki/failed/ directory must be created"
     failed_files = list(failed_dir.glob("evil*"))
     assert failed_files, (
-        f"_failed/ must contain evil.bin; found: {list(failed_dir.iterdir())}"
+        f".wiki/failed/ must contain evil.bin; found: {list(failed_dir.iterdir())}"
     )
 
     # .DS_Store must NOT have been moved — it should remain in inbox.
