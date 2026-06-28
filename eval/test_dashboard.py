@@ -44,6 +44,7 @@ from wiki_weaver.dashboard import (  # noqa: E402
     _contrast_ratio,
     _hex_to_luminance,
     _sanitize_enrichment_css,
+    _validate_group_link_template,
     build_dashboard,
 )
 from wiki_weaver.index import build_indexes  # noqa: E402
@@ -568,6 +569,46 @@ def test_theme_json_none_value_skipped(wiki: Path, tmp_path: Path) -> None:
     )
 
 
+def test_theme_json_title_no_unknown_warning(wiki: Path, tmp_path: Path) -> None:
+    """BUG 2 regression: a 'title' key in theme.json must NOT warn as unknown.
+
+    'title' is a legitimate theme.json field (branding) read separately for the
+    dashboard heading.  It must be recognized (skipped silently), produce NO
+    'unknown token' warning, and still render in the output.
+    """
+    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir.mkdir(exist_ok=True)
+    (theme_dir / "theme.json").write_text(
+        json.dumps({"title": "My Wiki Title", "--wiki-accent": "#3B5BDB"}),
+        encoding="utf-8",
+    )
+
+    out = tmp_path / "dash_title.html"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        build_dashboard(wiki, out)
+
+    # NO warning may mention 'title'
+    msgs = [str(ww.message) for ww in w]
+    title_warnings = [m for m in msgs if "title" in m.lower()]
+    assert not title_warnings, (
+        f"'title' must not trigger an unknown-token warning. Got: {title_warnings}"
+    )
+    # Specifically: no 'unknown token' warning at all here
+    unknown_warnings = [m for m in msgs if "unknown token" in m.lower()]
+    assert not unknown_warnings, (
+        f"No unknown-token warning expected for title+accent. Got: {unknown_warnings}"
+    )
+
+    # The title must still render (heading + <title>)
+    html = out.read_text(encoding="utf-8")
+    assert "My Wiki Title" in html, (
+        "Expected the theme.json title to render in the dashboard HTML"
+    )
+    # The accent override must still apply (proves the loop still processed tokens)
+    assert "#3B5BDB" in html, "Expected the --wiki-accent override to render"
+
+
 # ── Contrast utility unit tests ───────────────────────────────────────────────
 
 
@@ -711,7 +752,8 @@ def test_sidebar_pages_sorted_alphabetically(dashboard_html: str) -> None:
     assert pages_m is not None, "PAGES JSON not found in dashboard HTML"
     pages = json.loads(pages_m.group(1).replace(r"\/", "/"))
 
-    concept_idxs = [i for i, p in enumerate(pages) if p.get("g") == "concept"]
+    # g is now always a list; check membership with "in"
+    concept_idxs = [i for i, p in enumerate(pages) if "concept" in (p.get("g") or [])]
     assert len(concept_idxs) >= 3, (
         f"Expected >=3 pages in 'concept' group for sort test, got {len(concept_idxs)}"
     )
@@ -724,4 +766,271 @@ def test_sidebar_pages_sorted_alphabetically(dashboard_html: str) -> None:
     assert titles == ["Alpha", "Beta", "Gamma"], (
         f"Concept group must render Alpha -> Beta -> Gamma in alphabetical order; "
         f"got {titles!r}"
+    )
+
+
+# ── Enhancement 1: list-valued grouping ────────────────────────────────────
+
+
+def test_list_grouping_multi_membership(wiki: Path, tmp_path: Path) -> None:
+    """group_by='tags' on list-valued tags → page appears under EACH tag group.
+
+    wiki-min fixture:
+      alpha.md  tags: [x]      → must appear in group "x"
+      gamma.md  tags: [x, y]   → must appear in groups "x" AND "y"
+
+    Group counts must reflect multi-membership (group "x" has 2 entries,
+    group "y" has 1).  STATS.pages stays at the actual page count (not inflated).
+    """
+    out = tmp_path / "dash_tags.html"
+    build_dashboard(wiki, out, group_by="tags")
+    html = out.read_text(encoding="utf-8")
+
+    # Extract PAGES JSON
+    pages_m = re.search(r"const PAGES=(\[.+?\]);", html, re.DOTALL)
+    assert pages_m is not None, "PAGES JSON not found in dashboard HTML"
+    pages = json.loads(pages_m.group(1).replace(r"\/", "/"))
+
+    # Build group membership map (simulates JS buildSidebar)
+    groups: dict[str, list[int]] = {}
+    for i, p in enumerate(pages):
+        g_val = p.get("g", [])
+        gs = g_val if isinstance(g_val, list) and g_val else [str(g_val) or "(untyped)"]
+        for g in gs:
+            groups.setdefault(g, []).append(i)
+
+    # Locate alpha and gamma by slug
+    alpha_idx = next((i for i, p in enumerate(pages) if p["s"] == "alpha"), None)
+    gamma_idx = next((i for i, p in enumerate(pages) if p["s"] == "gamma"), None)
+    assert alpha_idx is not None, "alpha page not found in PAGES"
+    assert gamma_idx is not None, "gamma page not found in PAGES"
+
+    # alpha (tags: [x]) → must appear in group "x"
+    assert alpha_idx in groups.get("x", []), (
+        f"alpha must appear in group 'x'; group 'x' = {groups.get('x', [])!r}"
+    )
+
+    # gamma (tags: [x, y]) → must appear in BOTH groups
+    assert gamma_idx in groups.get("x", []), (
+        f"gamma must appear in group 'x' (multi-membership); "
+        f"group 'x' = {groups.get('x', [])!r}"
+    )
+    assert gamma_idx in groups.get("y", []), (
+        f"gamma must appear in group 'y' (multi-membership); "
+        f"group 'y' = {groups.get('y', [])!r}"
+    )
+
+    # Count checks: "x" has alpha+gamma (2), "y" has gamma only (1)
+    x_count = len(groups.get("x", []))
+    y_count = len(groups.get("y", []))
+    assert x_count == 2, f"Expected 2 pages in group 'x', got {x_count}"
+    assert y_count == 1, f"Expected 1 page in group 'y', got {y_count}"
+
+    # STATS.pages must NOT be inflated by multi-membership
+    total_m = re.search(r'"pages"\s*:\s*(\d+)', html)
+    assert total_m is not None, "STATS.pages not found"
+    expected_total = len(list(wiki.glob("*.md")))
+    assert int(total_m.group(1)) == expected_total, (
+        f"STATS.pages must equal unique page count ({expected_total}), "
+        f"got {total_m.group(1)} — multi-membership must not inflate the total"
+    )
+
+
+def test_scalar_grouping_unchanged(wiki: Path, tmp_path: Path) -> None:
+    """group_by='type' (scalar) still works correctly — regression guard.
+
+    All wiki-min concept pages must have g=['concept'] (list with one item).
+    The sidebar groups must still be driven by that single value.
+    """
+    out = tmp_path / "dash_type_regression.html"
+    build_dashboard(wiki, out, group_by="type")
+    html = out.read_text(encoding="utf-8")
+
+    pages_m = re.search(r"const PAGES=(\[.+?\]);", html, re.DOTALL)
+    assert pages_m is not None, "PAGES JSON not found"
+    pages = json.loads(pages_m.group(1).replace(r"\/", "/"))
+
+    # Every page with type=concept must have g=["concept"]
+    concept_pages = [p for p in pages if p.get("y") == "concept"]
+    assert concept_pages, "Expected concept-type pages in wiki-min fixture"
+    for p in concept_pages:
+        g = p.get("g")
+        assert isinstance(g, list), (
+            f"g must be a list (got {type(g).__name__}) for page {p['s']!r}"
+        )
+        assert "concept" in g, (
+            f"concept page {p['s']!r} must have 'concept' in g, got {g!r}"
+        )
+
+
+# ── Enhancement 2: group-link-template ────────────────────────────────────
+
+
+def test_group_link_template_embedded_and_used(wiki: Path, tmp_path: Path) -> None:
+    """group_link_template is embedded as GROUP_LINK_TEMPLATE and buildSidebar uses it.
+
+    Tests:
+      - The template constant is present in the JS.
+      - buildSidebar() contains encodeURIComponent and href/link logic.
+      - rel= and target= attributes are present in the link-building code.
+    """
+    out = tmp_path / "dash_linked.html"
+    build_dashboard(wiki, out, group_link_template="https://example.com/{group}")
+    html = out.read_text(encoding="utf-8")
+
+    # JS constant is present
+    assert "GROUP_LINK_TEMPLATE" in html, "GROUP_LINK_TEMPLATE constant missing"
+    # Template value is embedded (JSON-encoded)
+    assert "example.com" in html, "Template domain not found in HTML"
+    assert "{group}" in html or "%7Bgroup%7D" in html or "\\{group\\}" in html, (
+        "Template {group} placeholder should appear in the HTML"
+    )
+
+    # buildSidebar uses encodeURIComponent to safely substitute the group value
+    script = _extract_script(html)
+    assert "encodeURIComponent" in script, (
+        "buildSidebar must use encodeURIComponent for the group value substitution"
+    )
+    assert "target=" in script, (
+        "buildSidebar must set target attribute on group-header links"
+    )
+    assert "rel=" in script, (
+        "buildSidebar must set rel= attribute (e.g. noopener noreferrer) on links"
+    )
+    assert "GROUP_LINK_TEMPLATE" in script, (
+        "buildSidebar must reference GROUP_LINK_TEMPLATE"
+    )
+
+
+def test_group_link_template_encodes_per_segment(wiki: Path, tmp_path: Path) -> None:
+    """BUG 1 regression: group-link encoding must preserve `/` as path structure.
+
+    Path-like group values (e.g. ``owner/repo``) must NOT have their slashes
+    percent-encoded to ``%2F`` (which breaks the URL).  The JS must encode
+    PER PATH SEGMENT: ``g.split('/').map(encodeURIComponent).join('/')`` — NOT
+    a bare ``encodeURIComponent(g)``.
+
+    Structural check on the embedded JS + behavioral simulation of the exact
+    substitution the browser would perform on a slash-bearing value.
+    """
+    out = tmp_path / "dash_segments.html"
+    build_dashboard(wiki, out, group_link_template="https://github.com/{group}")
+    html = out.read_text(encoding="utf-8")
+    script = _extract_script(html)
+
+    # -- Structural: the group-link must use the per-segment form ------------
+    # Find the group-header link construction line (it references {group}).
+    grp_link_line = next(
+        (ln for ln in script.splitlines() if "GROUP_LINK_TEMPLATE.replace" in ln),
+        None,
+    )
+    assert grp_link_line is not None, (
+        "Could not find the GROUP_LINK_TEMPLATE.replace group-link line in JS"
+    )
+    assert "split('/')" in grp_link_line, (
+        "Group-link substitution must split on '/' to encode per path segment "
+        f"(preserving slashes). Line: {grp_link_line.strip()!r}"
+    )
+    assert ".map(encodeURIComponent).join('/')" in grp_link_line, (
+        "Group-link substitution must use "
+        "g.split('/').map(encodeURIComponent).join('/') to preserve slashes. "
+        f"Line: {grp_link_line.strip()!r}"
+    )
+    # Must NOT use the bare form that breaks path-like values.
+    assert "encodeURIComponent(g)" not in grp_link_line, (
+        "Group-link must NOT use bare encodeURIComponent(g) — it turns '/' into "
+        f"%2F and breaks path-like group values. Line: {grp_link_line.strip()!r}"
+    )
+
+    # -- Behavioral: simulate the substitution on an owner/repo value -------
+    def _per_segment(value: str) -> str:
+        from urllib.parse import quote
+
+        # encodeURIComponent-equivalent per segment, '/' preserved as structure
+        return "/".join(quote(seg, safe="") for seg in value.split("/"))
+
+    group_value = "microsoft/amplifier-app-cli"
+    href = "https://github.com/{group}".replace("{group}", _per_segment(group_value))
+    assert href == "https://github.com/microsoft/amplifier-app-cli", (
+        f"Per-segment encoding must yield a literal '/' between segments; got {href!r}"
+    )
+    assert "%2F" not in href, (
+        f"Slash must NOT be percent-encoded to %2F in the href; got {href!r}"
+    )
+
+
+def test_group_link_template_non_http_rejected(wiki: Path, tmp_path: Path) -> None:
+    """A non-http/https group_link_template is rejected with a warning.
+
+    Build must succeed (dashboard still written), GROUP_LINK_TEMPLATE is null,
+    and the dangerous scheme is NOT present in the output HTML.
+    """
+    out = tmp_path / "dash_bad_template.html"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        build_dashboard(
+            wiki,
+            out,
+            group_link_template="javascript:alert(1)//{group}",
+        )
+
+    assert out.exists(), "Dashboard must still be written despite rejected template"
+    html = out.read_text(encoding="utf-8")
+
+    # Warning must mention scheme/http
+    msgs = [str(ww.message) for ww in w]
+    assert any("http" in m.lower() or "scheme" in m.lower() for m in msgs), (
+        f"Expected a warning about non-http scheme. Got: {msgs}"
+    )
+
+    # Rejected template must NOT appear in output (null constant instead)
+    assert "javascript:" not in html, (
+        "Rejected non-http template scheme must not appear in output HTML"
+    )
+    # GROUP_LINK_TEMPLATE constant must be null
+    script = _extract_script(html)
+    assert "GROUP_LINK_TEMPLATE=null" in script.replace(" ", ""), (
+        "GROUP_LINK_TEMPLATE must be null when template is rejected"
+    )
+
+
+def test_group_link_template_absent_plain_headers(wiki: Path, tmp_path: Path) -> None:
+    """Without group_link_template, GROUP_LINK_TEMPLATE is null (plain headers)."""
+    out = tmp_path / "dash_plain.html"
+    build_dashboard(wiki, out)
+    html = out.read_text(encoding="utf-8")
+
+    script = _extract_script(html)
+    # The constant must be present and set to null
+    assert "GROUP_LINK_TEMPLATE=null" in script.replace(" ", ""), (
+        "GROUP_LINK_TEMPLATE must be null when no template is provided "
+        "(ensures plain-text group headers by default)"
+    )
+
+
+def test_validate_group_link_template_accepts_http() -> None:
+    """_validate_group_link_template accepts http/https and rejects others (unit)."""
+    assert _validate_group_link_template("https://example.com/{group}") is not None
+    assert _validate_group_link_template("http://example.com/{group}") is not None
+    assert _validate_group_link_template("HTTPS://Example.com/{group}") is not None
+
+
+def test_validate_group_link_template_rejects_non_http() -> None:
+    """_validate_group_link_template rejects non-http/https schemes with a warning."""
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = _validate_group_link_template("javascript:alert(1)//{group}")
+    assert result is None, "javascript: scheme must be rejected"
+    assert any(
+        "http" in str(ww.message).lower() or "scheme" in str(ww.message).lower()
+        for ww in w
+    )
+
+    with warnings.catch_warnings(record=True) as w2:
+        warnings.simplefilter("always")
+        result2 = _validate_group_link_template("ftp://evil.example/{group}")
+    assert result2 is None, "ftp: scheme must be rejected"
+    assert any(
+        "http" in str(ww.message).lower() or "scheme" in str(ww.message).lower()
+        for ww in w2
     )

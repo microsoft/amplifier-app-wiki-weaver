@@ -4,6 +4,7 @@ Public API
 ----------
 build_dashboard(corpus_dir, out_path, *,
                 theme=None, group_by="type",
+                group_link_template=None,
                 enrichment_css=None, enrichment_data=None) -> None
 
 Build a single self-contained HTML dashboard from any wiki corpus.
@@ -242,6 +243,30 @@ def _sanitize_enrichment_css(css_text: str) -> str | None:
     return serialized.replace("<", r"\3c ")
 
 
+# ── Group-link-template validation ─────────────────────────────────────────
+
+
+def _validate_group_link_template(template: str, *, stacklevel: int = 3) -> str | None:
+    """Validate group_link_template; return it if safe, None on rejection.
+
+    Only http/https schemes are accepted.  Non-http templates are rejected
+    with a warning; build continues with plain (non-linked) group headers.
+    The template is opaque to wiki-weaver beyond the scheme check — any
+    URL structure, path, or query string is the consumer's concern.
+    """
+    t = template.strip()
+    low = t.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        warnings.warn(
+            "group_link_template: non-http/https scheme rejected "
+            "— group headers will render as plain text",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+        return None
+    return t
+
+
 # ── Contrast validation (spec §10) ───────────────────────────────────────────
 
 
@@ -318,6 +343,8 @@ def _load_theme_overrides(corpus_dir: Path, theme_param: Any) -> dict[str, str]:
     for key, value in raw.items():
         if key.startswith("_"):
             continue  # private metadata
+        if key == "title":
+            continue  # branding, not a --wiki-* token; read separately for the heading
         if key not in known_keys:
             warnings.warn(
                 f"theme.json: unknown token {key!r} — ignored",
@@ -502,7 +529,8 @@ def _safe_json(obj: Any) -> str:
 # Placeholders: __TITLE__, __THEME_CSS__, __CUSTOM_CSS_BLOCK__,
 # __ENRICHMENT_DATA_STYLE__, __ENRICHMENT_STYLE__,
 # __PAGES_JSON__, __BACKLINKS_JSON__, __TAG_IDX_JSON__,
-# __STATS_JSON__, __GROUP_BY_JSON__, __STALE_JSON__, __BADGE_PALETTE_JSON__
+# __STATS_JSON__, __GROUP_BY_JSON__, __STALE_JSON__, __BADGE_PALETTE_JSON__,
+# __GROUP_LINK_TEMPLATE_JSON__
 
 _DASH_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -723,6 +751,7 @@ const STATS=__STATS_JSON__;
 const GROUP_BY=__GROUP_BY_JSON__;
 const STALE=__STALE_JSON__;
 const BADGE_PALETTE=__BADGE_PALETTE_JSON__;
+const GROUP_LINK_TEMPLATE=__GROUP_LINK_TEMPLATE_JSON__;
 
 /* --- Utilities --- */
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -738,9 +767,9 @@ if(STALE){$('stale-banner').removeAttribute('hidden');}
 function buildSidebar(){
   const groups={};
   PAGES.forEach((p,i)=>{
-    const g=String(p.g||'(untyped)');
-    if(!groups[g])groups[g]=[];
-    groups[g].push(i);
+    /* g is always a list; empty list → untyped bucket */
+    const gs=p.g&&p.g.length?p.g:['(untyped)'];
+    gs.forEach(function(g){if(!groups[g])groups[g]=[];groups[g].push(i);});
   });
   const sorted=Object.keys(groups).sort();
   const tree=$('nav-tree');
@@ -751,12 +780,16 @@ function buildSidebar(){
       if(ta!==tb)return ta<tb?-1:1;
       return PAGES[a].s<PAGES[b].s?-1:1;
     });
+    /* group header: plain text or hyperlink depending on GROUP_LINK_TEMPLATE */
+    const grpHdr=GROUP_LINK_TEMPLATE
+      ?'<a href="'+esc(GROUP_LINK_TEMPLATE.replace('{group}',g.split('/').map(encodeURIComponent).join('/')))+'" target="_blank" rel="noopener noreferrer">'+esc(g)+'</a>'
+      :esc(g);
     const det=document.createElement('details');
     det.className='nav-group';
     det.innerHTML=
       '<summary class="group-hdr">'+
         '<span class="group-chev">&#9654;</span>'+
-        '<span class="group-name">'+esc(g)+'</span>'+
+        '<span class="group-name">'+grpHdr+'</span>'+
         '<span class="group-cnt">'+idxs.length+'</span>'+
       '</summary>'+
       idxs.map(i=>{
@@ -1057,6 +1090,7 @@ def _generate_html(  # noqa: PLR0913
     enrichment_data_style: str,
     enrichment_style: str,
     title: str,
+    group_link_template: str | None = None,
 ) -> str:
     """Fill _DASH_HTML with corpus data and return the complete HTML string."""
     # Render pages: resolve wikilinks, render markdown, build search body.
@@ -1067,14 +1101,15 @@ def _generate_html(  # noqa: PLR0913
         total_links += link_count
         body_html = _render_markdown(_resolve_wikilinks(p["body_raw"], slug_to_idx))
         body_text = _strip_html(body_html).lower()
-        grp_val = str(p.get("_group_val", p["type"] or ""))
+        # _group_vals is always a list (set in build_dashboard)
+        grp_vals: list[str] = p.get("_group_vals", [p["type"] or ""])
         rendered.append(
             {
                 "i": i,
                 "s": p["slug"],
                 "t": p["title"],
                 "y": p["type"],
-                "g": grp_val,
+                "g": grp_vals,
                 "tags": p["tags"],
                 "d": p["last_updated"],
                 "h": body_html,
@@ -1108,6 +1143,7 @@ def _generate_html(  # noqa: PLR0913
     html = html.replace("__ENRICHMENT_DATA_STYLE__", enrichment_data_style)
     html = html.replace("__ENRICHMENT_STYLE__", enrichment_style)
     html = html.replace("__BADGE_PALETTE_JSON__", _safe_json(BADGE_PALETTE))
+    html = html.replace("__GROUP_LINK_TEMPLATE_JSON__", _safe_json(group_link_template))
     return html
 
 
@@ -1120,6 +1156,7 @@ def build_dashboard(
     *,
     theme: dict[str, str] | None = None,
     group_by: str = "type",
+    group_link_template: str | None = None,
     enrichment_css: str | None = None,
     enrichment_data: dict[str, Any] | None = None,
 ) -> None:
@@ -1137,7 +1174,16 @@ def build_dashboard(
         ``<corpus>/.wiki-dashboard/theme.json`` when present.
     group_by
         Frontmatter field that groups the sidebar (default: ``"type"``).
-        repo-weaver passes ``"repos"``; any frontmatter field works.
+        Scalar values work as before; **list-valued** fields (e.g. ``tags``,
+        ``repos``) cause each page to appear under *every* value as a separate
+        group (multi-membership).  Missing/empty fields fall back to ``type``.
+    group_link_template
+        Optional URL template for group header links.  ``{group}`` is replaced
+        by the URL-encoded group value; the rendered ``<a>`` opens in a new
+        tab with ``rel=noopener noreferrer``.  Only ``http://`` and ``https://``
+        schemes are accepted; non-http templates are rejected with a warning
+        and fall back to plain-text headers.  Domain-opaque — wiki-weaver
+        applies no meaning beyond the scheme check and ``{group}`` substitution.
     enrichment_css
         Optional consumer-supplied CSS fragment (cross-seam, sanitized via
         tinycss2 parse→filter→reserialize before inlining).  Domain-opaque.
@@ -1171,7 +1217,18 @@ def build_dashboard(
     for p in pages:
         fm = p.get("_fm", {})
         raw_val = fm.get(group_by, fm.get("type", ""))
-        p["_group_val"] = str(raw_val) if raw_val is not None else ""
+        if isinstance(raw_val, list):
+            vals = [str(v) for v in raw_val if v is not None]
+            p["_group_vals"] = vals if vals else [""]
+        else:
+            p["_group_vals"] = [str(raw_val) if raw_val is not None else ""]
+
+    # ── Validate group_link_template ─────────────────────────────────────────────
+    validated_template: str | None = None
+    if group_link_template is not None:
+        validated_template = _validate_group_link_template(
+            group_link_template, stacklevel=2
+        )
 
     # ── Theme ──────────────────────────────────────────────────────────────
     theme_overrides = _load_theme_overrides(corpus, theme)
@@ -1229,6 +1286,7 @@ def build_dashboard(
         enrichment_data_style=enrichment_data_style,
         enrichment_style=enrichment_style,
         title=title,
+        group_link_template=validated_template,
     )
 
     out.write_text(html, encoding="utf-8")

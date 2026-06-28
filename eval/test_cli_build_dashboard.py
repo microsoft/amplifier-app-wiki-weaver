@@ -51,6 +51,7 @@ def _run(
     *,
     theme: str | None = None,
     group_by: str = "type",
+    group_link_template: str | None = None,
     skip_index: bool = False,
 ) -> int:
     """Build a Namespace and call cmd_build_dashboard directly."""
@@ -59,6 +60,7 @@ def _run(
         out=str(out),
         theme=theme,
         group_by=group_by,
+        group_link_template=group_link_template,
         skip_index=skip_index,
     )
     return cmd_build_dashboard(ns)
@@ -133,3 +135,19 @@ def test_missing_corpus_returns_nonzero(tmp_path: Path) -> None:
     out = tmp_path / "dashboard.html"
     rc = _run(nonexistent, out)
     assert rc != 0, "Expected non-zero exit for missing corpus"
+
+
+def test_group_link_template_flag_forwarded(corpus: Path, tmp_path: Path) -> None:
+    """--group-link-template is accepted and forwarded to build_dashboard.
+
+    The GROUP_LINK_TEMPLATE constant must be embedded in the output JS.
+    """
+    out = tmp_path / "dash_linked.html"
+    rc = _run(corpus, out, group_link_template="https://example.com/{group}")
+    assert rc == 0, "Expected exit code 0 with --group-link-template"
+    assert out.exists()
+    html = out.read_text(encoding="utf-8")
+    assert "GROUP_LINK_TEMPLATE" in html, (
+        "Expected GROUP_LINK_TEMPLATE constant in output when --group-link-template is set"
+    )
+    assert "example.com" in html, "Expected template domain in output HTML"

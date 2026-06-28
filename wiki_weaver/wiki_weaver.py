@@ -178,7 +178,13 @@ def cmd_build_dashboard(args: argparse.Namespace) -> int:
     if not args.skip_index:
         build_indexes(corpus)
 
-    build_dashboard(corpus, out, theme=theme, group_by=args.group_by)
+    build_dashboard(
+        corpus,
+        out,
+        theme=theme,
+        group_by=args.group_by,
+        group_link_template=args.group_link_template,
+    )
     print(f"Dashboard written \u2192 {out}")
     return 0
 
@@ -291,6 +297,18 @@ def main() -> None:
         metavar="FIELD",
         dest="group_by",
         help="frontmatter field to group sidebar nav by (default: type)",
+    )
+    p_build_dashboard.add_argument(
+        "--group-link-template",
+        default=None,
+        metavar="TEMPLATE",
+        dest="group_link_template",
+        help=(
+            "URL template for group header links.  {group} is replaced by the "
+            "URL-encoded group value.  Only http:// and https:// schemes are "
+            "accepted; non-http templates are ignored with a warning.  "
+            "Example: --group-link-template 'https://github.com/{group}'"
+        ),
     )
     p_build_dashboard.add_argument(
         "--skip-index",
