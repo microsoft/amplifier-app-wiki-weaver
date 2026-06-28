@@ -33,13 +33,6 @@ import sys
 import time
 from pathlib import Path
 
-# When executed as a standalone script (via tool_command in ingest.dot), Python
-# adds only the script's directory (wiki-weaver/cli/) to sys.path, not the repo
-# root.  Add the repo root explicitly so that `from wiki_weaver.* import ...` works.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 # Absolute paths to the archive, fail, and tamper-check CLI scripts (sibling scripts in cli/).
 _CLI_DIR = Path(__file__).resolve().parent
 INGEST_ARCHIVE_PY = _CLI_DIR / "ingest_archive.py"

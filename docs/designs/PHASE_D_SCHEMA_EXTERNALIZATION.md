@@ -206,7 +206,7 @@ No other files change. No engine (`amplifier-bundle-attractor`) change.
 
 | Knob | Where | Status | Note |
 |---|---|---|---|
-| **Model tier per stage** | `wiki.config.yaml: models.{ingest,assess,feedback,ask,default}` | **Implemented** | Resolved by `WikiPolicy.model_for(stage)`, injected per-node in `build_dot`. Real lever (cheap model for `feedback`, stronger for `assess`). |
+| **Model tier per stage** | `wiki.config.yaml: models.{ingest,assess,feedback,ask,default}` | **Implemented** | Resolved by `WikiPolicy.model_for(stage)`, injected per-node in `build_dot`. Real lever (cheap model for `feedback`, stronger for `assess`). **Model values are now FAMILY TOKENS (`sonnet`/`opus`/`haiku`) resolved live, not pinned ids — see §5.5.** |
 | **`max_cycles`** | `wiki.config.yaml: max_cycles` (+ CLI override) | **Implemented** | Already a substitution var; just sourced from policy. |
 | **Parallelism** | `wiki.config.yaml: parallelism` | **RESERVED — honored as 1** | **Decision: not a per-wiki runtime knob.** The outer sweep mutates shared wiki pages, `.sources.json`, the ledger, and `_archive/`; two sources concurrently editing the same hub page (e.g. `claude-code.md`) is a write race that corrupts synthesis and the tamper guard's snapshot. Within one wiki, ingest **must** stay sequential for correctness. The key is accepted into the schema for forward-compat and surfaced in `doctor`, but the executor honors `1`. If cross-wiki batching is wanted later, that's a *sweep-level* concern (independent wikis in parallel), not policy in a single wiki — out of scope for Phase D. |
 
@@ -216,6 +216,65 @@ shipped as a config key that silently does nothing.
 
 (The strawman per-stage objectives in `evolution-plan.md §6` remain **DRAFT/unredlined**.
 Defaults above are fine; do not block Phase D on the redline.)
+
+---
+
+## 5.5 Model selection — live family resolution (SHIPPED)
+
+> **Status: SHIPPED** to `microsoft/amplifier-app-wiki-weaver` (originally PR #4; the resolver
+> engine now delegates to the upstream cross-provider resolver via PR #6, which consumes
+> `amplifier-bundle-attractor` PR #68 — see "Cross-provider family resolution" below). This section
+> is the authoritative model-selection stance and **supersedes** the pinned `claude-sonnet-4-6` /
+> `claude-haiku-4-5` examples that appear as illustrative ids in §3.1, §4, and §7 — those remain
+> in the spec as historical Phase-D artifacts, not as the strategy.
+
+The original Phase-D draft pinned concrete model ids per stage. Pinning has a maintenance
+tax: when a vendor ships a newer model in a family (e.g. `opus-4-8` → `opus-4-10`), every pin
+must be hand-bumped, and a stale pin can silently 404. **wiki-weaver no longer pins model ids.**
+
+**What ships instead.** A model spec is now either a **family token** (`sonnet` / `opus` /
+`haiku`) or an **explicit model id**:
+
+- A **family token** resolves at runtime: query the provider's **live model list**, filter to
+  that family (glob), and pick the **newest stable model the provider actually serves**
+  (numeric/date-aware version sort; preview/experimental excluded). The list and the generation
+  go through the **same** upstream `unified-llm-client` adapter — *the adapter that lists is the
+  adapter that generates* — so a resolved id is generation-compatible by construction (no
+  "id-seam" where the listed id 404s at generation).
+- An **explicit id** (e.g. `claude-sonnet-4-6`) **passes through unchanged** — no network call
+  (back-compat for anyone who wants a hard pin).
+- **Fail-loud**: a family that resolves to zero served models, an unreachable list, or a missing
+  API key raises a clear error. There is **no silent fallback to a stale hardcoded id**.
+- **Cached per run**: each `(provider, family)` resolves at most once per process, so a long
+  ingest loop pays one round-trip per family.
+
+**Per-stage defaults are now families, not ids:** `default` (and thus `ingest`/`assess`) =
+`sonnet` (workhorse); `feedback` = `haiku` (cheaper/faster where judgment is light). Overrides
+via `wiki.config.yaml: models.*` and `WIKI_WEAVER_MODEL` accept family tokens or explicit ids.
+
+**Where it lives:** `wiki_weaver/model_resolver.py` (`resolve_model(provider, spec)`) — now a
+**thin shim** over the upstream `unified-llm-client` resolver (`resolve_latest_for`, shipped in
+attractor PR #68); wired into the per-node injection in `engine_runner.build_dot` and the defaults
+in `wiki_weaver/policy.py` (`_DEF_MODEL = "sonnet"`, `_DEF_FEEDBACK_MODEL = "haiku"`). Explicit-id
+passthrough, the per-process cache, and the anthropic-only family guard are preserved across the
+shim swap (wiki-weaver PR #6).
+
+**Not to be confused with engine/dependency versioning.** Model-id selection (this section) is
+**live family resolution**. The engine/foundation **dependency** versions are a separate concern
+and stay **pinned + governed by a hardened `upgrade` command** — that strategy is unchanged.
+One is "which LLM do we call" (live, zero-pin); the other is "which engine code do we run"
+(pinned, deliberate upgrades).
+
+### Planned (not shipped) — cross-provider family resolution
+
+Family-token resolution is **anthropic-only today**; a family token on any other provider
+fail-louds. A **planned** evolution (under design, **council pending**) replaces the direct
+Anthropic `/v1/models` call with a routing-matrix-style approach: **`fnmatch` glob matching over
+`Provider.list_models()`** (amplifier-core's existing provider interface) plus a numeric-aware
+version sort, so `opus`/`sonnet`/`haiku`-style family selection works uniformly across **all**
+providers (openai / chat-completions / github-copilot / gemini). This reuses the provider
+abstraction instead of a per-vendor HTTP call. **Marked planned, not built** — do not assume it
+in current behavior.
 
 ---
 

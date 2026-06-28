@@ -35,7 +35,7 @@ Install the `wiki-weaver` command with one line (requires an [Amplifier](https:/
 installation — see [Requirements](#requirements)):
 
 ```bash
-uv tool install git+https://github.com/microsoft/amplifier-bundle-wiki-weaver
+uv tool install git+https://github.com/microsoft/amplifier-app-wiki-weaver
 ```
 
 `wiki-weaver` is a **companion** to an installed Amplifier: it tracks `@main` of the Amplifier
@@ -43,12 +43,34 @@ runtime libraries so it stays in lockstep with your ecosystem, and it uses your 
 install at runtime for provider keys and the engine bundle cache. (Equivalently, run it from a
 clone as `python -m wiki_weaver <command>`.)
 
-Because it tracks `@main`, update it the same way you would any uv tool — this re-fetches the
-latest `wiki-weaver` and its `@main` runtime libraries:
+**Strategy: track `@main`, fix-forward — no version pinning.** wiki-weaver intentionally does
+not commit a `uv.lock` (see `.gitignore`): the lock would silently freeze runtime deps at stale
+commits for every `uv sync` user, which defeats the point of tracking `@main`.
+
+### Keeping wiki-weaver current
+
+Use the built-in `update` command — it's the canonical way to refresh both layers:
 
 ```bash
-uv tool upgrade wiki-weaver
+# Check for drift (ls-remote each @main source; no changes made):
+wiki-weaver update --check
+
+# Apply updates:
+#   Layer 1 — reinstall wiki-weaver + wheel deps (amplifier-foundation, unified-llm-client)
+#   Layer 2 — re-clone engine bundles in ~/.amplifier/cache/bundles
+wiki-weaver update
+
+# Confirm what you're running after update:
+wiki-weaver doctor
 ```
+
+`update` verifies that packages actually moved to the new remote commit after reinstall.
+If uv served a stale cache, it escalates through a ladder (`--no-cache`, then
+`uv cache clean`) and exits non-zero with a diagnostic if the package still didn't update —
+so you're never silently left running stale code.
+
+`doctor` now also prints the resolved `@main` commits for all sources (no network needed) so
+you always have a "what am I actually running" record without a committed lock file.
 
 Every command runs a fast preflight first and **fails loud and clean** — with a clear message,
 no traceback — if the environment is missing a prerequisite (runtime, provider key, or the
@@ -92,7 +114,8 @@ way afterward.
 | `ingest --wiki <dir>` | Drain `<dir>/_inbox/` into the wiki, synthesizing/updating pages and archiving each source on convergence. Flags: `--source <file>` (one file), `--max-cycles N`, `--keep-going`. |
 | `ask "<question>" --wiki <dir>` | Answer a question by reading the compiled wiki; cites pages used and refuses when the topic is absent. `--json` for structured output. |
 | `lint --wiki <dir>` | Run the structural validator (links, orphans, frontmatter, provenance). Exit 0 = PASS. |
-| `doctor [--wiki <dir>]` | Environment + (optional) wiki-structure diagnostics. |
+| `doctor [--wiki <dir>]` | Environment + (optional) wiki-structure diagnostics. Also prints resolved `@main` commits for all sources (your lock-file replacement). |
+| `update [--check]` | Refresh wiki-weaver to latest `@main`: reinstall the tool (Layer 1) and re-clone engine bundles (Layer 2). `--check`/`--dry-run` = report drift only, no changes. |
 | `build-dashboard <corpus> --out <file.html>` | Render a compiled wiki into one self-contained HTML dashboard (no LLM, no runtime). Flags: `--theme <file>`, `--group-by <field>` (default `type`), `--skip-index`. See [Dashboard](#dashboard). |
 
 > `query` exists but is a naive substring grep over page text — a minimal stub, **not** the
@@ -215,12 +238,16 @@ Full design: [`docs/`](docs/).
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `WIKI_WEAVER_MODEL` | Model for the LLM pipeline/`init` nodes | `claude-sonnet-4-6` |
+| `WIKI_WEAVER_MODEL` | Model (or family) for LLM pipeline/`init` nodes | `sonnet` |
 | `WIKI_WEAVER_PROVIDER` | Provider the LLM nodes route to | `anthropic` |
 
-The default model was chosen by a model-swap eval (`eval/model_sweep.py`): it converged
-reliably with no flakes, faster and cheaper than Opus-class. Use a premium model for the
-richest synthesis via `WIKI_WEAVER_MODEL`.
+`WIKI_WEAVER_MODEL` accepts a **bare family token** (`sonnet`, `haiku`, `opus`) or an explicit
+model id.  Family tokens resolve at runtime to the newest model the provider actually serves in
+that family — no pinned version to maintain.  An explicit id (e.g. `claude-opus-4-8`) passes
+through unchanged.  Internally, `feedback` nodes use `haiku` (fast, cheap) while the heavier
+synthesis nodes (`ingest`, `assess`, `init`, `ask`) use `sonnet`; both can be overridden per-wiki
+in `wiki.config.yaml` under `models:`.  If the family can't be resolved (network error, no match)
+wiki-weaver raises a loud error — it never silently falls back to a stale hardcoded id.
 
 ## Requirements
 

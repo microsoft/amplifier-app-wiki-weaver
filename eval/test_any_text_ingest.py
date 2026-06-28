@@ -26,7 +26,12 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-from wiki_weaver.wiki_weaver import ARCHIVE, FAILED, INBOX, cmd_ingest  # noqa: E402
+# These tests patch wiki_weaver.engine_runner at runtime, which imports the
+# attractor engine deps. Skip cleanly in lightweight CI (no @main resolution)
+# rather than erroring. Matches test_claim_retention.py / test_preflight_gate.py.
+pytest.importorskip("wiki_weaver.engine_runner")
+
+from wiki_weaver.cli import ARCHIVE, FAILED, INBOX, cmd_ingest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +45,7 @@ def _bypass_env_gate(monkeypatch):
     a lightweight CI env. Patching preflight to return no failures is robust
     whether or not foundation is installed or a key is set.
     """
-    monkeypatch.setattr("wiki_weaver.wiki_weaver.preflight", lambda **_kw: [])
+    monkeypatch.setattr("wiki_weaver.cli.preflight", lambda **_kw: [])
 
 
 # ---------------------------------------------------------------------------

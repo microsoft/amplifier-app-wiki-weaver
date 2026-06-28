@@ -38,7 +38,9 @@ _PIPELINE = pipeline_dir()
 _DEF_SCHEMA = _PIPELINE / "SCHEMA.md"
 _DEF_RUBRIC = _PIPELINE / "CONVERGENCE_RUBRIC.md"
 _DEF_INNERDOT = _PIPELINE / "synthesize.dot"
-_DEF_MODEL = os.environ.get("WIKI_WEAVER_MODEL", "claude-sonnet-4-6")
+_DEF_MODEL = os.environ.get("WIKI_WEAVER_MODEL", "sonnet")
+# Default model for the feedback stage (cheaper/faster; generates concise guidance).
+_DEF_FEEDBACK_MODEL = "haiku"
 _DEF_PROVIDER = os.environ.get("WIKI_WEAVER_PROVIDER", "anthropic")
 
 
@@ -98,6 +100,8 @@ def load_policy(wiki_dir: Path, *, cli_max_cycles: int | None = None) -> WikiPol
 
     models: dict[str, str] = dict(cfg.get("models") or {})
     models.setdefault("default", _DEF_MODEL)
+    # Feedback is cheaper/faster by default — use haiku unless the wiki config overrides it.
+    models.setdefault("feedback", _DEF_FEEDBACK_MODEL)
 
     validator_cfg = pol / "validator.yaml"
 

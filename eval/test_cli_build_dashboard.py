@@ -26,7 +26,7 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-from wiki_weaver.wiki_weaver import cmd_build_dashboard  # noqa: E402
+from wiki_weaver.cli import cmd_build_dashboard  # noqa: E402
 
 # ---------------------------------------------------------------------------
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / "wiki-min"

@@ -29,12 +29,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Ensure the repo root is on sys.path so `from wiki_weaver.* import` works when
-# this script is invoked directly (e.g. via tool_command in ingest.dot).
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 
 def _find_ingest_logs_dir(wiki_dir: Path) -> Path:
     """Return the most-recent ingest-* run directory under <wiki>/.runs/.

@@ -16,7 +16,7 @@ PROPER PreparedBundle path (no sys.path hacks, no raw mount-plan):
 ``prepared.spawn`` composes parent -> child by default, so the context-intelligence
 hook is inherited by every per-node sub-session automatically.
 
-The OUTER corpus sweep is a plain Python loop in the CLI (see wiki_weaver.py).
+The OUTER corpus sweep is a plain Python loop in the CLI (see wiki_weaver/cli.py).
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from ._assets import pipeline_dir
+from .model_resolver import resolve_model
 from .policy import WikiPolicy, load_policy
 
 # --------------------------------------------------------------------------
@@ -104,7 +105,7 @@ PROVIDER = os.environ.get("WIKI_WEAVER_PROVIDER", "anthropic")
 # Explicit model for the LLM nodes. The attractor child agents intentionally
 # carry NO default_model ("no silent defaults"), so the spawning node must name
 # one. The engine forwards it as a provider_preference to the child session.
-MODEL = os.environ.get("WIKI_WEAVER_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("WIKI_WEAVER_MODEL", "sonnet")
 # Optional per-node reasoning_effort (recognized stylesheet property). Unset =>
 # omitted entirely, so default behaviour (e.g. Wave 1 anthropic) is unchanged.
 REASONING_EFFORT = os.environ.get("WIKI_WEAVER_REASONING_EFFORT")
@@ -143,8 +144,36 @@ def load_ci_config() -> dict[str, Any]:
     """Read the context-intelligence hook config from the user's settings.
 
     Reads ``overrides.hook-context-intelligence.config`` from
-    ~/.amplifier/settings.yaml (server_url + api_key). Never hardcodes the key.
-    Returns ``{}`` (hook still composed, fails soft) if absent/unreadable.
+    ~/.amplifier/settings.yaml and returns a config dict using the PRIMARY
+    ``destinations`` shape expected by the hook's current contract.
+
+    The hook's ``LoggingHandler`` is always-on: it writes per-session
+    ``events.jsonl`` + ``metadata.json`` locally regardless of config.
+    An empty return (``{}``) means local-only logging — the normal default.
+
+    ``destinations`` shape (remote fan-out, optional):
+    ::
+
+        {
+            "destinations": {
+                "<name>": {
+                    "url": "https://...",
+                    "api_key": "<key>",       # optional
+                    "include": ["**"],         # glob filter, optional
+                }
+            }
+        }
+
+    Three resolution paths:
+
+    1. ``cfg`` already has a ``destinations`` dict → pass through, expanding
+       ``${VAR}`` in every destination's ``url`` and ``api_key``.
+    2. ``cfg`` has the simple legacy scalars ``context_intelligence_server_url``
+       (+ optionally ``context_intelligence_api_key``) → translate into the
+       primary ``destinations`` shape. Only synthesises the remote destination
+       when *both* url **and** api_key are non-empty after ``${VAR}`` expansion;
+       otherwise returns local-only ``{}``.
+    3. Nothing configured → return ``{}`` (local-only, the normal default).
     """
     try:
         import yaml  # pyright: ignore[reportMissingModuleSource]
@@ -158,19 +187,74 @@ def load_ci_config() -> dict[str, Any]:
         return {}
     overrides = (data.get("overrides") or {}).get("hook-context-intelligence") or {}
     cfg = overrides.get("config") or {}
-    out: dict[str, Any] = {}
-    if cfg.get("context_intelligence_server_url"):
-        out["context_intelligence_server_url"] = str(
-            cfg["context_intelligence_server_url"]
-        )
-    if cfg.get("context_intelligence_api_key"):
-        out["context_intelligence_api_key"] = str(cfg["context_intelligence_api_key"])
-    return out
+
+    # --- Path 1: caller already supplied the destinations shape ---------------
+    if isinstance(cfg.get("destinations"), dict):
+        destinations: dict[str, Any] = {}
+        for name, dest in cfg["destinations"].items():
+            if not isinstance(dest, dict):
+                continue
+            expanded: dict[str, Any] = dict(dest)
+            if isinstance(expanded.get("url"), str):
+                expanded["url"] = os.path.expandvars(expanded["url"])
+            if isinstance(expanded.get("api_key"), str):
+                expanded["api_key"] = os.path.expandvars(expanded["api_key"])
+            destinations[name] = expanded
+        return {"destinations": destinations} if destinations else {}
+
+    # --- Path 2: legacy convenience scalars → translate to destinations -------
+    raw_url = str(cfg.get("context_intelligence_server_url") or "").strip()
+    raw_key = str(cfg.get("context_intelligence_api_key") or "").strip()
+    url = os.path.expandvars(raw_url) if raw_url else ""
+    key = os.path.expandvars(raw_key) if raw_key else ""
+    if url and key:
+        return {
+            "destinations": {
+                "default": {
+                    "url": url,
+                    "api_key": key,
+                    "include": ["**"],
+                }
+            }
+        }
+
+    # --- Path 3: nothing configured → local-only (the normal default) --------
+    return {}
 
 
 # --------------------------------------------------------------------------
 # DOT preparation: $var substitution + per-node provider injection
 # --------------------------------------------------------------------------
+
+
+def _substitute_models(dot_text: str, policy: WikiPolicy) -> str:
+    """Apply per-node llm_provider / llm_model substitutions to a synthesize DOT text.
+
+    Loops over LLM_NODE_IDS, resolves the concrete model id for each node via
+    the policy, and substitutes the ``llm_provider`` and ``llm_model`` attributes
+    in-place.  Returns the modified DOT text.
+
+    Factored out of ``build_dot`` so that ``run_ingest`` can materialise a fully
+    resolved ``synthesize.dot`` into the run directory — making the tool-module
+    path honour ``WIKI_WEAVER_MODEL`` exactly as the CLI path already did.
+    """
+    for node_id in LLM_NODE_IDS:
+        node_opener = f"    {node_id} [\n"
+        idx = dot_text.find(node_opener)
+        if idx == -1:
+            continue
+        node_close = dot_text.find("\n    ]", idx + len(node_opener))
+        if node_close == -1:
+            continue
+        block = dot_text[idx:node_close]
+        spec = policy.model_for(node_id)
+        concrete = resolve_model(policy.provider, spec)
+        block = re.sub(
+            r'llm_provider="[^"]*"', f'llm_provider="{policy.provider}"', block
+        )
+        block = re.sub(r'llm_model="[^"]*"', f'llm_model="{concrete}"', block)
+        dot_text = dot_text[:idx] + block + dot_text[node_close:]
+    return dot_text
 
 
 def build_dot(
@@ -238,9 +322,16 @@ def build_dot(
     for var, value in substitutions.items():
         dot = dot.replace(var, value)
 
-    # NOTE: llm_provider and llm_model are now declared directly in synthesize.dot
-    # (baked in as self-contained attrs so the DOT works as both a direct pipeline
-    # and a folder sub-pipeline without requiring Python injection here).
+    # Apply per-node provider / model overrides from policy.
+    #
+    # synthesize.dot bakes in defaults (llm_provider="anthropic",
+    # llm_model="claude-sonnet-4-6") as self-contained fallbacks so the DOT can
+    # be loaded directly by the engine without Python injection.  We always
+    # override them here with resolved values so that:
+    #   - family tokens ("sonnet", "haiku") resolve to the newest served id, and
+    #   - per-stage overrides from wiki.config.yaml take effect.
+    dot = _substitute_models(dot, policy)
+
     return dot
 
 
@@ -252,15 +343,28 @@ def build_dot(
 async def _resolve_agent_bundle(agent_name: str, config: dict[str, Any]) -> Any:
     """Resolve a per-node agent into a full, self-contained child Bundle.
 
-    The attractor-pipeline bundle declares its child agents as lazy references
-    (``{"bundle": "attractor:agents/attractor-agent-anthropic"}``) which carry
-    NO inline session. If we spawned an empty child and let ``compose`` fill the
-    blanks, the child would INHERIT the parent's ``loop-pipeline`` orchestrator
-    and re-run the whole DOT (infinite-ish recursion that falls back to the
-    direct backend). So we ``load_bundle`` the referenced agent, which brings
-    its own ``loop-agent`` orchestrator + tools; on spawn that orchestrator
-    overrides the parent's ``loop-pipeline`` (session deep-merge, child wins)
-    while the parent's context-intelligence hook is still inherited.
+    The recursion-avoidance mechanism: every child agent must carry an inline
+    ``session.orchestrator`` set to a NON-pipeline orchestrator (``loop-agent``).
+    Without it the spawned child inherits the parent's ``loop-pipeline``
+    orchestrator and re-runs the whole DOT (infinite recursion; loop-pipeline's
+    spawn guard now fails loud on this). On spawn the child's inline orchestrator
+    deep-merges over the parent's session and the child wins, so it runs a normal
+    single-agent loop; the parent's context-intelligence hook is still inherited
+    through the same merge.
+
+    Two ``config`` shapes are accepted:
+
+    * Inline definition (current) -- a full agent dict carrying its own
+      ``session`` (with the inline ``loop-agent`` orchestrator), ``providers``,
+      ``tools``, ``hooks``, ``instruction``. This is what attractor-pipeline's
+      ``agents:`` block declares today, and it is materialised directly into a
+      ``Bundle`` in the inline branch below.
+    * ``{"bundle": "attractor:agents/<name>"}`` reference (legacy) -- resolved
+      via ``load_bundle``. attractor-pipeline@main no longer emits this form;
+      it was replaced by inline ``session.orchestrator`` declarations in
+      attractor commit ``fd777ed`` (#74, which also added the identity-based
+      recursion guard). The reference branch is retained only for backward
+      compatibility with older agent declarations.
     """
     from amplifier_foundation import load_bundle
 
@@ -690,6 +794,9 @@ def build_ask_dot(
 
     prompt_dot = _dot_escape_prompt(prompt)
 
+    # Resolve family token to a concrete served model id before injecting into DOT.
+    model = resolve_model(provider, model)
+
     # Build DOT using plain string concatenation for lines with literal { }
     # to avoid Python f-string brace conflicts.
     lines = [
@@ -745,6 +852,9 @@ def build_ask_dot_from_file(
     dot = dot.replace("$answer_file", answer_file_s)
     # Question is user-supplied and may contain DOT-special chars; escape before injecting.
     dot = dot.replace("$question", _dot_escape_prompt(question))
+
+    # Resolve family token to a concrete served model id before substitution.
+    model = resolve_model(provider, model)
 
     # Apply provider/model override — replace the baked defaults unconditionally so
     # the call is always correct regardless of env-var PROVIDER/MODEL values.
@@ -1088,22 +1198,22 @@ def run_ingest(
         f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_SETUP_PY))}"
         f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(wiki_dir))}"
     )
-    synthesize_dot_abs = str(INNER_DOT)
 
-    # The engine names child pipeline logs {logs_dir}/subgraph_{node.id}.
-    # On loop iterations 2+, the child engine finds the checkpoint written by
-    # iteration 1 there, fingerprint-matches synthesize.dot (unchanged), restores
-    # stale context (source_id=1), and exits immediately without doing any work.
-    # Fix: delete that checkpoint before every run_synthesize invocation.
-    synthesize_checkpoint = str(
-        logs_dir / "subgraph_run_synthesize" / "checkpoint.json"
-    )
-    clear_synthesize_cmd = f"rm -f {shlex.quote(synthesize_checkpoint)}"
+    # Materialise a fully-resolved synthesize.dot in the run directory so that
+    # the engine executes with the WIKI_WEAVER_MODEL / wiki.config.yaml model,
+    # not the hardcoded defaults baked into the package file.  This closes the
+    # gap where the tool-module path (run_ingest) silently ignored the resolved
+    # model while the CLI path (run_inner / build_dot) honoured it.
+    policy = load_policy(wiki_dir)
+    inner_text = INNER_DOT.read_text(encoding="utf-8")
+    inner_text = _substitute_models(inner_text, policy)
+    resolved_synthesize_dot = logs_dir / "synthesize.dot"
+    resolved_synthesize_dot.write_text(inner_text, encoding="utf-8")
+    synthesize_dot_abs = str(resolved_synthesize_dot)
 
     dot_source = dot_template.replace("$setup_cmd", setup_cmd)
     dot_source = dot_source.replace("$synthesize_dot", synthesize_dot_abs)
     dot_source = dot_source.replace("$max_drain_iters", str(max_drain_iters))
-    dot_source = dot_source.replace("$clear_synthesize_cmd", clear_synthesize_cmd)
 
     (logs_dir / "ingest.dot").write_text(dot_source, encoding="utf-8")
 
@@ -1386,6 +1496,9 @@ def build_init_dot(
 
     prompt_dot = _dot_escape_prompt(prompt)
 
+    # Resolve family token to a concrete served model id before injecting into DOT.
+    model = resolve_model(provider, model)
+
     lines = [
         "digraph init_wiki {",
         '    graph [goal="Design a domain-adaptive schema for a new wiki"]',
@@ -1437,6 +1550,9 @@ def build_init_dot_from_file(
     dot = dot.replace("$purpose", _dot_escape_prompt(purpose))
     dot = dot.replace("$source_sample", _dot_escape_prompt(source_sample))
     dot = dot.replace("$default_schema", _dot_escape_prompt(default_schema))
+
+    # Resolve family token to a concrete served model id before substitution.
+    model = resolve_model(provider, model)
 
     # Apply provider/model override — replace the baked defaults unconditionally.
     dot = dot.replace('llm_provider="anthropic"', f'llm_provider="{provider}"')

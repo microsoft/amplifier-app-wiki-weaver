@@ -501,26 +501,29 @@ def _collision_safe_move(src: Path, dest_dir: Path) -> Path:
 
 
 def _looks_like_text(path: Path) -> bool:
-    """Return True if *path* appears to be a UTF-8 text file.
+    """Return True unless *path* is binary, using git's heuristic: a file is
+    binary iff it contains a NUL byte.
 
-    Reads up to 8 KB and applies two cheap binary checks:
-    - A NUL byte (``\\x00``) anywhere in the sample → binary.
-    - Failure to decode the sample as UTF-8 → binary.
+    Scans the whole file in 64 KB chunks (ingest sources are read in full by the
+    engine downstream anyway, so this costs nothing next to the LLM pass) and
+    stops at the first NUL.  Deliberately encoding-agnostic -- it does NOT decode
+    the bytes.
 
-    Both checks cover the vast majority of common binary formats (images,
-    archives, executables, compiled blobs).  All plain-text source files
-    (.md, .py, .rs, .go, .yaml, .toml, .txt, etc.) pass both checks cleanly.
+    History: an earlier version decoded an 8 KB head *slice* as UTF-8 and treated
+    a decode error as "binary".  But a multi-byte UTF-8 character straddling the
+    8 KB cut raises UnicodeDecodeError, so valid UTF-8 text with long lines was
+    silently misclassified as binary and dropped.  NUL-sniffing the whole file
+    has no boundary hazard, accepts text in any encoding (UTF-8, latin-1, ...),
+    and still rejects real binaries (images, archives, executables, UTF-16) since
+    those carry NUL bytes.  Genuinely mis-encoded input is surfaced loudly
+    downstream, not hidden here.
     """
-    _SAMPLE = 8192
     try:
-        sample = path.read_bytes()[:_SAMPLE]
+        with path.open("rb") as fh:
+            while chunk := fh.read(65536):
+                if b"\x00" in chunk:
+                    return False
     except OSError:
-        return False
-    if b"\x00" in sample:
-        return False
-    try:
-        sample.decode("utf-8")
-    except UnicodeDecodeError:
         return False
     return True
 
@@ -843,13 +846,26 @@ def ingest(
             # Drain mode: always continue (never halt on non-convergence).
 
     _print_summary(summary_drain)
-    # Fail-loud after the drain: nonzero if anything went to _failed/.
-    failed_n = sum(
-        1
-        for _, s in summary_drain
+    # Fail-loud after the drain: surface anything routed to _failed/ as a
+    # distinct, un-missable block (not merely a yellow bullet in the summary) so
+    # silently-dropped sources cannot slip past the operator.
+    failed_items = [
+        (n, s)
+        for n, s in summary_drain
         if s in {"error", "not-converged", "tampered", "binary"}
-    )
-    return 1 if failed_n else 0
+    ]
+    if failed_items:
+        print(
+            f"\n{RED}!! {len(failed_items)} source(s) were NOT added to the wiki"
+            f" -- moved to {failed_dir}{RESET}"
+        )
+        for n, s in failed_items:
+            print(f"{RED}   - {n}  ({s}){RESET}")
+        print(
+            f"{RED}   review these, fix, and re-drop into _inbox/ to retry,"
+            f" or remove them.{RESET}"
+        )
+    return 1 if failed_items else 0
 
 
 # ---------------------------------------------------------------------------
@@ -975,7 +991,7 @@ def _hard_env_checks(*, require_api_key: bool) -> list[_EnvCheck]:
                     ),
                     remediation=(
                         "  fix: uv tool install --force"
-                        " git+https://github.com/microsoft/amplifier-bundle-wiki-weaver",
+                        " git+https://github.com/microsoft/amplifier-app-wiki-weaver",
                     ),
                 )
             )
@@ -1102,33 +1118,35 @@ def doctor(*, wiki: str | Path | None = None) -> int:
             "WIKI_WEAVER_ATTRACTOR_PIPELINE not set; will load attractor-pipeline from git URL"
         )
 
-    # context-intelligence hook config (server_url + api_key) from settings.
+    # context-intelligence hook.
+    # The hook's LoggingHandler is ALWAYS-ON: it writes per-session events.jsonl
+    # locally regardless of config. Unconfigured = local-only = normal default.
+    _ok("context-intelligence: logging locally (per-session events.jsonl) — normal")
     ci_cfg = load_ci_config()
-    server_url = ci_cfg.get("context_intelligence_server_url")
-    if ci_cfg.get("context_intelligence_api_key"):
-        _ok("context-intelligence hook config found in settings (api_key + server_url)")
-    else:
-        _warn(
-            "no context-intelligence api_key in settings; hook composes but fails soft"
-        )
+    destinations = ci_cfg.get("destinations") or {}
+    if destinations:
+        for dest_name, dest in destinations.items():
+            dest_url = dest.get("url", "") if isinstance(dest, dict) else ""
+            if not dest_url:
+                continue
+            _ok(f"context-intelligence: remote destination '{dest_name}' → {dest_url}")
+            # Probe the destination (non-fatal info -- local logging continues regardless).
+            try:
+                import urllib.request
 
-    # Probe the CI server (GET, short timeout). DOWN is OK -- the hook fails soft
-    # and still writes local events.jsonl. No hardcoded default: if the user has
-    # not configured a server in settings, there is nothing to probe.
-    if not server_url:
-        _warn("no context-intelligence server_url in settings; skipping probe")
-    else:
-        try:
-            import urllib.request
-
-            with urllib.request.urlopen(server_url, timeout=3) as resp:  # noqa: S310
+                with urllib.request.urlopen(dest_url, timeout=3) as resp:  # noqa: S310
+                    _ok(
+                        f"context-intelligence: '{dest_name}' server UP (HTTP {resp.status})"
+                    )
+            except Exception as e:  # noqa: BLE001
                 _ok(
-                    f"context-intelligence server UP at {server_url} (HTTP {resp.status})"
+                    f"context-intelligence: '{dest_name}' server DOWN/unreachable"
+                    f" ({type(e).__name__}) — OK, local events.jsonl still written"
                 )
-        except Exception as e:  # noqa: BLE001
-            _warn(
-                f"context-intelligence server DOWN/unreachable at {server_url} ({type(e).__name__}); OK -- hook fails soft, local events.jsonl still written"
-            )
+    else:
+        _ok(
+            "context-intelligence: no remote destinations configured (local-only) — normal"
+        )
 
     if wiki:
         wiki_path = Path(wiki).resolve()
@@ -1166,12 +1184,199 @@ def doctor(*, wiki: str | Path | None = None) -> int:
             except Exception as e:  # noqa: BLE001
                 _warn(f"  could not resolve policy for {wiki_path}: {e}")
 
+    # Resolved @main commits — the "what am I running" record that replaces
+    # the committed uv.lock (absent intentionally; see .gitignore).
+    # Reads from local cache only (no ls-remote) so doctor stays fast offline.
+    # Run `wiki-weaver update --check` to compare against remote.
+    try:
+        from wiki_weaver.updater import local_layer2_commits, wheel_dep_commits
+
+        print()
+        print(
+            "Resolved @main commits (local — run 'wiki-weaver update --check' to compare remote):"
+        )
+        for rec in wheel_dep_commits():
+            sha = rec.local_short
+            _ok(f"  {rec.label:<44s} {sha}")
+        for rec in local_layer2_commits():
+            if rec.local_sha:
+                _ok(f"  {rec.label:<44s} {rec.local_short}")
+            else:
+                _warn(f"  {rec.label:<44s} (not cached — will clone on first ingest)")
+    except Exception as e:  # noqa: BLE001
+        _warn(f"could not read resolved @main commits: {e}")
+
     print()
     if ok:
         _ok("doctor: all required checks passed")
         return 0
     _fail("doctor: one or more checks failed")
     return 1
+
+
+# ---------------------------------------------------------------------------
+# update — refresh @main sources
+# ---------------------------------------------------------------------------
+
+
+def update(*, check_only: bool = False) -> int:
+    """Refresh wiki-weaver's @main sources to latest.
+
+    Tracks @main, fix-forward — no SHA pinning.
+
+    Two layers:
+      Layer 1 — ``uv tool install --reinstall`` to update wiki-weaver itself
+                and its wheel deps (amplifier-foundation, amplifier-unified-llm-client).
+                Uses verify+ladder+fail-loud: if stale uv-cached packages are
+                detected, escalates to ``--no-cache`` then ``uv cache clean``.
+      Layer 2 — Calls foundation's ``GitSourceHandler.update()`` on the
+                attractor-bundle and context-intelligence engine bundles in
+                ``~/.amplifier/cache/bundles`` (rmtree+reclone).
+
+    ``check_only=True`` — detect and report without modifying anything.
+    """
+    try:
+        from wiki_weaver.updater import (  # noqa: F401
+            Layer1Result,
+            SourceRecord,
+            check_layer1,
+            check_layer2,
+            update_layer1,
+            update_layer2,
+        )
+    except Exception as e:  # noqa: BLE001
+        _fail(f"could not load updater module: {e}")
+        return 1
+
+    if check_only:
+        return _update_check(check_layer1, check_layer2)
+    return _update_real(update_layer1, update_layer2)
+
+
+def _update_check(check_l1_fn, check_l2_fn) -> int:  # type: ignore[no-untyped-def]
+    """--check mode: ls-remote all sources, report drift, no side effects."""
+    print("Checking @main sources for drift (ls-remote only — no changes made)…")
+    any_update = False
+    any_error = False
+
+    print()
+    print("Layer 1 — wheel deps (amplifier-foundation, amplifier-unified-llm-client):")
+    try:
+        for rec in check_l1_fn():
+            if rec.error:
+                _warn(f"  {rec.label}: {rec.error}")
+                any_error = True
+            elif rec.needs_update:
+                _warn(
+                    f"  {rec.label}: UPDATE AVAILABLE  "
+                    f"{rec.local_short} -> {rec.target_short}"
+                )
+                any_update = True
+            elif rec.needs_update is False:
+                _ok(f"  {rec.label}: up to date ({rec.local_short})")
+            else:
+                _warn(f"  {rec.label}: unknown (local={rec.local_short} remote=?)")
+    except Exception as e:  # noqa: BLE001
+        _fail(f"  layer-1 check failed: {e}")
+        any_error = True
+
+    print()
+    print("Layer 2 — engine bundles (~/.amplifier/cache/bundles):")
+    try:
+        for rec in check_l2_fn():
+            if rec.error:
+                _warn(f"  {rec.label}: {rec.error}")
+                any_error = True
+            elif rec.needs_update:
+                _warn(
+                    f"  {rec.label}: UPDATE AVAILABLE  "
+                    f"{rec.local_short} -> {rec.target_short}"
+                )
+                any_update = True
+            elif rec.needs_update is False:
+                _ok(f"  {rec.label}: up to date ({rec.local_short})")
+            else:
+                _warn(
+                    f"  {rec.label}: not yet cached (will clone fresh on first ingest)"
+                )
+    except Exception as e:  # noqa: BLE001
+        _fail(f"  layer-2 check failed: {e}")
+        any_error = True
+
+    print()
+    if any_update:
+        _warn("Updates are available.  Run `wiki-weaver update` to apply.")
+    elif any_error:
+        _warn("Some checks failed; could not determine update status for all sources.")
+    else:
+        _ok("All @main sources are up to date.")
+    return 1 if any_error else 0
+
+
+def _update_real(update_l1_fn, update_l2_fn) -> int:  # type: ignore[no-untyped-def]
+    """Real update: Layer 1 reinstall + Layer 2 re-clone."""
+    print("Updating wiki-weaver to latest @main…")
+    overall_ok = True
+
+    # --- Layer 1 ---
+    print()
+    print("Layer 1 — uv tool install --reinstall (wiki-weaver + wheel deps)…")
+    res = None
+    try:
+        res = update_l1_fn(verbose=True)
+    except Exception as e:  # noqa: BLE001
+        _fail(f"Layer 1 update raised: {e}")
+        overall_ok = False
+
+    if res is not None:
+        for name in res.before:
+            b = (res.before.get(name) or "?")[:8]
+            a = (res.after.get(name) or "?")[:8]
+            if b != a:
+                _ok(f"  {name}: {b} -> {a}")
+            else:
+                _ok(f"  {name}: {a} (already at latest)")
+        for err in res.errors:
+            _fail(f"  error: {err}")
+        if res.stale:
+            _fail(
+                f"  FAIL: after {res.rung_reached} rung(s), {res.stale} still didn't update. "
+                f"uv is serving a stale cache.  Manual fix:\n"
+                f"    uv cache prune && "
+                f"uv tool install --reinstall "
+                f"git+https://github.com/microsoft/amplifier-app-wiki-weaver"
+            )
+            overall_ok = False
+        elif not res.success and res.errors:
+            overall_ok = False
+
+    # --- Layer 2 ---
+    print()
+    print("Layer 2 — engine bundle re-clone (~/.amplifier/cache/bundles)…")
+    try:
+        for rec in update_l2_fn():
+            if rec.skipped:
+                _warn(f"  {rec.label}: skipped ({rec.error})")
+            elif rec.error:
+                _fail(f"  {rec.label}: ERROR — {rec.error}")
+                overall_ok = False
+            elif rec.needs_update:
+                _ok(f"  {rec.label}: {rec.local_short} -> {rec.target_short}")
+            else:
+                _ok(f"  {rec.label}: {rec.target_short} (already at latest)")
+    except Exception as e:  # noqa: BLE001
+        _fail(f"Layer 2 update raised: {e}")
+        overall_ok = False
+
+    # --- Summary ---
+    print()
+    if overall_ok:
+        _ok("Update complete.")
+        print("  Run `wiki-weaver doctor` to confirm resolved commits.")
+    else:
+        _fail("Update completed with errors (see above).")
+        print("  Run `wiki-weaver doctor` for diagnostics.")
+    return 0 if overall_ok else 1
 
 
 # ---------------------------------------------------------------------------
