@@ -12,6 +12,7 @@ Subcommands:
     update [--check]           refresh @main sources to latest
     query  [--wiki] <q>        (stub) list pages matching a term
     ask    <question> [--wiki] answer a question by reading the compiled wiki
+    build-dashboard <corpus>   build a self-contained HTML dashboard
 """
 
 from __future__ import annotations
@@ -149,6 +150,52 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return ask(args.wiki, args.question, json_out=args.json_out)
 
 
+def cmd_build_dashboard(args: argparse.Namespace) -> int:
+    """Build a self-contained HTML dashboard from a wiki corpus.
+
+    Deterministic — no LLM, no Amplifier runtime required.  Builds corpus
+    indexes first (unless --skip-index), then renders the Almanac-themed
+    dashboard HTML.
+    """
+    import json
+    from pathlib import Path
+
+    from wiki_weaver.dashboard import build_dashboard
+    from wiki_weaver.index import build_indexes
+
+    corpus = Path(args.corpus).expanduser().resolve()
+    out = Path(args.out).expanduser().resolve()
+
+    if not corpus.is_dir():
+        _fail(f"corpus directory not found: {corpus}")
+        return 1
+
+    theme: dict | None = None
+    if args.theme:
+        theme_path = Path(args.theme).expanduser().resolve()
+        try:
+            theme = json.loads(theme_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            _fail(f"theme file not found: {theme_path}")
+            return 1
+        except json.JSONDecodeError as exc:
+            _fail(f"invalid JSON in theme file {theme_path}: {exc}")
+            return 1
+
+    if not args.skip_index:
+        build_indexes(corpus)
+
+    build_dashboard(
+        corpus,
+        out,
+        theme=theme,
+        group_by=args.group_by,
+        group_link_template=args.group_link_template,
+    )
+    print(f"Dashboard written \u2192 {out}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -257,6 +304,49 @@ def main() -> None:
         help="output JSON: {answer, pages_used, refused}",
     )
 
+    p_build_dashboard = sub.add_parser(
+        "build-dashboard",
+        help="build a self-contained HTML dashboard from a wiki corpus",
+    )
+    p_build_dashboard.add_argument("corpus", help="wiki corpus directory")
+    p_build_dashboard.add_argument(
+        "--out",
+        required=True,
+        metavar="PATH",
+        help="destination .html file",
+    )
+    p_build_dashboard.add_argument(
+        "--theme",
+        default=None,
+        metavar="PATH",
+        help="path to theme.json (optional; overrides .wiki-dashboard/theme.json in corpus)",
+    )
+    p_build_dashboard.add_argument(
+        "--group-by",
+        default="type",
+        metavar="FIELD",
+        dest="group_by",
+        help="frontmatter field to group sidebar nav by (default: type)",
+    )
+    p_build_dashboard.add_argument(
+        "--group-link-template",
+        default=None,
+        metavar="TEMPLATE",
+        dest="group_link_template",
+        help=(
+            "URL template for group header links.  {group} is replaced by the "
+            "URL-encoded group value.  Only http:// and https:// schemes are "
+            "accepted; non-http templates are ignored with a warning.  "
+            "Example: --group-link-template 'https://github.com/{group}'"
+        ),
+    )
+    p_build_dashboard.add_argument(
+        "--skip-index",
+        action="store_true",
+        dest="skip_index",
+        help="skip index rebuild (use existing .wiki/index/ files)",
+    )
+
     args = parser.parse_args()
 
     dispatch = {
@@ -267,6 +357,7 @@ def main() -> None:
         "update": cmd_update,
         "query": cmd_query,
         "ask": cmd_ask,
+        "build-dashboard": cmd_build_dashboard,
     }
     if args.command is None:
         parser.print_help()

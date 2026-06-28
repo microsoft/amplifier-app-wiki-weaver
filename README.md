@@ -116,9 +116,63 @@ way afterward.
 | `lint --wiki <dir>` | Run the structural validator (links, orphans, frontmatter, provenance). Exit 0 = PASS. |
 | `doctor [--wiki <dir>]` | Environment + (optional) wiki-structure diagnostics. Also prints resolved `@main` commits for all sources (your lock-file replacement). |
 | `update [--check]` | Refresh wiki-weaver to latest `@main`: reinstall the tool (Layer 1) and re-clone engine bundles (Layer 2). `--check`/`--dry-run` = report drift only, no changes. |
+| `build-dashboard <corpus> --out <file.html>` | Render a compiled wiki into one self-contained HTML dashboard (no LLM, no runtime). Flags: `--theme <file>`, `--group-by <field>` (default `type`), `--skip-index`. See [Dashboard](#dashboard). |
 
 > `query` exists but is a naive substring grep over page text — a minimal stub, **not** the
 > query surface. Use `ask` to query a wiki.
+
+## Dashboard
+
+`build-dashboard` renders a compiled wiki into a **single self-contained HTML file** — a navigable
+reading view of the whole corpus with no server and no build step. It is **deterministic**: no LLM
+and no Amplifier runtime, so it runs anywhere Python does.
+
+```bash
+wiki-weaver build-dashboard mywiki --out mywiki.html
+```
+
+The output is one portable file with everything inlined — **open it directly in a browser, or drop it
+(or the corpus folder) into Obsidian**; `[[wikilinks]]` resolve either way. You get a sidebar grouped
+by frontmatter `type` (collapsed by default, pages A–Z by title), per-page type badges and dates, a
+reading view with a heading "ledger rail", and a **"Linked from"** backlinks panel.
+
+Under the hood it first builds the corpus indexes at `<corpus>/.wiki/index/` (backlinks, links, tags,
+properties, aliases), then renders. Flags:
+
+| Flag | Effect |
+|---|---|
+| `--out <file.html>` | Destination HTML file (required). |
+| `--theme <file>` | Path to a `theme.json` (overrides the corpus's own `.wiki-dashboard/theme.json`). |
+| `--group-by <field>` | Frontmatter field to group the sidebar nav by (default: `type`). |
+| `--skip-index` | Reuse the existing `.wiki/index/` files instead of rebuilding them. |
+
+### Theming
+
+The default look is **Almanac**: a warm-paper light theme plus an "Almanac Night" dark variant that
+switch automatically with the OS setting (`prefers-color-scheme` — there is no in-page toggle).
+
+To restyle without touching code, drop a `theme.json` in the corpus at `.wiki-dashboard/theme.json`
+(or point at one with `--theme`). It is a **flat JSON object of per-token overrides** keyed by the
+dashboard's `--wiki-*` CSS custom properties — colors (`--wiki-bg`, `--wiki-accent`, …), typography
+(`--wiki-font-reading`, `--wiki-font-size`, `--wiki-line-height`, …), and shape (`--wiki-radius`,
+`--wiki-space-unit`, …). It also accepts an optional `title` string for the dashboard heading. Unknown
+tokens warn and are ignored; overrides whose contrast falls below WCAG AA warn loudly (they are not
+silently "corrected"). Keys prefixed with `_` are treated as private metadata.
+
+```json
+{
+  "title": "My Knowledge Base",
+  "--wiki-accent": "#3B5BDB",
+  "--wiki-bg": "#F4F6FA",
+  "--wiki-font-reading": "system-ui, sans-serif",
+  "--wiki-radius": "4px"
+}
+```
+
+For arbitrary CSS beyond the token set, add `.wiki-dashboard/custom.css` — it is appended **verbatim**
+(trusted: it's the wiki owner's own file, so it is not contrast-checked).
+
+> Theming is **tokens + an optional title only** today — there is no logo or richer branding support yet.
 
 ## Three ways to use it
 

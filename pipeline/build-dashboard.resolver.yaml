@@ -1,0 +1,38 @@
+# build-dashboard.resolver.yaml
+#
+# Sidecar manifest for build-dashboard.dot.  Declares this pipeline to the
+# dot-graph resolver so it appears in the Resolve UI picker with a typed form.
+#
+# Note: the existing wiki-weaver pipelines (init, ingest, lint, ask) do NOT
+# ship resolver sidecars -- they are run only by wiki-weaver's own engine_runner
+# with compile-time token substitution.  build-dashboard is the first pipeline
+# that ships with a resolver sidecar because it is Resolve-composable (design
+# goal G3): it is pure CLI delegation with no engine setup, so the dot-graph
+# resolver can invoke it directly without the wiki-weaver engine_runner wrapper.
+#
+# Params are seeded into the pipeline engine's context at dispatch time.
+# The engine substitutes $corpus and $out into the DOT before execution.
+
+name: "Build Dashboard"
+description: >
+  Build a self-contained HTML dashboard from a wiki corpus.
+  Builds corpus indexes (backlinks, tags, properties, aliases, links) first,
+  then generates the Almanac-themed single-file HTML dashboard — no LLM, no
+  Amplifier runtime required.  Outputs a portable .html that works standalone
+  in Obsidian, a browser, or any file viewer.
+pipeline: build-dashboard.dot
+params:
+  corpus:
+    input: shortText
+    label: "Wiki corpus directory"
+    description: >
+      Path to the wiki corpus directory (the folder containing *.md page files).
+      May be an absolute path or a path relative to the working directory.
+    required: true
+  out:
+    input: shortText
+    label: "Output .html file path"
+    description: >
+      Destination path for the generated HTML dashboard file.  Parent
+      directories are created as needed.  Use a .html extension.
+    required: true

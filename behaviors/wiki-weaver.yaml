@@ -2,8 +2,10 @@ bundle:
   name: wiki-weaver-behavior
   version: 0.1.0
   description: >
-    Mounts the wiki-weaver tools (wiki_weaver_init, wiki_weaver_ingest,
-    wiki_weaver_ask, wiki_weaver_lint) and a thin orientation context.
+    Mounts the wiki-weaver tools — the four pipeline commands (wiki_weaver_init,
+    wiki_weaver_ingest, wiki_weaver_ask, wiki_weaver_lint) plus five read-only
+    index query tools (wiki_backlinks, wiki_graph_neighbors, wiki_tags,
+    wiki_properties, wiki_resolve_citation) — and a thin orientation context.
     Compose onto any bundle to add LLM-wiki automation tools.
 
 # source: is relative to THIS FILE's directory (behaviors/).

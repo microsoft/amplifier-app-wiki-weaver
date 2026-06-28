@@ -13,7 +13,7 @@ source is integrated into status-tracked, interlinked pages; every later questio
 the compiled wiki, not the raw pile. The maintenance cost that makes humans abandon
 wikis is paid by the pipeline instead.
 
-## The four tools
+## The pipeline tools
 
 | Tool | What it does | Cost / shape |
 |---|---|---|
@@ -21,6 +21,21 @@ wikis is paid by the pipeline instead.
 | `wiki_weaver_ingest` | Drain `<wiki>/_inbox/` into the wiki: mine each source, write/update cross-referenced pages, reconcile dups/orphans, verify — looping until each source converges. | **LONG-RUNNING & LLM-heavy** (minutes per source). Place sources in `_inbox/` first. |
 | `wiki_weaver_ask` | Read-only, **index-first** Q&A with citations. Navigates `index.md` + `[[wikilinks]]`, synthesizes a cited answer, and **refuses loudly** when the topic is absent. Structurally barred from writing/shelling/web. | One LLM call. Never mutates the wiki. |
 | `wiki_weaver_lint` | Deterministic structural validation (frontmatter, type taxonomy, link integrity, orphans) via the same validator the ingest pipeline uses. Returns the full report + PASS/FAIL. | No LLM. Fast. Read-only. |
+
+## The five index query tools
+
+These are **read-only, deterministic** corpus lookups (no LLM) over the indexes built at
+`<wiki_dir>/.wiki/index/`. They require the indexes to exist first — built by the `build-dashboard`
+command (or `wiki_weaver.index.build_indexes`). Each returns its data plus a `stale` flag (true when
+the corpus changed since the last index build); they never refuse on stale.
+
+| Tool | What it returns |
+|---|---|
+| `wiki_backlinks` | Pages whose body contains a `[[wikilink]]` pointing at the given page. |
+| `wiki_graph_neighbors` | Immediate link neighbourhood of a page — `out` (links from it) and `in` (links to it). |
+| `wiki_tags` | Pages carrying a given tag; with no tag, a tag→count summary for the whole corpus. |
+| `wiki_properties` | The full frontmatter key/value set for a page (type, tags, aliases, sources, …). |
+| `wiki_resolve_citation` | Maps a page's 1-based citation ordinal to its source record from `.sources.json`. |
 
 ## When to use which
 

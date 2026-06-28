@@ -1,0 +1,30 @@
+{
+  "_comment": "Ground truth for the wiki-min fixture corpus.  See spec-stub §6.",
+  "backlinks": {
+    "alpha": ["beta"],
+    "beta": ["alpha"],
+    "gamma": ["alpha"],
+    "delta": [],
+    "loop-a": [],
+    "loop-b": []
+  },
+  "broken_links": [
+    {"from": "delta", "target": "nonexistent"}
+  ],
+  "tags": {
+    "x": ["alpha", "gamma"],
+    "y": ["gamma"]
+  },
+  "aliases": {
+    "a-overview": "alpha",
+    "b-overview": "beta"
+  },
+  "cycles": [
+    ["loop-a", "loop-b", "loop-a"]
+  ],
+  "citation": {
+    "page": "beta",
+    "n": 1,
+    "source_id": 1
+  }
+}

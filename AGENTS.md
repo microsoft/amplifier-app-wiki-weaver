@@ -15,6 +15,12 @@ Each user command is an attractor `.dot` pipeline in `pipeline/`, run via the CL
 `doctor` (env diagnostics) and `query` (a naive substring-grep stub — not the query surface;
 use `ask`) round out the CLI.
 
+`build-dashboard <corpus> --out <file.html>` is a **deterministic** command (no LLM, no Amplifier
+runtime): it builds the corpus indexes, then renders a self-contained HTML dashboard. It is the first
+pipeline to ship a Resolve sidecar (`pipeline/build-dashboard.dot` + `build-dashboard.resolver.yaml`)
+because it is pure CLI delegation — see Architecture. Flags: `--theme <file>`, `--group-by <field>`
+(default `type`), `--skip-index`.
+
 ## Architecture
 
 Commands are **thin lib wrappers over attractor `.dot` pipelines**:
@@ -27,6 +33,25 @@ Commands are **thin lib wrappers over attractor `.dot` pipelines**:
   are `$token` templates; `build_*_from_file()` fills them with concrete paths/prompts before
   execution. The `.dot` files are **not** drop-in standalone.
 - `cli/policy.py` — resolves per-wiki schema/rubric/model overrides (`<wiki>/policy/…`).
+
+**Deterministic dashboard layer** (no engine, no LLM, no Amplifier runtime — pure stdlib + `tinycss2`
++ `markdown`):
+
+- `wiki_weaver/index.py` — `build_indexes(corpus_dir)` scans `<corpus>/*.md` and materialises five JSON
+  indexes under `<corpus>/.wiki/index/` (`backlinks`, `links`, `tags`, `properties`, `aliases`), each
+  wrapped in the envelope `{schema_version, built, data}`. Also the importable `query_*` layer + named
+  errors (`PageNotFound`, `CitationNotFound`, `CycleDetectedError`, `SchemaVersionError`). Staleness is
+  derived by comparing corpus mtimes against `built.max_mtime`; reads never refuse on stale.
+- `wiki_weaver/dashboard.py` — `build_dashboard(...)` consumes the indexes and renders the
+  domain-blind, Almanac-themed self-contained HTML. Theming reads `<corpus>/.wiki-dashboard/theme.json`
+  (`--wiki-*` token overrides + optional `title`) and appends `.wiki-dashboard/custom.css` verbatim;
+  enrichment CSS from a consumer is sanitized through tinycss2 (the security boundary — hard import,
+  never a silent no-op).
+
+**Agent-tool surface** (`modules/tool-wiki-weaver/`): mounts **9** tools — the 4 pipeline commands
+(`wiki_weaver_init/ingest/ask/lint`) plus 5 read-only index query tools that wrap `index.query_*`:
+`wiki_backlinks`, `wiki_graph_neighbors`, `wiki_tags`, `wiki_properties`, `wiki_resolve_citation`. The
+five require `build_indexes()` to have run first.
 
 Runtime: requires the Amplifier runtime (`amplifier_foundation` + `unified_llm`). `pyproject`
 declares these as `@main` git deps + `allow-direct-references`, so `uv tool install git+...`
@@ -64,12 +89,22 @@ retcon it, don't leave it alongside the real one.
 ## Build / test
 
 - Tests live in `eval/` (`test_*.py`) alongside the eval harnesses.
-- Run with a venv that has `pytest` + `pyyaml`:
+- **Canonical test command (use this):**
 
   ```bash
-  pytest eval/ -q
+  uv run pytest eval/ -q
   ```
 
+  `uv run` syncs the project `.venv` first, so the runtime deps (`tinycss2`,
+  `markdown`) AND the dev-group test tooling (`pytest`, `pytest-asyncio`) are
+  all present in ONE interpreter. Do **not** invoke a global `pytest` — it runs
+  under a different interpreter that lacks the runtime deps, which silently
+  changes behaviour (e.g. the dashboard CSS sanitizer would be import-broken).
+  The dev tooling is declared under `[dependency-groups].dev` in `pyproject.toml`
+  and locked in `uv.lock`; run `uv sync` after changing deps.
+
+- Deterministic tests run without the Amplifier runtime; tests needing it
+  self-skip when `amplifier_foundation` is absent.
 - Run quality checks (format, lint, types) before committing.
 
 ## Data discipline (important)
