@@ -77,5 +77,6 @@ See [DEMO.md](DEMO.md) for a full demo walkthrough and [docs/](docs/) for design
 
 ## Questions
 
-Open an [issue](https://github.com/microsoft/amplifier-app-wiki-weaver/issues) for
-bugs, feature requests, or questions.
+This repo does not use GitHub Issues. For bugs, feature requests, or questions, open a
+pull request (see [Pull Requests](#pull-requests) above). See [SUPPORT.md](SUPPORT.md)
+for the project's support policy.
