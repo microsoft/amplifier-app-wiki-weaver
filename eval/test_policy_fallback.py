@@ -97,8 +97,9 @@ def _make_wiki(tmp_path: Path) -> Path:
     wiki = tmp_path / "wiki"
     wiki.mkdir(parents=True)
     (wiki / ".ai").mkdir()
+    (wiki / ".wiki").mkdir()  # hidden machine-only subtree
     (wiki / "_inbox").mkdir()
-    (wiki / "_archive").mkdir()
+    (wiki / "_sources").mkdir()
     (wiki / ".ai" / "feedback").mkdir()
     return wiki
 
@@ -253,8 +254,8 @@ class TestLoadPolicyDefaults:
 
     def test_project_schema_overrides_builtin(self, tmp_path: Path) -> None:
         wiki = _make_wiki(tmp_path)
-        (wiki / "policy").mkdir()
-        project_schema = wiki / "policy" / "schema.md"
+        (wiki / ".wiki" / "policy").mkdir()
+        project_schema = wiki / ".wiki" / "policy" / "schema.md"
         project_schema.write_text("# Project Schema\n", encoding="utf-8")
         policy = load_policy(wiki)
         assert policy.schema_path == project_schema
@@ -262,8 +263,8 @@ class TestLoadPolicyDefaults:
 
     def test_project_validator_yaml_sets_config_path(self, tmp_path: Path) -> None:
         wiki = _make_wiki(tmp_path)
-        (wiki / "policy").mkdir()
-        vcfg = wiki / "policy" / "validator.yaml"
+        (wiki / ".wiki" / "policy").mkdir()
+        vcfg = wiki / ".wiki" / "policy" / "validator.yaml"
         vcfg.write_text("nav_pages: [catalog, landing]\n", encoding="utf-8")
         policy = load_policy(wiki)
         assert policy.validator_config_path == vcfg
@@ -271,8 +272,8 @@ class TestLoadPolicyDefaults:
     def test_absent_policy_file_does_not_set_config_path(self, tmp_path: Path) -> None:
         """A policy/ dir without validator.yaml keeps validator_config_path=None."""
         wiki = _make_wiki(tmp_path)
-        (wiki / "policy").mkdir()
-        (wiki / "policy" / "schema.md").write_text("# Schema\n", encoding="utf-8")
+        (wiki / ".wiki" / "policy").mkdir()
+        (wiki / ".wiki" / "policy" / "schema.md").write_text("# Schema\n", encoding="utf-8")
         policy = load_policy(wiki)
         # validator.yaml was NOT created
         assert policy.validator_config_path is None
@@ -282,8 +283,8 @@ class TestLoadPolicyDefaults:
         default_wiki = _make_wiki(tmp_path / "default")
         project_wiki = _make_wiki(tmp_path / "project")
 
-        (project_wiki / "policy").mkdir()
-        (project_wiki / "policy" / "schema.md").write_text(
+        (project_wiki / ".wiki" / "policy").mkdir()
+        (project_wiki / ".wiki" / "policy" / "schema.md").write_text(
             "# Board Game Schema\n", encoding="utf-8"
         )
         (project_wiki / "wiki.config.yaml").write_text(
@@ -297,7 +298,7 @@ class TestLoadPolicyDefaults:
         assert default_policy.schema_path == SCHEMA_PATH
         assert default_policy.max_cycles == 3
         # Project wiki uses project schema and different max_cycles
-        assert project_policy.schema_path == project_wiki / "policy" / "schema.md"
+        assert project_policy.schema_path == project_wiki / ".wiki" / "policy" / "schema.md"
         assert project_policy.max_cycles == 2
 
 
@@ -364,8 +365,8 @@ class TestBuildDotByteIdentical:
         """When validator.yaml exists, --config must appear in validate_cmd."""
         wiki = _make_wiki(tmp_path)
         src = _make_source(tmp_path)
-        (wiki / "policy").mkdir()
-        vcfg = wiki / "policy" / "validator.yaml"
+        (wiki / ".wiki" / "policy").mkdir()
+        vcfg = wiki / ".wiki" / "policy" / "validator.yaml"
         vcfg.write_text("nav_pages: [catalog, landing]\n", encoding="utf-8")
         policy = load_policy(wiki)
         dot = build_dot(src, wiki, policy)
@@ -453,8 +454,8 @@ class TestBuildLintDotByteIdentical:
     def test_with_validator_config_byte_identical(self, tmp_path: Path) -> None:
         """Wiki with policy/validator.yaml present — --config appended to cmd."""
         wiki = tmp_path / "wiki"
-        (wiki / "policy").mkdir(parents=True)
-        (wiki / "policy" / "validator.yaml").write_text(
+        (wiki / ".wiki" / "policy").mkdir(parents=True)
+        (wiki / ".wiki" / "policy" / "validator.yaml").write_text(
             "nav_pages: [index]\n", encoding="utf-8"
         )
         result_file = tmp_path / "lint_result.md"
@@ -468,11 +469,12 @@ class TestBuildLintDotByteIdentical:
         """Sanity: the two cases (config present / absent) must NOT be identical."""
         wiki = tmp_path / "wiki"
         wiki.mkdir()
+        (wiki / ".wiki").mkdir()  # hidden subtree for policy overrides
         result_file = tmp_path / "lint_result.md"
         no_cfg = build_lint_dot(wiki, result_file)
 
-        (wiki / "policy").mkdir()
-        (wiki / "policy" / "validator.yaml").write_text(
+        (wiki / ".wiki" / "policy").mkdir()
+        (wiki / ".wiki" / "policy" / "validator.yaml").write_text(
             "nav_pages: [index]\n", encoding="utf-8"
         )
         with_cfg = build_lint_dot(wiki, result_file)

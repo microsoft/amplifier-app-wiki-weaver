@@ -17,7 +17,7 @@ wikis is paid by the pipeline instead.
 
 | Tool | What it does | Cost / shape |
 |---|---|---|
-| `wiki_weaver_init` | Scaffold a wiki and (unless `plain=true`) LLM-design a domain-fit schema from a stated `purpose` — page types, frontmatter contract, conventions → `<wiki>/policy/schema.md`. | One LLM call (cheap). `plain=true` is free (deterministic scaffold only). |
+| `wiki_weaver_init` | Scaffold a wiki and (unless `plain=true`) LLM-design a domain-fit schema from a stated `purpose` — page types, frontmatter contract, conventions → `<wiki>/.wiki/policy/schema.md`. | One LLM call (cheap). `plain=true` is free (deterministic scaffold only). |
 | `wiki_weaver_ingest` | Drain `<wiki>/_inbox/` into the wiki: mine each source, write/update cross-referenced pages, reconcile dups/orphans, verify — looping until each source converges. | **LONG-RUNNING & LLM-heavy** (minutes per source). Place sources in `_inbox/` first. |
 | `wiki_weaver_ask` | Read-only, **index-first** Q&A with citations. Navigates `index.md` + `[[wikilinks]]`, synthesizes a cited answer, and **refuses loudly** when the topic is absent. Structurally barred from writing/shelling/web. | One LLM call. Never mutates the wiki. |
 | `wiki_weaver_lint` | Deterministic structural validation (frontmatter, type taxonomy, link integrity, orphans) via the same validator the ingest pipeline uses. Returns the full report + PASS/FAIL. | No LLM. Fast. Read-only. |
@@ -35,7 +35,7 @@ the corpus changed since the last index build); they never refuse on stale.
 | `wiki_graph_neighbors` | Immediate link neighbourhood of a page — `out` (links from it) and `in` (links to it). |
 | `wiki_tags` | Pages carrying a given tag; with no tag, a tag→count summary for the whole corpus. |
 | `wiki_properties` | The full frontmatter key/value set for a page (type, tags, aliases, sources, …). |
-| `wiki_resolve_citation` | Maps a page's 1-based citation ordinal to its source record from `.sources.json`. |
+| `wiki_resolve_citation` | Maps a page's 1-based citation ordinal to its source record from `.wiki/.sources.json`. |
 
 ## When to use which
 

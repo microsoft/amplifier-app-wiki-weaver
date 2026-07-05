@@ -21,18 +21,27 @@ pipeline to ship a Resolve sidecar (`pipeline/build-dashboard.dot` + `build-dash
 because it is pure CLI delegation — see Architecture. Flags: `--theme <file>`, `--group-by <field>`
 (default `type`), `--skip-index`.
 
+`migrate <corpus> [--dry-run] [--force]` is a **deterministic** command (no LLM, no Amplifier
+runtime): migrates a corpus from the OLD (pre-0.5.0) layout (machine files at corpus root: ledger
+`.processed.jsonl`, registry `.sources.json`, `_archive/`, `_failed/`, `.runs/`, `policy/`,
+`.wiki-dashboard/`) to the NEW layout (machine files under hidden `.wiki/` subtree; `_archive/`
+renamed to visible `_sources/`). Also rewrites absolute-path ledger fields (`archived_to`,
+`logs_dir`). Safety: PID lock, idempotency sentinel, copy→verify→delete sequence — never deletes
+before verification passes. `--dry-run` prints the plan without changes; `--force` bypasses the
+sentinel.
+
 ## Architecture
 
 Commands are **thin lib wrappers over attractor `.dot` pipelines**:
 
 - `cli/wiki_weaver.py` — argparse front end (dispatch only).
 - `cli/lib.py` — importable concept-level functions; owns the outer corpus sweep and all
-  process state (the `.processed.jsonl` ledger + `_archive/`), written by code *only* on real
+  process state (the `.wiki/.processed.jsonl` ledger + `_sources/`), written by code *only* on real
   convergence (a deterministic tamper guard reverts agent-written process state and fails loud).
 - `cli/engine_runner.py` — runs the inner pipelines on the attractor engine. The `.dot` files
   are `$token` templates; `build_*_from_file()` fills them with concrete paths/prompts before
   execution. The `.dot` files are **not** drop-in standalone.
-- `cli/policy.py` — resolves per-wiki schema/rubric/model overrides (`<wiki>/policy/…`).
+- `cli/policy.py` — resolves per-wiki schema/rubric/model overrides (`<wiki>/.wiki/policy/…`).
 
 **Deterministic dashboard layer** (no engine, no LLM, no Amplifier runtime — pure stdlib + `tinycss2`
 + `markdown`):
@@ -43,8 +52,8 @@ Commands are **thin lib wrappers over attractor `.dot` pipelines**:
   errors (`PageNotFound`, `CitationNotFound`, `CycleDetectedError`, `SchemaVersionError`). Staleness is
   derived by comparing corpus mtimes against `built.max_mtime`; reads never refuse on stale.
 - `wiki_weaver/dashboard.py` — `build_dashboard(...)` consumes the indexes and renders the
-  domain-blind, Almanac-themed self-contained HTML. Theming reads `<corpus>/.wiki-dashboard/theme.json`
-  (`--wiki-*` token overrides + optional `title`) and appends `.wiki-dashboard/custom.css` verbatim;
+  domain-blind, Almanac-themed self-contained HTML. Theming reads `<corpus>/.wiki/dashboard/theme.json`
+  (`--wiki-*` token overrides + optional `title`) and appends `.wiki/dashboard/custom.css` verbatim;
   enrichment CSS from a consumer is sanitized through tinycss2 (the security boundary — hard import,
   never a silent no-op).
 

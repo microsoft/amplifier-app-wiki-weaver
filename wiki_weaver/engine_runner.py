@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from ._assets import pipeline_dir
+from .lib import wiki_ledger, wiki_policy_dir, wiki_registry, wiki_runs, wiki_sources
 from .model_resolver import resolve_model
 from .policy import WikiPolicy, load_policy
 
@@ -412,7 +413,7 @@ async def _resolve_agent_bundle(agent_name: str, config: dict[str, Any]) -> Any:
 # Fix 1 -- per-node filesystem isolation
 # --------------------------------------------------------------------------
 #
-# Process state (the .processed.jsonl ledger and the _archive/ directory) is the
+# Process state (the .wiki/.processed.jsonl ledger and the _sources/ directory) is the
 # deterministic CLI's EXCLUSIVE responsibility. A spawned LLM node must be
 # PHYSICALLY UNABLE to write it. The tool-filesystem module honours a
 # ``denied_write_paths`` config (DENY wins over ALLOW in is_path_allowed), so we
@@ -429,7 +430,7 @@ async def _resolve_agent_bundle(agent_name: str, config: dict[str, Any]) -> Any:
 def _denied_process_paths(wiki_dir: Path) -> list[str]:
     """The two process-state paths a spawned node must never write."""
     wiki_dir = Path(wiki_dir).resolve()
-    return [str(wiki_dir / ".processed.jsonl"), str(wiki_dir / "_archive")]
+    return [str(wiki_ledger(wiki_dir)), str(wiki_sources(wiki_dir))]
 
 
 def _constrain_agent_fs(child_bundle: Any, wiki_dir: Path) -> None:
@@ -463,7 +464,7 @@ def make_spawn_fn(prepared: Any, wiki_dir: Path | None = None):
     default, so the context-intelligence hook is inherited by every child.
 
     When ``wiki_dir`` is provided, every spawned child agent's filesystem tool
-    is constrained so it cannot write the ledger or _archive/ (Fix 1).
+    is constrained so it cannot write the ledger or _sources/ (Fix 1).
     """
     # Cache resolved agent bundles across spawns within one process.
     _agent_cache: dict[str, Any] = {}
@@ -493,7 +494,7 @@ def make_spawn_fn(prepared: Any, wiki_dir: Path | None = None):
         child_bundle = _agent_cache[agent_name]
 
         # Fix 1: physically deny the spawned node write access to the ledger and
-        # _archive/. DENY beats ALLOW in the filesystem tool, so write_file /
+        # _sources/. DENY beats ALLOW in the filesystem tool, so write_file /
         # edit_file targeting those paths are rejected at the tool boundary.
         if wiki_dir is not None:
             _constrain_agent_fs(child_bundle, wiki_dir)
@@ -756,7 +757,7 @@ def build_ask_dot(
     constrained by make_ask_spawn_fn (wiki writes denied, bash/web removed).
     """
     wiki_abs = str(wiki_dir.resolve())
-    sources_json = str(wiki_dir / ".sources.json")
+    sources_json = str(wiki_registry(wiki_dir))
     answer_file_s = str(answer_file)
 
     # Build the agent instruction (real Python newlines; _dot_escape_prompt
@@ -833,7 +834,7 @@ def build_ask_dot_from_file(
 
     Token substitution:
       $wiki_dir    -> str(wiki_dir.resolve())
-      $sources_json -> str(wiki_dir / ".sources.json")
+      $sources_json -> str(wiki_registry(wiki_dir))  # <wiki>/.wiki/.sources.json
       $answer_file -> str(answer_file)
       $question    -> _dot_escape_prompt(question)   (DOT-escaping for the prompt context)
 
@@ -841,7 +842,7 @@ def build_ask_dot_from_file(
     If policy differs, those values are replaced with the supplied provider/model.
     """
     wiki_abs = str(wiki_dir.resolve())
-    sources_json = str(wiki_dir / ".sources.json")
+    sources_json = str(wiki_registry(wiki_dir))
     answer_file_s = str(answer_file)
 
     dot = ASK_DOT.read_text(encoding="utf-8")
@@ -906,7 +907,7 @@ def run_ask(
 
     The spawned agent session is CI-instrumented (inherits the hook from the
     composed bundle) so cost/token/artifact events are captured in
-    ``<wiki_dir>/.runs/ask-<ts>/`` alongside the ask.dot and session logs.
+    ``<wiki_dir>/.wiki/runs/ask-<ts>/`` alongside the ask.dot and session logs.
 
     Tool scoping (THE MECHANISM — structural, not instructional):
       - tool-bash and web tools REMOVED from the spawned agent's tools list
@@ -923,7 +924,7 @@ def run_ask(
     import uuid
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logs_dir = wiki_dir / ".runs" / f"ask-{timestamp}-{uuid.uuid4().hex[:8]}"
+    logs_dir = wiki_runs(wiki_dir) / f"ask-{timestamp}-{uuid.uuid4().hex[:8]}"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     # The answer_file lives outside wiki_dir so the denied_write_paths
@@ -1064,7 +1065,7 @@ async def _run_pipeline(
 
     ``wiki_dir`` (when set) is forwarded to the spawn capability so each
     per-node child agent's filesystem tool is denied write access to the
-    ledger and _archive/ (Fix 1).
+    ledger and _sources/ (Fix 1).
     """
     import json
 
@@ -1118,7 +1119,7 @@ def run_inner(
     policy = load_policy(wiki_dir, cli_max_cycles=max_cycles)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logs_dir = wiki_dir / ".runs" / timestamp
+    logs_dir = wiki_runs(wiki_dir) / timestamp
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     dot_source = build_dot(source_path, wiki_dir, policy, source_id=source_id)
@@ -1152,7 +1153,7 @@ def run_ingest(
       2. A folder sub-pipeline (synthesize.dot) that integrates the source,
          inheriting all context keys from step 1.
       3. An archive tool node (ingest_archive.py) on convergence -- moves the
-         source to _archive/, appends the ledger, marks ingested in .sources.json.
+         source to _sources/, appends the ledger, marks ingested in .wiki/.sources.json.
       4. A fail_handler tool node (ingest_fail.py) on non-convergence -- moves
          the source to _failed/ so the inbox keeps shrinking.
       5. loop_restart back to setup until has_source=false.
@@ -1188,7 +1189,7 @@ def run_ingest(
     max_drain_iters = max(20, inbox_count * 5)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logs_dir = wiki_dir / ".runs" / f"ingest-{timestamp}"
+    logs_dir = wiki_runs(wiki_dir) / f"ingest-{timestamp}"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     # Substitute compile-time tokens in ingest.dot (paths and bounds that
@@ -1299,7 +1300,7 @@ def build_lint_dot(wiki_dir: Path, lint_result_file: Path) -> str:
       $validate_cmd -> python validate_wiki.py <wiki_abs> [--config <cfg>] --out <lint_result_file>
 
     ``wiki_dir`` is resolved to an absolute path so the DOT is self-contained.
-    If ``<wiki_dir>/policy/validator.yaml`` exists, ``--config`` is appended
+    If ``<wiki_dir>/.wiki/policy/validator.yaml`` exists, ``--config`` is appended
     (identical behaviour to lib.lint).
 
     Byte-identical to build_lint_dot_from_file for the same inputs.
@@ -1307,7 +1308,7 @@ def build_lint_dot(wiki_dir: Path, lint_result_file: Path) -> str:
     import sys
 
     wiki_abs = str(wiki_dir.resolve())
-    validator_cfg = wiki_dir / "policy" / "validator.yaml"
+    validator_cfg = wiki_policy_dir(wiki_dir) / "validator.yaml"
     validate_cmd = f"{sys.executable} {VALIDATE_PY} {wiki_abs}"
     if validator_cfg.is_file():
         validate_cmd += f" --config {validator_cfg}"
@@ -1343,7 +1344,7 @@ def build_lint_dot_from_file(wiki_dir: Path, lint_result_file: Path) -> str:
     import sys
 
     wiki_abs = str(wiki_dir.resolve())
-    validator_cfg = wiki_dir / "policy" / "validator.yaml"
+    validator_cfg = wiki_policy_dir(wiki_dir) / "validator.yaml"
     validate_cmd = f"{sys.executable} {VALIDATE_PY} {wiki_abs}"
     if validator_cfg.is_file():
         validate_cmd += f" --config {validator_cfg}"
@@ -1361,7 +1362,7 @@ def run_lint(wiki_dir: str | Path) -> int:
     validator's exit code: 0 on pass, 1 on fail. Prints the validator report
     to stdout (identical output to lib.lint).
 
-    The wiki must already exist — lint runs on a built wiki whose ``.runs/``
+    The wiki must already exist — lint runs on a built wiki whose ``.wiki/runs/``
     directory is writable (no bootstrapping issue, unlike init).
 
     The validator result is written to a tmp file via ``--out`` and read back
@@ -1375,7 +1376,7 @@ def run_lint(wiki_dir: str | Path) -> int:
         return 1
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logs_dir = wiki_dir / ".runs" / f"lint-{timestamp}"
+    logs_dir = wiki_runs(wiki_dir) / f"lint-{timestamp}"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     # Result file: validate_wiki.py writes its output here via --out.
@@ -1415,7 +1416,7 @@ def run_lint(wiki_dir: str | Path) -> int:
 # --------------------------------------------------------------------------
 #
 # MECHANISM: one LLM node that reads the wiki purpose + source sample, adapts
-# the generic SCHEMA.md for the domain, and writes <wiki>/policy/schema.md.
+# the generic SCHEMA.md for the domain, and writes <wiki>/.wiki/policy/schema.md.
 # That path is already the first override point in policy.py's schema_path
 # resolution — so the first ingest after `init --purpose` automatically runs
 # with the domain-fit schema, no other changes needed.
@@ -1444,7 +1445,7 @@ _INIT_PROMPT_TEMPLATE = (
     "$default_schema\n"
     "\n"
     "Design a schema TAILORED to this wiki's purpose and desired outcomes. Write the\n"
-    "complete schema to `$wiki_dir/policy/schema.md`. It MUST define:\n"
+    "complete schema to `$wiki_dir/.wiki/policy/schema.md`. It MUST define:\n"
     "1. PAGE TYPES \u2014 a domain-fit `type:` taxonomy chosen to serve the stated outcomes.\n"
     "   Do NOT reflexively keep concept/entity/comparison/synthesis if this domain wants\n"
     "   different page types (e.g. a team-decisions wiki may want decision/workstream/owner\n"
@@ -1595,13 +1596,13 @@ def run_init(
 
     Contract C (per parent conversation design decision):
       - Always calls lib.init(wiki_dir) first (deterministic scaffold: dirs, stubs,
-        ledger). This also ensures <wiki>/.runs/ is writable for the engine.
+        ledger). This also ensures <wiki>/.wiki/runs/ is writable for the engine.
       - plain=True  -> stop after scaffold (generic default schema, no LLM). Free.
       - No signal (purpose is None AND inbox is empty/absent) -> same as plain.
-      - Otherwise   -> run init.dot (one LLM node that writes policy/schema.md).
+      - Otherwise   -> run init.dot (one LLM node that writes .wiki/policy/schema.md).
 
     POST-CHECK after the LLM run (fail loud, never silent fallback):
-      Asserts <wiki>/policy/schema.md was written, is non-empty, and contains a
+      Asserts <wiki>/.wiki/policy/schema.md was written, is non-empty, and contains a
       "type:" taxonomy reference plus "index" and "overview" nav-page mentions.
     """
     import sys
@@ -1611,7 +1612,7 @@ def run_init(
     wiki_dir = Path(wiki_dir).expanduser().resolve()
 
     # Step 1: Always scaffold first (deterministic; creates dirs + stubs + ledger;
-    # also creates wiki_dir so the engine can create .runs/ inside it).
+    # also creates wiki_dir so the engine can create .wiki/runs/ inside it).
     rc = _lib_init(wiki_dir)
     if rc != 0:
         return rc
@@ -1640,10 +1641,10 @@ def run_init(
 
     # Create policy/ dir before the engine runs so the LLM can write schema.md
     # without needing to mkdir itself (belt-and-suspenders).
-    (wiki_dir / "policy").mkdir(exist_ok=True)
+    wiki_policy_dir(wiki_dir).mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logs_dir = wiki_dir / ".runs" / f"init-{timestamp}"
+    logs_dir = wiki_runs(wiki_dir) / f"init-{timestamp}"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     _init_policy = load_policy(wiki_dir)
@@ -1667,7 +1668,7 @@ def run_init(
     )
 
     # Step 4: Post-check — fail loud if schema.md wasn't written or looks malformed.
-    schema_file = wiki_dir / "policy" / "schema.md"
+    schema_file = wiki_policy_dir(wiki_dir) / "schema.md"
     if not schema_file.is_file():
         print(
             f"FAIL: schema design completed but {schema_file} was not written.\n"

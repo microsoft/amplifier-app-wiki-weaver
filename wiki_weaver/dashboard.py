@@ -27,7 +27,7 @@ CSS escaping (spec §4):
 Theme (spec §5):
     Ships Almanac warm-paper light default + Almanac Night dark variant
     (``defaultScheme: auto`` via ``@media (prefers-color-scheme:dark)``).
-    Reads optional ``<corpus>/.wiki-dashboard/theme.json`` per-token with
+    Reads optional ``<corpus>/.wiki/dashboard/theme.json`` per-token with
     explicit None-checks (0/""/False are valid values); unknown keys warn;
     contrast pairs validated loudly against WCAG AA (4.5:1).
     ``custom.css`` is appended VERBATIM (trusted — wiki-owner's own file;
@@ -57,6 +57,7 @@ _MD_EXT = ["tables", "fenced_code", "sane_lists"]
 
 # ── Index layer (increment 1 — consumed here) ─────────────────────────────────
 
+from wiki_weaver.lib import wiki_dashboard as _wiki_dashboard  # noqa: E402
 from wiki_weaver.index import (  # noqa: E402
     EXPECTED_SCHEMA_VERSION,
     _body,  # noqa: PLC2701
@@ -309,7 +310,7 @@ def _load_theme_overrides(corpus_dir: Path, theme_param: Any) -> dict[str, str]:
 
     Rules:
     - ``theme_param`` dict → used directly as overrides (skip theme.json).
-    - ``theme_param`` is None → read ``<corpus>/.wiki-dashboard/theme.json``.
+    - ``theme_param`` is None → read ``<corpus>/.wiki/dashboard/theme.json``.
     - Unknown keys warn and are ignored (not silently swallowed).
     - ``None`` values are skipped (explicit None-check; 0/""/False are valid).
     - Contrast pairs are validated loudly; no silent auto-correct.
@@ -320,7 +321,7 @@ def _load_theme_overrides(corpus_dir: Path, theme_param: Any) -> dict[str, str]:
     if isinstance(theme_param, dict):
         raw: dict[str, Any] = theme_param
     else:
-        theme_path = corpus_dir / ".wiki-dashboard" / "theme.json"
+        theme_path = _wiki_dashboard(corpus_dir) / "theme.json"
         if not theme_path.exists():
             return {}
         try:
@@ -1171,7 +1172,7 @@ def build_dashboard(
         Destination ``.html`` file.  Parent directories are created as needed.
     theme
         Optional dict of ``--wiki-*`` CSS var overrides.  If ``None``, reads
-        ``<corpus>/.wiki-dashboard/theme.json`` when present.
+        ``<corpus>/.wiki/dashboard/theme.json`` when present.
     group_by
         Frontmatter field that groups the sidebar (default: ``"type"``).
         Scalar values work as before; **list-valued** fields (e.g. ``tags``,
@@ -1235,7 +1236,7 @@ def build_dashboard(
     theme_css = _build_theme_css(theme_overrides)
 
     # ── custom.css — verbatim / trusted (spec §10) ─────────────────────────
-    custom_path = corpus / ".wiki-dashboard" / "custom.css"
+    custom_path = _wiki_dashboard(corpus) / "custom.css"
     if custom_path.exists():
         custom_content = custom_path.read_text(encoding="utf-8")
         custom_css_block = f'<style id="wiki-custom">\n{custom_content}\n</style>'
@@ -1264,7 +1265,7 @@ def build_dashboard(
 
     # ── Wiki title from theme.json branding (optional) ─────────────────────
     title = "Wiki"
-    tj_path = corpus / ".wiki-dashboard" / "theme.json"
+    tj_path = _wiki_dashboard(corpus) / "theme.json"
     if tj_path.exists():
         try:
             tj = json.loads(tj_path.read_text(encoding="utf-8"))

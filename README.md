@@ -110,16 +110,71 @@ way afterward.
 
 | Command | What it does |
 |---|---|
-| `init <dir> --purpose "..."` | Scaffold a wiki and design a domain-fit schema (`<dir>/policy/schema.md`) from the stated purpose (and a sample of any staged `_inbox/` sources). `--plain` = generic scaffold, no LLM. `--no-sample-inbox` = design from `--purpose` alone. |
-| `ingest --wiki <dir>` | Drain `<dir>/_inbox/` into the wiki, synthesizing/updating pages and archiving each source on convergence. Flags: `--source <file>` (one file), `--max-cycles N`, `--keep-going`. |
+| `init <dir> --purpose "..."` | Scaffold a wiki and design a domain-fit schema (`<dir>/.wiki/policy/schema.md`) from the stated purpose (and a sample of any staged `_inbox/` sources). `--plain` = generic scaffold, no LLM. `--no-sample-inbox` = design from `--purpose` alone. |
+| `ingest --wiki <dir>` | Drain `<dir>/_inbox/` into the wiki, synthesizing/updating pages and moving each source to `<dir>/_sources/` on convergence. Flags: `--source <file>` (one file), `--max-cycles N`, `--keep-going`. |
 | `ask "<question>" --wiki <dir>` | Answer a question by reading the compiled wiki; cites pages used and refuses when the topic is absent. `--json` for structured output. |
 | `lint --wiki <dir>` | Run the structural validator (links, orphans, frontmatter, provenance). Exit 0 = PASS. |
 | `doctor [--wiki <dir>]` | Environment + (optional) wiki-structure diagnostics. Also prints resolved `@main` commits for all sources (your lock-file replacement). |
 | `update [--check]` | Refresh wiki-weaver to latest `@main`: reinstall the tool (Layer 1) and re-clone engine bundles (Layer 2). `--check`/`--dry-run` = report drift only, no changes. |
 | `build-dashboard <corpus> --out <file.html>` | Render a compiled wiki into one self-contained HTML dashboard (no LLM, no runtime). Flags: `--theme <file>`, `--group-by <field>` (default `type`), `--skip-index`. See [Dashboard](#dashboard). |
+| `migrate <corpus>` | Relocate an existing corpus to the new hidden-`.wiki/` layout (machine state under `.wiki/`, `_archive/` renamed to `_sources/`). Deterministic, no LLM. Flags: `--dry-run` (print the plan, change nothing), `--force` (re-run past the completion sentinel). See [Migrating an existing corpus](#migrating-an-existing-corpus). |
 
 > `query` exists but is a naive substring grep over page text — a minimal stub, **not** the
 > query surface. Use `ask` to query a wiki.
+
+## Corpus structure
+
+A wiki corpus separates **human-facing content** (lives at the corpus root) from **machine-only
+bookkeeping** (lives under a hidden `.wiki/` subtree). The compiled wiki pages and the source
+material stay browsable; the operational state stays out of the way.
+
+```
+mywiki/
+├── index.md, overview.md, *.md   the compiled wiki pages (human-visible)
+├── _inbox/                       drop zone — stage new source material here (human-visible)
+├── _sources/                     source digests, one per ingested source (human-visible; was _archive/)
+├── wiki.config.yaml              optional per-wiki knobs (human-visible)
+├── .obsidian/                    seeded Obsidian vault config (so the folder opens cleanly)
+└── .wiki/                        machine-only subtree (hidden) — never hand-edit
+    ├── .processed.jsonl          the ingest ledger
+    ├── .sources.json             the source registry
+    ├── policy/                   schema.md + any project policy overrides
+    ├── failed/                   sources that did not converge
+    ├── runs/                     per-run engine logs
+    ├── index/                    backlinks/links/tags/properties/aliases JSON
+    └── dashboard/                theme.json + custom.css for build-dashboard
+```
+
+Because `.wiki/` is a **dotfolder**, Obsidian (and most tooling) hides it automatically — it never
+shows up as phantom notes in the vault graph. `init` and `migrate` also seed a corpus `.gitignore`
+(so the machine state isn't committed as content) and a `.obsidian/` config, so the folder is
+ready to open as a vault.
+
+### Migrating an existing corpus
+
+Corpora created before the `.wiki/` layout keep their bookkeeping at the corpus root
+(`_archive/`, `.processed.jsonl`, `.runs/`, …). The `migrate` command relocates them in place:
+
+```bash
+wiki-weaver migrate mywiki --dry-run   # preview the plan, change nothing
+wiki-weaver migrate mywiki             # perform the migration
+```
+
+It is **idempotent** and **copy-before-delete**: every file is copied and verified before
+anything is removed, and the run records a completion sentinel so a second run is a no-op.
+
+**Pre-run checklist** (from an adversarial safety review — do not skip these):
+
+- **Back up `_sources/` first.** Migration is not a backup; the source digests are irreplaceable.
+- **Stop everything touching the corpus** — close Obsidian and any running
+  `wiki-weaver`/`repo-weaver` process. Migration locks against other migrations but **not**
+  against a concurrent `ingest`/`weave`.
+- **Do NOT run `weave`/`ingest` between upgrading and migrating.** Post-upgrade runs write to the
+  new `.wiki/runs/` and can block the migration's verify step.
+- **If the corpus is in a git repo,** expect a large rename/delete in `git status` — commit or
+  stash first.
+- Migration **safely aborts** (touching nothing) if the corpus's ledger paths don't match its
+  location — a sign the corpus was moved. If you see that abort, **don't `--force`**; investigate.
 
 ## Dashboard
 
@@ -142,7 +197,7 @@ properties, aliases), then renders. Flags:
 | Flag | Effect |
 |---|---|
 | `--out <file.html>` | Destination HTML file (required). |
-| `--theme <file>` | Path to a `theme.json` (overrides the corpus's own `.wiki-dashboard/theme.json`). |
+| `--theme <file>` | Path to a `theme.json` (overrides the corpus's own `.wiki/dashboard/theme.json`). |
 | `--group-by <field>` | Frontmatter field to group the sidebar nav by (default: `type`). |
 | `--skip-index` | Reuse the existing `.wiki/index/` files instead of rebuilding them. |
 
@@ -151,7 +206,7 @@ properties, aliases), then renders. Flags:
 The default look is **Almanac**: a warm-paper light theme plus an "Almanac Night" dark variant that
 switch automatically with the OS setting (`prefers-color-scheme` — there is no in-page toggle).
 
-To restyle without touching code, drop a `theme.json` in the corpus at `.wiki-dashboard/theme.json`
+To restyle without touching code, drop a `theme.json` in the corpus at `.wiki/dashboard/theme.json`
 (or point at one with `--theme`). It is a **flat JSON object of per-token overrides** keyed by the
 dashboard's `--wiki-*` CSS custom properties — colors (`--wiki-bg`, `--wiki-accent`, …), typography
 (`--wiki-font-reading`, `--wiki-font-size`, `--wiki-line-height`, …), and shape (`--wiki-radius`,
@@ -169,7 +224,7 @@ silently "corrected"). Keys prefixed with `_` are treated as private metadata.
 }
 ```
 
-For arbitrary CSS beyond the token set, add `.wiki-dashboard/custom.css` — it is appended **verbatim**
+For arbitrary CSS beyond the token set, add `.wiki/dashboard/custom.css` — it is appended **verbatim**
 (trusted: it's the wiki owner's own file, so it is not contrast-checked).
 
 > Theming is **tokens + an optional title only** today — there is no logo or richer branding support yet.
@@ -212,8 +267,9 @@ of interlinked markdown with a navigable `index.md` and `overview.md`. To share 
 - **Obsidian / any markdown editor:** open the wiki folder directly — `[[wikilinks]]` resolve.
 - **Static site:** point a static-site generator (MkDocs, Hugo, etc.) at the folder.
 
-(`_inbox/`, `_archive/`, `_failed/`, `.ai/`, `.runs/`, and the `.sources.json`/`.processed.jsonl`
-bookkeeping files are operational state, not published content.)
+(`_inbox/` and `_sources/`, plus the hidden `.wiki/` subtree — ledger, registry, `failed/`,
+`runs/`, `index/`, `policy/`, `dashboard/` — are operational state, not published content. See
+[Corpus structure](#corpus-structure).)
 
 ## Architecture
 

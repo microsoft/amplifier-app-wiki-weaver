@@ -449,7 +449,7 @@ def test_dashboard_enrichment_data_emitted(wiki: Path, tmp_path: Path) -> None:
 def test_theme_json_malformed_warns_and_builds(wiki: Path, tmp_path: Path) -> None:
     """A malformed theme.json emits a warning but the build still succeeds."""
     # Create a bad theme.json
-    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir = wiki / ".wiki" / "dashboard"
     theme_dir.mkdir(exist_ok=True)
     (theme_dir / "theme.json").write_text("NOT VALID JSON{{{", encoding="utf-8")
 
@@ -472,7 +472,7 @@ def test_theme_json_malformed_warns_and_builds(wiki: Path, tmp_path: Path) -> No
 
 def test_theme_json_unknown_key_warns(wiki: Path, tmp_path: Path) -> None:
     """Unknown keys in theme.json produce a warning."""
-    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir = wiki / ".wiki" / "dashboard"
     theme_dir.mkdir(exist_ok=True)
     (theme_dir / "theme.json").write_text(
         json.dumps({"--wiki-bg": "#EEEEEE", "--unknown-key": "red"}),
@@ -494,7 +494,7 @@ def test_theme_json_unknown_key_warns(wiki: Path, tmp_path: Path) -> None:
 
 def test_theme_json_low_contrast_warns(wiki: Path, tmp_path: Path) -> None:
     """A low-contrast text/background token pair in theme.json emits a loud warning."""
-    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir = wiki / ".wiki" / "dashboard"
     theme_dir.mkdir(exist_ok=True)
     # Black text on black background — contrast = 1.0 (WCAG AA requires 4.5)
     (theme_dir / "theme.json").write_text(
@@ -523,7 +523,7 @@ def test_theme_json_falsy_values_accepted(wiki: Path, tmp_path: Path) -> None:
 
     Spec §10: the token cascade must use explicit None-checks, not truthiness.
     """
-    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir = wiki / ".wiki" / "dashboard"
     theme_dir.mkdir(exist_ok=True)
     # 0 and "" are falsy but not None — they should survive as overrides
     # (In practice CSS custom properties with these values are degenerate,
@@ -552,7 +552,7 @@ def test_theme_json_falsy_values_accepted(wiki: Path, tmp_path: Path) -> None:
 
 def test_theme_json_none_value_skipped(wiki: Path, tmp_path: Path) -> None:
     """Explicit null (None) values in theme.json are skipped; default is used."""
-    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir = wiki / ".wiki" / "dashboard"
     theme_dir.mkdir(exist_ok=True)
     (theme_dir / "theme.json").write_text(
         json.dumps({"--wiki-bg": None}),  # null in JSON
@@ -576,7 +576,7 @@ def test_theme_json_title_no_unknown_warning(wiki: Path, tmp_path: Path) -> None
     dashboard heading.  It must be recognized (skipped silently), produce NO
     'unknown token' warning, and still render in the output.
     """
-    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir = wiki / ".wiki" / "dashboard"
     theme_dir.mkdir(exist_ok=True)
     (theme_dir / "theme.json").write_text(
         json.dumps({"title": "My Wiki Title", "--wiki-accent": "#3B5BDB"}),
@@ -645,7 +645,7 @@ def test_contrast_almanac_defaults_pass_wcag() -> None:
 
 def test_custom_css_appended_verbatim(wiki: Path, tmp_path: Path) -> None:
     """custom.css content is inlined verbatim (no sanitisation, trusted)."""
-    theme_dir = wiki / ".wiki-dashboard"
+    theme_dir = wiki / ".wiki" / "dashboard"
     theme_dir.mkdir(exist_ok=True)
     marker = "/* my-custom-theme-marker-xyz */"
     (theme_dir / "custom.css").write_text(marker, encoding="utf-8")

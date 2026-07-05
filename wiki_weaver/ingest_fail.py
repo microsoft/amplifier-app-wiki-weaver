@@ -39,10 +39,10 @@ def main() -> int:
         print(f"ERROR: wiki_dir not found: {wiki_dir}", file=sys.stderr)
         return 1
 
-    from wiki_weaver.lib import FAILED, _collision_safe_move
+    from wiki_weaver.lib import _collision_safe_move, wiki_failed
 
-    failed_dir = wiki_dir / FAILED
-    failed_dir.mkdir(exist_ok=True)
+    failed_dir = wiki_failed(wiki_dir)
+    failed_dir.mkdir(parents=True, exist_ok=True)
 
     if not source_path.is_file():
         # Already moved or never existed -- idempotent, not an error.

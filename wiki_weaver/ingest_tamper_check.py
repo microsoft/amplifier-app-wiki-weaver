@@ -6,7 +6,7 @@ _detect_and_undo_tamper from cli/lib.py, cleans up the snapshot file, and
 emits ONE JSON object to stdout.
 
 The tamper guard enforces the CLI-exclusive invariant: the ledger
-(.processed.jsonl) and the _archive/ directory are written ONLY by the CLI
+(.wiki/.processed.jsonl) and the _sources/ directory are written ONLY by the CLI
 (ingest_archive.py), NEVER by the LLM during synthesis.  If the LLM wrote
 either during synthesize.dot, _detect_and_undo_tamper undoes the damage and
 we fail loud by emitting {"tampered": "true"} (which the ingest.dot router
@@ -20,7 +20,7 @@ On tamper: undoes fabricated records, prints error to stderr,
 Usage:
     python <this_file> <wiki_dir> <snapshot_path>
 
-    wiki_dir       -- the wiki root (contains _archive/, .processed.jsonl, etc.)
+    wiki_dir       -- the wiki root (contains _sources/, .wiki/.processed.jsonl, etc.)
     snapshot_path  -- path to the before-snapshot JSON written by ingest_setup.py
                       (format: {"ledger_lines": int, "archive_files": [str, ...]})
 

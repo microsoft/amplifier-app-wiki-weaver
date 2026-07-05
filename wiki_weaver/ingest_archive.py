@@ -5,9 +5,9 @@ Called by the `archive` tool node in ingest.dot after synthesize.dot
 reports convergence (outcome=success). Performs the three deterministic
 process-state writes that are the CLI's exclusive job:
 
-  1. Move source from _inbox/ to _archive/ (collision-safe).
-  2. Append a ledger entry to .processed.jsonl.
-  3. Mark the source as ingested in .sources.json.
+  1. Move source from _inbox/ to _sources/ (collision-safe).
+  2. Append a ledger entry to .wiki/.processed.jsonl.
+  3. Mark the source as ingested in .wiki/.sources.json.
 
 Reuses the exact functions from cli/lib.py that the Python drain loop
 in cli/lib.py:ingest() uses -- no reimplementation.
@@ -15,7 +15,7 @@ in cli/lib.py:ingest() uses -- no reimplementation.
 Usage:
     python <this_file> <wiki_dir> <source_path> <source_id>
 
-    wiki_dir     -- the wiki root (contains _archive/, .processed.jsonl, etc.)
+    wiki_dir     -- the wiki root (contains _sources/, .wiki/.processed.jsonl, etc.)
     source_path  -- absolute path to the source file in _inbox/
     source_id    -- stable integer id previously assigned by ingest_setup.py
 
@@ -31,19 +31,21 @@ from pathlib import Path
 
 
 def _find_ingest_logs_dir(wiki_dir: Path) -> Path:
-    """Return the most-recent ingest-* run directory under <wiki>/.runs/.
+    """Return the most-recent ingest-* run directory under <wiki>/.wiki/runs/.
 
-    run_ingest() (engine_runner.py) creates ``<wiki>/.runs/ingest-YYYYMMDD-HHMMSS/``
+    run_ingest() (engine_runner.py) creates ``<wiki>/.wiki/runs/ingest-YYYYMMDD-HHMMSS/``
     and writes ``ingest.dot`` there *before* launching the engine, so this directory
     always exists by the time any tool node (including archive) fires.
 
     Raises RuntimeError loudly if no ingest-* directory is found -- ingest_archive
     must only be called from within an active run_ingest() pipeline.
     """
-    runs_dir = wiki_dir / ".runs"
+    from wiki_weaver.lib import wiki_runs as _wiki_runs
+
+    runs_dir = _wiki_runs(wiki_dir)
     if not runs_dir.is_dir():
         raise RuntimeError(
-            f"no .runs/ directory found under {wiki_dir}; "
+            f"no .wiki/runs/ directory found under {wiki_dir}; "
             "ingest_archive must be called from within a run_ingest() pipeline"
         )
     candidates = sorted(
@@ -75,7 +77,7 @@ def main() -> int:
         return 1
 
     # Determine the run-logs directory for this drain run.  run_ingest() creates
-    # <wiki>/.runs/ingest-YYYYMMDD-HHMMSS/ before launching the engine; that dir
+    # <wiki>/.wiki/runs/ingest-YYYYMMDD-HHMMSS/ before launching the engine; that dir
     # is the honest logs_dir for every source archived during this pipeline run.
     # Fail loud if it doesn't exist -- this script must not run outside a drain.
     try:
@@ -94,14 +96,14 @@ def main() -> int:
         return 1
 
     from wiki_weaver.lib import (
-        ARCHIVE,
         _append_ledger,
         _collision_safe_move,
         _mark_source_ingested,
         _source_hash,
+        wiki_sources,
     )
 
-    archive_dir = wiki_dir / ARCHIVE
+    archive_dir = wiki_sources(wiki_dir)
     archive_dir.mkdir(exist_ok=True)
 
     # Hash BEFORE moving so we can record it in the ledger even if the
@@ -110,12 +112,12 @@ def main() -> int:
         file_hash = _source_hash(source_path)
     else:
         # Source already moved (e.g. a retry after a partial run).
-        # Attempt to find it in _archive/ to retrieve its hash.
+        # Attempt to find it in _sources/ to retrieve its hash.
         candidate = archive_dir / source_path.name
         if candidate.is_file():
             file_hash = _source_hash(candidate)
             print(
-                f"NOTE: source already in _archive/ ({candidate.name}); "
+                f"NOTE: source already in _sources/ ({candidate.name}); "
                 "ledger + registry update only.",
                 file=sys.stderr,
             )
@@ -146,7 +148,7 @@ def main() -> int:
             )
             return 1
 
-    # Move source from _inbox/ to _archive/ (collision-safe rename).
+    # Move source from _inbox/ to _sources/ (collision-safe rename).
     dest = _collision_safe_move(source_path, archive_dir)
 
     # Append ledger entry (same schema as the Python drain loop in lib.py).
@@ -164,7 +166,7 @@ def main() -> int:
         },
     )
 
-    # Mark ingested in .sources.json registry.
+    # Mark ingested in .wiki/.sources.json registry.
     _mark_source_ingested(wiki_dir, file_hash)
 
     print(

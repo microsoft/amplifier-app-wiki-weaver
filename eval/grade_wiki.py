@@ -1084,7 +1084,11 @@ def grade_provenance(wiki: Path) -> GradeResult:
     """
     res = GradeResult("provenance-quality")
 
-    reg_path = wiki / REGISTRY_NAME
+    # Registry lives under .wiki/ in the new layout; fall back to corpus root for
+    # old-layout corpora (migration path).
+    reg_path = wiki / ".wiki" / REGISTRY_NAME
+    if not reg_path.is_file():
+        reg_path = wiki / REGISTRY_NAME  # pre-migration fallback
     if not reg_path.is_file():
         res.check(False, f"{REGISTRY_NAME} not found in wiki")
         return res
