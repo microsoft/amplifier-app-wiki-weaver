@@ -87,7 +87,7 @@ def _count_pending_changes(wiki_dir: Path, valid_ids: set[str]) -> dict[str, int
 
 def process_wiki(wiki: Path, apply: bool) -> None:
     sources_json = wiki / ".sources.json"
-    valid_ids, _ = _load_sources(sources_json)
+    valid_ids, _, _ = _load_sources(sources_json)
     if not valid_ids:
         print(f"  {wiki}: no .sources.json found — skipped")
         return
