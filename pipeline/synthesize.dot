@@ -19,6 +19,9 @@
 //                          a single freshly-ingested article)
 //   $normalize_cmd    -- link normalizer command (normalize_links.py $wiki_dir)
 //   $footnotes_cmd    -- footnote converter command (footnotes.py $wiki_dir)
+//   $normalize_unicode_cmd -- stray \uXXXX escape-artifact repair command
+//                          (normalize_unicode.py $wiki_dir; defense-in-depth
+//                          bridge for amplifier-support #306, see module docstring)
 //   $validate_cmd     -- structural validator command (validate_wiki.py $wiki_dir)
 //   $max_cycles       -- hard iteration bound (LLM-judged loops MUST be bounded)
 //
@@ -66,6 +69,23 @@ digraph synthesize {
         tool_command="$footnotes_cmd"
     ]
 
+    // NORMALIZE UNICODE (code, deterministic): repair stray \uXXXX JSON-escape
+    // artifacts left in prose (e.g. \u2014 where a real em-dash belongs).
+    // Defense-in-depth bridge for a latent amplifier-core bug
+    // (get_serialized_output uses ensure_ascii=True; a model can copy the
+    // escape it was shown verbatim into page content) -- amplifier-support
+    // #306. Code-fence- and inline-code-aware, allowlist-scoped so technical
+    // docs (Rust source, MCP configs) that legitimately contain \uXXXX in code
+    // are never touched. Runs last among the deterministic passes, right
+    // before validate, so the artifact never reaches a persisted page
+    // regardless of when the upstream core fix lands. Always exits 0
+    // (idempotent -- no backup in pipeline mode).
+    normalize_unicode [
+        shape=parallelogram,
+        label="Normalize Unicode Artifacts",
+        tool_command="$normalize_unicode_cmd"
+    ]
+
     // VALIDATE (code, deterministic): the Tier-1 structural graders.
     // Non-zero exit (broken links / missing frontmatter / orphans) forces the
     // loop back into the refine cycle via the validate -[fail]-> feedback edge
@@ -104,7 +124,8 @@ digraph synthesize {
     start -> ingest
     ingest -> normalize
     normalize -> footnotes
-    footnotes -> validate
+    footnotes -> normalize_unicode
+    normalize_unicode -> validate
 
     // VALIDATE routes BOTH outcomes explicitly. A tool node that exits non-zero
     // produces outcome=fail; the engine's fail-fast rule means it will ONLY

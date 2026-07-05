@@ -68,7 +68,12 @@ def main() -> int:
 
     # Import the library functions and engine constants lazily so
     # init/lint/doctor do not pay the cost of loading them.
-    from wiki_weaver.engine_runner import FOOTNOTES_PY, NORMALIZE_PY, VALIDATE_PY
+    from wiki_weaver.engine_runner import (
+        FOOTNOTES_PY,
+        NORMALIZE_PY,
+        NORMALIZE_UNICODE_PY,
+        VALIDATE_PY,
+    )
     from wiki_weaver.lib import (
         _assign_source_id,
         _looks_like_text,
@@ -126,6 +131,10 @@ def main() -> int:
         f"{shlex.quote(sys.executable)} {shlex.quote(str(FOOTNOTES_PY))}"
         f" {shlex.quote(str(wiki_dir))}"
     )
+    normalize_unicode_cmd = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(NORMALIZE_UNICODE_PY))}"
+        f" {shlex.quote(str(wiki_dir))}"
+    )
 
     # Fully-formed archive and fail commands, constructed with sys.executable
     # so they run in the same interpreter that launched this script.
@@ -177,6 +186,7 @@ def main() -> int:
         "max_cycles": str(policy.max_cycles),
         "normalize_cmd": normalize_cmd,
         "footnotes_cmd": footnotes_cmd,
+        "normalize_unicode_cmd": normalize_unicode_cmd,
         "validate_cmd": validate_cmd,
         "archive_cmd": archive_cmd,
         "fail_cmd": fail_cmd,

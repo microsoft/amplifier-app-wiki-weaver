@@ -62,6 +62,9 @@ SCHEMA_PATH = PIPELINE_DIR / "SCHEMA.md"
 VALIDATE_PY = PIPELINE_DIR / "validate_wiki.py"
 NORMALIZE_PY = PIPELINE_DIR / "normalize_links.py"
 FOOTNOTES_PY = PIPELINE_DIR / "footnotes.py"
+# normalize_unicode.py: repairs stray \uXXXX JSON-escape artifacts in prose
+# (defense-in-depth bridge for amplifier-support #306; see module docstring).
+NORMALIZE_UNICODE_PY = PIPELINE_DIR / "normalize_unicode.py"
 # RESERVED FOR EVAL GRADING ONLY. The scenario rubric grades the WHOLE finished
 # corpus wiki (all sources, the A/B test). It is the WRONG bar for the inner
 # per-source loop: a single freshly-ingested article can never satisfy
@@ -300,6 +303,7 @@ def build_dot(
 
     normalize_cmd = f"{sys.executable} {NORMALIZE_PY} {wiki_dir}"
     footnotes_cmd = f"{sys.executable} {FOOTNOTES_PY} {wiki_dir}"
+    normalize_unicode_cmd = f"{sys.executable} {NORMALIZE_UNICODE_PY} {wiki_dir}"
 
     substitutions = {
         "$source_path": str(source_path),
@@ -316,6 +320,7 @@ def build_dot(
         "$rubric_path": str(RUBRIC_PATH),
         "$normalize_cmd": normalize_cmd,
         "$footnotes_cmd": footnotes_cmd,
+        "$normalize_unicode_cmd": normalize_unicode_cmd,
         "$validate_cmd": validate_cmd,
         "$max_cycles": str(policy.max_cycles),
         "$source_id": str(source_id),
