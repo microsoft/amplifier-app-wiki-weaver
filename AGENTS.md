@@ -34,14 +34,14 @@ sentinel.
 
 Commands are **thin lib wrappers over attractor `.dot` pipelines**:
 
-- `cli/wiki_weaver.py` — argparse front end (dispatch only).
-- `cli/lib.py` — importable concept-level functions; owns the outer corpus sweep and all
+- `wiki_weaver/cli.py` — argparse front end (dispatch only).
+- `wiki_weaver/lib.py` — importable concept-level functions; owns the outer corpus sweep and all
   process state (the `.wiki/.processed.jsonl` ledger + `_sources/`), written by code *only* on real
   convergence (a deterministic tamper guard reverts agent-written process state and fails loud).
-- `cli/engine_runner.py` — runs the inner pipelines on the attractor engine. The `.dot` files
+- `wiki_weaver/engine_runner.py` — runs the inner pipelines on the attractor engine. The `.dot` files
   are `$token` templates; `build_*_from_file()` fills them with concrete paths/prompts before
   execution. The `.dot` files are **not** drop-in standalone.
-- `cli/policy.py` — resolves per-wiki schema/rubric/model overrides (`<wiki>/.wiki/policy/…`).
+- `wiki_weaver/policy.py` — resolves per-wiki schema/rubric/model overrides (`<wiki>/.wiki/policy/…`).
 
 **Deterministic dashboard layer** (no engine, no LLM, no Amplifier runtime — pure stdlib + `tinycss2`
 + `markdown`):
