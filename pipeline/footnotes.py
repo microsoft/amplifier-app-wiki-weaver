@@ -9,7 +9,8 @@ Public API:
         IN-PLACE. Idempotent. No backup created.
 
 Algorithm:
-    1. Load valid source ids from <wiki>/.sources.json (id -> filename map).
+    1. Load valid source ids from <wiki>/.sources.json (id -> filename map,
+       plus id -> provenance map when the registry entry carries author/url/date).
     2. Pass 1 – convert each page:
        a. Convert inline [N] (valid id, not in code fences/inline code, not
           already [^N], not a markdown link [N](...), not inside [[...]]) → [^N].
@@ -83,20 +84,32 @@ _FM_SOURCES = re.compile(r"^(sources:\s*\[)([^\]]*)\]")
 # ---------------------------------------------------------------------------
 
 
-def _load_sources(sources_json: Path) -> tuple[set[str], dict[str, str]]:
-    """Load valid source ids and id->filename map from .sources.json.
+def _load_sources(
+    sources_json: Path,
+) -> tuple[set[str], dict[str, str], dict[str, dict[str, str]]]:
+    """Load valid source ids, id->filename map, and id->provenance map.
 
-    Returns (valid_ids, id_to_filename).  Both empty if the file is absent or
-    unparseable — caller handles this gracefully.
+    The registry (`<wiki>/.sources.json`) captures `author`/`url`/`date` per
+    source when the original source had that metadata (see
+    `wiki_weaver/lib.py::_assign_source_id`). This loader surfaces those
+    fields alongside id/filename so citation rendering can use real
+    provenance instead of only a de-slugged filename.
+
+    Returns (valid_ids, id_to_filename, id_to_provenance). `id_to_provenance`
+    maps id -> {"author": ..., "url": ..., "date": ...} containing ONLY the
+    fields present for that source (missing fields are omitted, never
+    fabricated as empty strings). All three are empty if the file is absent
+    or unparseable — caller handles this gracefully.
     """
     if not sources_json.is_file():
-        return set(), {}
+        return set(), {}, {}
     try:
         data = json.loads(sources_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return set(), {}
+        return set(), {}, {}
     valid_ids: set[str] = set()
     id_to_filename: dict[str, str] = {}
+    id_to_provenance: dict[str, dict[str, str]] = {}
     for src in data.get("sources", []):
         nid = str(src.get("id", ""))
         if nid:
@@ -104,7 +117,10 @@ def _load_sources(sources_json: Path) -> tuple[set[str], dict[str, str]]:
             fname = src.get("filename", "")
             if fname:
                 id_to_filename[nid] = fname
-    return valid_ids, id_to_filename
+            provenance = {k: src[k] for k in ("author", "url", "date") if src.get(k)}
+            if provenance:
+                id_to_provenance[nid] = provenance
+    return valid_ids, id_to_filename, id_to_provenance
 
 
 def _filename_to_title(filename: str) -> str:
@@ -329,10 +345,55 @@ def _convert_page_format(
     return True, refs_converted, defs_converted
 
 
+def _render_provenance_def(
+    nid: str,
+    id_to_filename: dict[str, str],
+    id_to_provenance: dict[str, dict[str, str]],
+) -> str:
+    """Render a footnote-definition fallback for a source with no harvested def.
+
+    Priority: use the registry's captured `author`/`url`/`date` (when present)
+    to render a citation matching the corpus's own harvested style, e.g.
+    ``Author — "Title" — https://...`` (see real `## Sources` bullets already
+    written by the LLM across the corpus). Degrades gracefully as fields are
+    missing, and when NEITHER author nor url is available, returns EXACTLY
+    the prior fallback (de-slugged filename, unquoted, no attribution) — a
+    regression guard, not a new behavior.
+
+    Never fabricates a field: an absent author/url/date is simply omitted,
+    never rendered as an empty placeholder or dangling punctuation.
+    """
+    fname = id_to_filename.get(nid, "")
+    title = _filename_to_title(fname) if fname else f"Source {nid}"
+
+    prov = id_to_provenance.get(nid, {})
+    author = prov.get("author")
+    url = prov.get("url")
+    date = prov.get("date")
+
+    if not author and not url:
+        # No provenance captured for this source — exact prior behavior.
+        return title
+
+    quoted_title = f'"{title}"'
+    if author and url:
+        text = f"{author} — {quoted_title} — {url}"
+    elif author:
+        text = f"{author} — {quoted_title}"
+    else:  # url only
+        text = f"{quoted_title} — {url}"
+
+    if date:
+        text = f"{text} ({date})"
+
+    return text
+
+
 def _backfill_page_defs(
     page: Path,
     valid_ids: set[str],
     id_to_filename: dict[str, str],
+    id_to_provenance: dict[str, dict[str, str]],
     harvest: dict[str, str],
 ) -> tuple[bool, int]:
     """Pass 2: backfill missing [^N]: defs and sort/dedupe the Sources section.
@@ -386,8 +447,7 @@ def _backfill_page_defs(
         if nid in harvest:
             def_map[nid] = harvest[nid]
         else:
-            fname = id_to_filename.get(nid, "")
-            def_map[nid] = _filename_to_title(fname) if fname else f"Source {nid}"
+            def_map[nid] = _render_provenance_def(nid, id_to_filename, id_to_provenance)
 
     if not def_map:
         return False, 0
@@ -462,7 +522,7 @@ def footnote_citations(wiki_dir: Path | str) -> dict[str, int]:
     wiki_dir = Path(wiki_dir)
     sources_json = wiki_dir / ".sources.json"
 
-    valid_ids, id_to_filename = _load_sources(sources_json)
+    valid_ids, id_to_filename, id_to_provenance = _load_sources(sources_json)
     if not valid_ids:
         return {
             "pages_changed": 0,
@@ -492,7 +552,7 @@ def footnote_citations(wiki_dir: Path | str) -> dict[str, int]:
     total_backfilled = 0
     for page in non_index:
         changed, backfilled = _backfill_page_defs(
-            page, valid_ids, id_to_filename, harvest
+            page, valid_ids, id_to_filename, id_to_provenance, harvest
         )
         if changed:
             p2_changed.add(page)

@@ -1066,10 +1066,15 @@ def grade_overview(wiki: Path, judge_fn=None) -> GradeResult:
 def grade_provenance(wiki: Path) -> GradeResult:
     """Grade whether the source registry carries rich provenance (author + url).
 
-    The pipeline currently stores only ``id``, ``filename``, and ``hash`` in
-    ``.sources.json``.  Citation ``[N]`` therefore resolves to a filename, not
-    a URL, author, or date.  Rich provenance means each entry also carries
-    ``author`` and ``url`` (or ``source``).
+    The pipeline captures ``author``, ``url``, and ``date`` per source (in
+    addition to ``id``, ``filename``, and ``hash``) in ``.sources.json`` when
+    the original source had that metadata (see
+    ``wiki_weaver/lib.py::_assign_source_id``); ``pipeline/footnotes.py``
+    renders it into citation ``[N]`` footnote defs when present, falling back
+    to a de-slugged filename only when neither author nor url was captured.
+    Coverage varies by corpus -- e.g. Medium exports rarely carry ``date``.
+    Rich provenance means each entry also carries ``author`` and ``url`` (or
+    ``source``).
 
     Hard gate (deterministic, no LLM, no network):
         PR1  pct_sources_with_author_and_url >= PROVENANCE_MIN_PCT (0.80)
