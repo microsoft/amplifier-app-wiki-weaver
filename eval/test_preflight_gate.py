@@ -21,7 +21,7 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from wiki_weaver.lib import preflight  # noqa: E402
-from wiki_weaver.cli import cmd_ingest, cmd_query  # noqa: E402
+from wiki_weaver.cli import cmd_ingest  # noqa: E402
 
 # The "env is clean -> preflight returns []" assertion only holds in a fully
 # provisioned dev environment. CI is deliberately lightweight (no Amplifier runtime,
@@ -85,12 +85,3 @@ def test_cmd_ingest_gates_before_engine(monkeypatch, tmp_path, capsys) -> None:
     out = capsys.readouterr().out
     assert "ANTHROPIC_API_KEY is not set" in out
     assert "wiki-weaver doctor" in out
-
-
-def test_cmd_query_not_gated(monkeypatch, tmp_path) -> None:
-    """query is a pure substring grep -- it must work offline with no key."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    (tmp_path / "page.md").write_text("alpha gamma\n", encoding="utf-8")
-
-    args = argparse.Namespace(wiki=str(tmp_path), term="gamma")
-    assert cmd_query(args) == 0

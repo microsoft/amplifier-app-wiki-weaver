@@ -12,8 +12,8 @@ Each user command is an attractor `.dot` pipeline in `pipeline/`, run via the CL
 - `ask` (`ask.dot`) — answer a question by reading the compiled wiki, with citations.
 - `lint` (`lint.dot`) — deterministic structural validation (no LLM).
 
-`doctor` (env diagnostics) and `query` (a naive substring-grep stub — not the query surface;
-use `ask`) round out the CLI.
+`doctor` (env diagnostics) rounds out the CLI. `ask` is the single answer interface — there is
+no separate `query` command.
 
 `build-dashboard <corpus> --out <file.html>` is a **deterministic** command (no LLM, no Amplifier
 runtime): it builds the corpus indexes, then renders a self-contained HTML dashboard. It is the first

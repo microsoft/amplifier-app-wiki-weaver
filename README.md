@@ -119,8 +119,7 @@ way afterward.
 | `build-dashboard <corpus> --out <file.html>` | Render a compiled wiki into one self-contained HTML dashboard (no LLM, no runtime). Flags: `--theme <file>`, `--group-by <field>` (default `type`), `--skip-index`. See [Dashboard](#dashboard). |
 | `migrate <corpus>` | Relocate an existing corpus to the new hidden-`.wiki/` layout (machine state under `.wiki/`, `_archive/` renamed to `_sources/`). Deterministic, no LLM. Flags: `--dry-run` (print the plan, change nothing), `--force` (re-run past the completion sentinel). See [Migrating an existing corpus](#migrating-an-existing-corpus). |
 
-> `query` exists but is a naive substring grep over page text — a minimal stub, **not** the
-> query surface. Use `ask` to query a wiki.
+`ask` is the single answer interface for a wiki — there is no separate `query` command.
 
 ## Corpus structure
 

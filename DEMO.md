@@ -78,4 +78,4 @@ corpus, so it **scales** as the wiki grows. Full design: `docs/`.
   passes through unchanged.  Fail-loud: if the family can't be resolved, the run stops with
   a clear error rather than silently using a stale hardcoded id.  (The `feedback` nodes use
   `haiku` by default; see `wiki.config.yaml` `models:` to override per stage.)
-- `query` is a naive substring-grep stub — use `ask` to query a wiki.
+- `ask` is the single answer interface for a wiki — there is no separate `query` command.

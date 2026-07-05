@@ -31,7 +31,7 @@ The system splits along the classic Amplifier seam: a **bundle is configuration*
 | | the `wiki-weaver` **bundle** (capability) | `amplifier-app-wiki-weaver` (this repo, the product) |
 |---|---|---|
 | **Role** | The reusable **capability** | The **product / delivery vehicle** |
-| **Owns** | DOT pipelines, ingest/query/lint/ask logic, `AmplifierSession` wiring, the CLI (incl. `doctor`) | Watch-daemon, web UI, LAN service API, service install, config/state lifecycle |
+| **Owns** | DOT pipelines, ingest/lint/ask logic, `AmplifierSession` wiring, the CLI (incl. `doctor`) | Watch-daemon, web UI, LAN service API, service install, config/state lifecycle |
 | **Relationship** | Consumed by app-cli and others | Embeds `AmplifierSession`, **consumes** the bundle |
 | **Status** | Home of Phase 0/1 work — **active** | **Parked (Phase 3)** — document the boundary, not the build |
 

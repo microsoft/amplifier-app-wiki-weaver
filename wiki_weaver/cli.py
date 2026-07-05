@@ -10,7 +10,6 @@ Subcommands:
     lint   [--wiki]            run the structural validator
     doctor                     environment diagnostics
     update [--check]           refresh @main sources to latest
-    query  [--wiki] <q>        (stub) list pages matching a term
     ask    <question> [--wiki] answer a question by reading the compiled wiki
     build-dashboard <corpus>   build a self-contained HTML dashboard
     migrate <corpus>           relocate an old-layout corpus to the .wiki/ layout
@@ -41,7 +40,6 @@ from wiki_weaver.lib import (
     lint,
     migrate,
     preflight,
-    query,
     update,
 )
 
@@ -61,7 +59,6 @@ __all__ = [
     "lint",
     "doctor",
     "update",
-    "query",
     "ask",
     "migrate",
 ]
@@ -136,12 +133,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_update(args: argparse.Namespace) -> int:
     return update(check_only=args.check)
-
-
-def cmd_query(args: argparse.Namespace) -> int:
-    # query is a pure substring grep over the compiled wiki -- no engine, no
-    # foundation, no key. Deliberately NOT gated so it works fully offline.
-    return query(args.wiki, args.term)
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
@@ -299,13 +290,6 @@ def main() -> None:
         help="alias for --check",
     )
 
-    p_query = sub.add_parser(
-        "query",
-        help="naive substring page search; for real cited answers use 'ask'",
-    )
-    p_query.add_argument("term")
-    p_query.add_argument("--wiki", default=".", help="wiki directory (default: .)")
-
     p_ask = sub.add_parser(
         "ask", help="answer a question by reading the compiled wiki (no embeddings)"
     )
@@ -389,7 +373,6 @@ def main() -> None:
         "lint": cmd_lint,
         "doctor": cmd_doctor,
         "update": cmd_update,
-        "query": cmd_query,
         "ask": cmd_ask,
         "build-dashboard": cmd_build_dashboard,
         "migrate": cmd_migrate,

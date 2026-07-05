@@ -51,7 +51,7 @@ Investigation (file:line) shows the generic corpus machinery **already lives in 
 | Pipeline | `build-dashboard.dot` |
 | Resolver action label | "Build Dashboard" |
 
-Rationale: wiki-weaver's commands are flat verbs (`ingest`, `lint`, `query`, `ask`); a flat verb fits the cadence. (Noun-group `dashboard build` is the alternative if more artifact subcommands appear; flat verb is cleaner today.)
+Rationale: wiki-weaver's commands are flat verbs (`ingest`, `lint`, `ask`); a flat verb fits the cadence. (Noun-group `dashboard build` is the alternative if more artifact subcommands appear; flat verb is cleaner today.)
 
 ---
 
