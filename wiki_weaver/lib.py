@@ -11,7 +11,6 @@ init(wiki_dir)                      scaffold a fresh wiki
 ingest(wiki, *, source, ...)        integrate inbox sources via the engine
 lint(wiki)                          run the structural validator
 doctor(*, wiki)                     environment diagnostics
-query(wiki, term)                   list pages matching a term (stub)
 ask(wiki, question, *, json_out)    answer a question from the compiled wiki
 
 All functions print their own output (unchanged from the original cmd_*
@@ -1523,28 +1522,6 @@ def _update_real(update_l1_fn, update_l2_fn) -> int:  # type: ignore[no-untyped-
         _fail("Update completed with errors (see above).")
         print("  Run `wiki-weaver doctor` for diagnostics.")
     return 0 if overall_ok else 1
-
-
-# ---------------------------------------------------------------------------
-# query (minimal stub)
-# ---------------------------------------------------------------------------
-
-
-def query(wiki: str | Path, term: str) -> int:
-    """List pages in ``wiki`` that contain ``term`` (case-insensitive stub)."""
-    wiki_path = Path(wiki).resolve()
-    if not wiki_path.is_dir():
-        _fail(f"wiki dir not found: {wiki_path}")
-        return 1
-    term_lower = term.lower()
-    hits = 0
-    for page in sorted(wiki_path.glob("*.md")):
-        text = page.read_text(encoding="utf-8", errors="replace")
-        if term_lower in text.lower():
-            print(f"  {page.name}")
-            hits += 1
-    print(f"\n{hits} page(s) match {term!r} (query is a minimal stub)")
-    return 0
 
 
 # ---------------------------------------------------------------------------
