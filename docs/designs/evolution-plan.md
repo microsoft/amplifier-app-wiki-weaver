@@ -1,6 +1,7 @@
 # Wiki-Weaver Evolution Plan
 
-> **LIVING DOCUMENT** — last negotiated 2026-06-13. This captures decisions we have
+> **LIVING DOCUMENT** — last negotiated 2026-06-13; last trued-up 2026-07-05
+> (see **Appendix B: Cycle true-up**). This captures decisions we have
 > already made and is meant to be redlined. Sections marked **DRAFT — redline me** are
 > explicitly open for the user to change. Everything else is established; if you want to
 > change it, edit it here first, then we execute against it.
@@ -96,8 +97,8 @@ These frozen states are the measuring sticks. Do not overwrite them — they are
 
 | # | Item | Gate / criteria | Calibrated to FAIL against | Proof |
 |---|---|---|---|---|
-| **2** | **overview.md as a synthesized map** | `overview.md` is a navigational map (themes → hub pages + orienting prose), NOT a per-source thread log. Grader **must stop skipping** overview/index pages. | current `runs/corpus/wiki/overview.md` (concatenated thread log) | overview grader FAIL→PASS on same corpus + `proof-rag-v2` held-out |
-| **3** | **Deepen provenance** | Every `[N]` resolves to real **author + source URL + date** (not just a filename); citations carry it. | registry (`.sources.json`) already captures `author`/`url`/`date` per source when present (~601/746 in the frozen corpus have author+url; `date` is sparse — mostly absent from Medium exports); the gap was the **citation renderer** (`pipeline/footnotes.py`) discarding those fields and falling back to a de-slugged filename — now fixed (author+url render into the footnote def; `date` deferred, blocked upstream by sparse source data) | provenance grader FAIL→PASS; spot-check `[8]` → real URL/author/date |
+| **2** | **overview.md as a synthesized map** — grader **DONE**; re-weave **REMAINING** (see Appendix B) | `overview.md` is a navigational map (themes → hub pages + orienting prose), NOT a per-source thread log. `grade_overview()` exists, is deterministic/calibrated, and **stops skipping** overview/index pages. | current `runs/corpus/wiki/overview.md` (concatenated thread log) — grader correctly **FAILs** it (≈399 per-source-narration openers vs threshold ≤2) | overview grader FAIL→PASS on same corpus + `proof-rag-v2` held-out — **NOT yet achieved**: needs a dedicated whole-overview re-weave step + a corpus re-ingest |
+| **3** | **Deepen provenance** — author+url **DONE** (PR #25, `main` @ `0ba193d`; see Appendix B) | Every `[N]` resolves to real **author + source URL + date** (not just a filename); citations carry it. | registry (`.sources.json`) already captures `author`/`url`/`date` per source when present (~601/746 in the frozen corpus have author+url; `date` is sparse — mostly absent from Medium exports); the gap was the **citation renderer** (`pipeline/footnotes.py`) discarding those fields and falling back to a de-slugged filename — now fixed (author+url render into the footnote def; `date` deferred, blocked upstream by sparse source data) | provenance grader FAIL→PASS; spot-check `[8]` → real URL/author/date |
 | **1** | **ask/query layer + answer-quality eval** | Given a question, the wiki answers **grounded + cited + correct**, and **fails loud when the answer is absent** (no confabulation). **Better / more trustworthy than naive RAG** (synthesis + reliable refusal); cost/latency **comparable at this scale** (cheaper-at-scale untested). | a query harness over the current wiki (stub returns filename greps → FAILs grounded/cited/correct) | answer-quality eval FAIL→PASS; A/B vs RAG: **wiki-wins 6, raw-wins 0, tie 2, contested 1, never lost** (see "A/B results" below); absent-answer → loud "not in corpus" |
 | **4** | **Consolidation / holistic re-weave** | A periodic whole-corpus pass re-weaves hub pages across *all* sources and **guarantees no claim loss** (completeness guard). | current per-source-only healing (never re-weaves the whole corpus) | consolidation eval: hub integration ↑, completeness = 0 dropped claims, FAIL→PASS |
 | **5** | **Schema externalization** | Schema/validator/prompts are **project-supplied policy**, not hardcoded. Mechanism (engine) / policy (schema) split. | current hardcoded `SCHEMA.md` + validator + prompts | run an unmodified pipeline on a **2nd corpus** with a different supplied schema; both converge clean |
@@ -320,3 +321,48 @@ rejection**.
 - Full 748 corpus run STOPPED at 144 converged pages → frozen as `runs/corpus/wiki`
   (resume in Phase E).
 - Phase A is the next execution step: graders first, calibrated to FAIL the frozen corpus.
+
+---
+
+## Appendix B: Cycle true-up (2026-07-05)
+
+Execution cycle after the 2026-06-13 negotiation. Records what actually shipped to
+`microsoft/amplifier-app-wiki-weaver` `main` (@ `0ba193d`) and corrects now-stale roadmap
+claims. Detail lives in the gate table (Section 4); this is the cross-cutting summary.
+
+**Item 3 (provenance) — author + URL DONE (PR #25).** Footnote `[^N]:` definitions now render
+`Author — "Title" — URL` from `.sources.json` (which already captured `author`/`url`/`date`; the
+renderer had been discarding them and falling back to a de-slugged filename). ~601/746
+frozen-corpus sources are enriched. `date` stays **DEFERRED** — sparse upstream (Medium exports
+carry no `date:` frontmatter), tied to acquisition (Item 6). The 145/746 sources lacking
+author/url are an upstream frontmatter-coverage gap, not a renderer issue. (The stale claim that
+`.sources.json` holds only `{id, filename, hash}` was already corrected in the Section-4 row.)
+
+**Item 2 (synthesized overview) — grader DONE, re-weave REMAINING.** `grade_overview()` exists, is
+deterministic/calibrated, and correctly **FAILs** the frozen corpus (≈399 per-source-narration
+openers vs threshold ≤2). What's left is the actual **re-weave**: the synthesize prompt already
+demands a thematic map, but the LLM writer emits a per-source thread-log at corpus scale. Closing
+FAIL→PASS needs a dedicated whole-overview synthesis/re-weave step **plus a corpus re-ingest to
+prove it** — the next major item, not a cheap formatting change.
+
+**Decision — engine choice: KEEP wiki-weaver.** The frozen 6-cell bakeoff (both engines × 3
+corpora) showed wiki QUALITY was a **TIE**: both accurate, both correctly refused the absent-topic
+probes (0 hallucination), 0 broken links. wiki-weaver is ~3× faster with a tighter reader-oriented
+artifact, so it stays the engine. **Caveat (prevents re-misreading the bakeoff): the two signals
+that appeared to favor the attractor weaver were HARNESS BUGS, not real quality** — (a) the
+attractor's "lint FAIL on all 3 corpora" was a `verify.sh` wrong-cwd bug (its own verify is clean:
+37/55/36 pages); (b) the blind-grade tiebreaker fed the attractor's `ask` answers wrapped in its
+raw pipeline-run envelope. The attractor was **not** beaten on wiki quality.
+
+**Dependency — literal `\uXXXX` artifacts → amplifier-core (support #306).** The `\uXXXX` (e.g.
+em-dash) escapes leaking into pages were root-caused to amplifier-core `get_serialized_output`
+calling `json.dumps(ensure_ascii=True)` — it ASCII-escapes non-ASCII in tool results the model
+reads, and the model copies the escape. Filed as **amplifier-support #306**. wiki-weaver ships a
+bridge mitigation (**PR #20**, `pipeline/normalize_unicode.py`, wired `footnotes →
+normalize_unicode → validate`) that becomes a harmless no-op once #306 lands.
+
+**Open decision (unresolved) — provenance grader: coverage vs render.** The provenance grader
+currently measures registry **COVERAGE** (80.6% ≥ 80% → passes) rather than citation **RENDER**, so
+it does **not** verify the author+URL rendering shipped in #25. Open question: retune it to assert
+rendered `[^N]:` defs carry author+URL (calibrated to fail the old filename behavior)? **Left
+undecided — redline me.**
