@@ -1010,7 +1010,32 @@ def ingest(
             f"{RED}   review these, fix, and re-drop into _inbox/ to retry,"
             f" or remove them.{RESET}"
         )
-    return 1 if failed_items else 0
+
+    # ---------------------------------------------------------------------- #
+    # Item 2 (overview re-weave): runs ONCE HERE, after the ENTIRE _inbox/    #
+    # drain has completed -- never per source. grade_overview() is free and  #
+    # deterministic; a re-weave LLM call only happens when overview.md has   #
+    # actually degraded into a per-source narration log. Bounded retries;    #
+    # fails loud (never silently reports success on a still-failing gate).   #
+    # See wiki_weaver/reweave.py for the mechanism + cost-bounded design.    #
+    # ---------------------------------------------------------------------- #
+    from wiki_weaver.reweave import reweave_overview_if_needed
+
+    reweave_result = reweave_overview_if_needed(wiki)
+    if reweave_result.attempts:
+        if reweave_result.final_passed:
+            _ok(
+                f"overview.md re-woven into a synthesized map "
+                f"({reweave_result.attempts} attempt(s))"
+            )
+        else:
+            _fail(
+                f"overview.md still fails grade_overview() after "
+                f"{reweave_result.attempts} re-weave attempt(s):\n"
+                f"{reweave_result.final_report}"
+            )
+
+    return 1 if failed_items or not reweave_result.final_passed else 0
 
 
 # ---------------------------------------------------------------------------
