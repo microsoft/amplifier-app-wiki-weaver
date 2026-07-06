@@ -1,9 +1,9 @@
 {
   "sources": [
-    {"id": 1, "filename": "article-one.md",   "hash": "abc1234567890abc"},
-    {"id": 2, "filename": "article-two.md",   "hash": "def4567890defdef"},
-    {"id": 3, "filename": "article-three.md", "hash": "ghi7890abcghi789"},
-    {"id": 4, "filename": "article-four.md",  "hash": "jkl0123456jkl012"},
-    {"id": 5, "filename": "article-five.md",  "hash": "mno3456789mno345"}
+    {"id": 1, "filename": "article-one.md",   "hash": "abc1234567890abc", "author": "Author One",   "url": "https://example.com/one"},
+    {"id": 2, "filename": "article-two.md",   "hash": "def4567890defdef", "author": "Author Two",   "url": "https://example.com/two"},
+    {"id": 3, "filename": "article-three.md", "hash": "ghi7890abcghi789", "author": "Author Three", "url": "https://example.com/three"},
+    {"id": 4, "filename": "article-four.md",  "hash": "jkl0123456jkl012", "author": "Author Four",  "url": "https://example.com/four"},
+    {"id": 5, "filename": "article-five.md",  "hash": "mno3456789mno345", "author": "Author Five",  "url": "https://example.com/five"}
   ]
 }
