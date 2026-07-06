@@ -1062,27 +1062,74 @@ def grade_overview(wiki: Path, judge_fn=None) -> GradeResult:
 # Provenance-quality grader
 # ---------------------------------------------------------------------------
 
+# Matches a footnote definition line anchored at start: `[^N]: text` (same
+# shape produced by pipeline/footnotes.py's `_FOOTNOTE_DEF`; duplicated here
+# rather than imported since it's a one-line regex, not shared logic).
+_FOOTNOTE_DEF_LINE = re.compile(r"^\[\^(\d+)\]:\s*(.*)")
+
+
+def _collect_rendered_footnote_defs(wiki: Path) -> dict[str, list[str]]:
+    """Scan every compiled ``.md`` page under ``wiki`` for ``[^N]:`` defs.
+
+    Returns id (str) -> list of def TEXT (everything after ``[^N]: ``),
+    one entry per occurrence across all pages (a source cited on multiple
+    pages yields multiple entries for the same id). Used to verify what a
+    reader actually SEES for a citation, as opposed to what the registry
+    merely captured.
+    """
+    defs_by_id: dict[str, list[str]] = {}
+    for page in sorted(wiki.glob("*.md")):
+        try:
+            text = page.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = _FOOTNOTE_DEF_LINE.match(line)
+            if m:
+                defs_by_id.setdefault(m.group(1), []).append(m.group(2))
+    return defs_by_id
+
 
 def grade_provenance(wiki: Path) -> GradeResult:
-    """Grade whether the source registry carries rich provenance (author + url).
+    """Grade whether citations a READER SEES actually render captured provenance.
 
     The pipeline captures ``author``, ``url``, and ``date`` per source (in
     addition to ``id``, ``filename``, and ``hash``) in ``.sources.json`` when
     the original source had that metadata (see
-    ``wiki_weaver/lib.py::_assign_source_id``); ``pipeline/footnotes.py``
-    renders it into citation ``[N]`` footnote defs when present, falling back
-    to a de-slugged filename only when neither author nor url was captured.
-    Coverage varies by corpus -- e.g. Medium exports rarely carry ``date``.
-    Rich provenance means each entry also carries ``author`` and ``url`` (or
-    ``source``).
+    ``wiki_weaver/lib.py::_assign_source_id``). ``pipeline/footnotes.py``
+    (`_render_provenance_def`, shipped in PR #25) renders that captured data
+    into citation ``[^N]:`` footnote defs -- e.g. ``Author -- "Title" --
+    https://...`` -- falling back to a bare de-slugged filename only when
+    neither author nor url was captured. Coverage varies by corpus -- e.g.
+    Medium exports rarely carry ``date``.
+
+    Prior to PR #25 the registry already captured author/url but the
+    renderer discarded it, so every citation rendered as a bare filename
+    regardless of registry coverage -- registry coverage alone could not
+    have caught that regression. This grader now checks the OUTPUT a reader
+    sees, not just registry presence (see evolution-plan.md Appendix B).
 
     Hard gate (deterministic, no LLM, no network):
-        PR1  pct_sources_with_author_and_url >= PROVENANCE_MIN_PCT (0.80)
+        PR1  pct_citations_rendered_with_provenance >= PROVENANCE_MIN_PCT (0.80)
+
+        For every registry source that has a ``url`` (or ``source``) field,
+        checks whether that literal url string appears in a rendered
+        ``[^N]:`` footnote def for that source's id anywhere in the wiki's
+        compiled ``.md`` pages. This is a strong, cheap, deterministic
+        signal: it would have correctly FAILed the pre-#25 filename-only
+        rendering, and PASSes when the render path is intact.
+
+        Fallback: if the registry has NO sources with a captured url at all
+        (e.g. a registry-only fixture with no compiled pages yet -- the
+        render check has nothing to verify), the gate falls back to the
+        prior registry-coverage metric (pct_sources_with_author_and_url).
+        This fallback is reported explicitly in notes, never silent.
 
     Diagnostics (reported but NOT gated):
-        pct_with_date          fraction of entries that carry a ``date`` field
-        total_sources          total source count in registry
-        missing_author_url     count of entries without both author + url
+        pct_sources_with_author_and_url   registry-coverage metric (secondary)
+        pct_with_date                     fraction of entries with a ``date``
+        total_sources                     total source count in registry
+        missing_author_url                entries without both author + url
 
     CLI: ``python grade_wiki.py provenance <wiki_dir>``
     Exit 0 == pass; non-zero == fail (PR1 gate violated).
@@ -1115,21 +1162,76 @@ def grade_provenance(wiki: Path) -> GradeResult:
         1 for s in sources if s.get("author") and (s.get("url") or s.get("source"))
     )
     has_date = sum(1 for s in sources if s.get("date"))
+    registry_coverage_pct = has_author_and_url / total
 
-    pct = has_author_and_url / total
+    # Sources whose registry entry carries a url — the population the render
+    # check verifies against (a literal, cheap, deterministic substring test).
+    sources_with_url = [(s, s.get("url") or s.get("source")) for s in sources]
+    sources_with_url = [(s, url) for s, url in sources_with_url if url]
 
-    # PR1 — hard gate
-    res.check(
-        pct >= PROVENANCE_MIN_PCT,
-        f"PR1 FAIL: {pct:.1%} sources have author+url "
-        f"(need >= {PROVENANCE_MIN_PCT:.0%}; "
-        f"registry currently stores only filename+hash)",
-        f"PR1 pct_sources_with_author_url: {pct:.1%} (>= {PROVENANCE_MIN_PCT:.0%})",
-    )
+    # Any rendered [^N]: footnote defs at all in this wiki's compiled .md
+    # pages? Their absence means the wiki hasn't been through the citation-
+    # rendering stage yet (e.g. a registry-only fixture built directly via
+    # _assign_source_id, with no synthesized/footnoted pages) — the render
+    # check has nothing to verify, so we fall back to registry coverage
+    # rather than fail on an absence of evidence that isn't a render defect.
+    defs_by_id = _collect_rendered_footnote_defs(wiki)
+
+    if defs_by_id and sources_with_url:
+        checked = len(sources_with_url)
+        missing_ids: list[str] = []
+        rendered_ok = 0
+        for s, url in sources_with_url:
+            nid = str(s.get("id", ""))
+            defs = defs_by_id.get(nid, [])
+            if any(url in d for d in defs):
+                rendered_ok += 1
+            else:
+                missing_ids.append(nid)
+
+        pct = rendered_ok / checked
+        gate_basis = "render"
+
+        res.check(
+            pct >= PROVENANCE_MIN_PCT,
+            f"PR1 FAIL: {pct:.1%} of citations with a registry url actually "
+            f"RENDER that url in a [^N]: footnote def (need >= "
+            f"{PROVENANCE_MIN_PCT:.0%}; missing ids: "
+            f"{', '.join(missing_ids[:10])}"
+            f"{' ...' if len(missing_ids) > 10 else ''})",
+            f"PR1 pct_citations_rendered_with_provenance: {pct:.1%} "
+            f"(>= {PROVENANCE_MIN_PCT:.0%}; {rendered_ok}/{checked} checked)",
+        )
+    else:
+        # Nothing to render-check: either no compiled .md pages carry any
+        # [^N]: footnote defs yet, or the registry has no captured url at
+        # all. Fall back to the registry-coverage metric so the gate still
+        # means something (this is the prior, pre-recalibration behavior).
+        pct = registry_coverage_pct
+        reason = (
+            "no [^N]: footnote defs found in wiki"
+            if not defs_by_id
+            else "no sources with a captured url"
+        )
+        gate_basis = (
+            f"registry-coverage ({reason} — render check has nothing to verify)"
+        )
+        res.check(
+            pct >= PROVENANCE_MIN_PCT,
+            f"PR1 FAIL: {pct:.1%} sources have author+url in the registry "
+            f"(need >= {PROVENANCE_MIN_PCT:.0%}; {reason}, so the render "
+            f"check could not run — falling back to registry coverage; "
+            f"registry currently stores only filename+hash)",
+            f"PR1 pct_sources_with_author_url: {pct:.1%} "
+            f"(>= {PROVENANCE_MIN_PCT:.0%}; registry-coverage fallback, "
+            f"{reason})",
+        )
 
     res.notes += [
+        f"gate_basis: {gate_basis}",
         f"total_sources: {total}",
-        f"with_author_and_url: {has_author_and_url}/{total}",
+        f"[diag] pct_sources_with_author_and_url (registry-coverage): "
+        f"{registry_coverage_pct:.1%} ({has_author_and_url}/{total})",
         f"missing_author_url: {total - has_author_and_url}/{total}",
         f"[diag] with_date: {has_date}/{total} ({has_date / total:.1%})",
     ]

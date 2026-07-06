@@ -5,7 +5,11 @@ under eval/fixtures/ so calibration tests stay green regardless of corpus state.
 
 KNOWN-BAD FIXTURE: eval/fixtures/known-bad-wiki/
   Represents the pre-Phase-A concatenation state (per-source parenthetical openers
-  in overview.md, registry entries without author/url).
+  in overview.md) AND, independently, the pre-#25 provenance-RENDER regression:
+  citations.md's registry (.sources.json) carries author+url for every source,
+  but its compiled footnote defs render only bare de-slugged filenames — exactly
+  what pipeline/footnotes.py produced before `_render_provenance_def` started
+  consuming captured provenance (see PR #25, evolution-plan.md Appendix B).
 
 CALIBRATION FACTS (deterministic — fixed by fixture content):
 
@@ -15,14 +19,20 @@ CALIBRATION FACTS (deterministic — fixed by fixture content):
     section_header_count      : 0   (diagnostic only — no thematic ## sections)
     result.passed             : False  (OV1 violates the hard gate)
 
-  grade_provenance (.sources.json — 5 entries, id/filename/hash only):
-    pct_sources_with_author_url : 0.0%  (threshold >= 80% → PR1 FAILS)
-    total_sources               : 5
-    result.passed               : False  (PR1 violates the hard gate)
+  grade_provenance (.sources.json — 5 entries, ALL with author+url; citations.md —
+  5 bare-filename footnote defs, simulating the pre-#25 render-discard bug):
+    pct_citations_rendered_with_provenance : 0.0%  (threshold >= 80% → PR1 FAILS)
+    pct_sources_with_author_and_url (diagnostic, NOT gated) : 100.0%
+    total_sources                          : 5
+    result.passed                          : False  (PR1 violates the hard gate;
+      proves the grader catches a render regression even when registry coverage
+      alone would report 100% and wrongly PASS)
 
 KNOWN-GOOD FIXTURE: eval/fixtures/good-wiki/
-  Represents the post-Phase-A synthesized state (thematic ## sections, wikilinks,
-  registry entries with author+url — the targets the Phase A fixes achieve).
+  Represents the post-Phase-A synthesized state (thematic ## sections, wikilinks)
+  AND the post-#25 provenance-render state: citations.md's footnote defs render
+  the registry's captured author+url verbatim (the `_render_provenance_def`
+  output shape: ``Author — "Title" — url``).
 
 Both graders MUST FAIL on the known-bad fixture and PASS on the known-good fixture.
 Tests are skipped if the fixture directory is not present (guards against accidental
@@ -135,15 +145,19 @@ def provenance_result():
 def test_provenance_fails_known_bad(provenance_result):
     """grade_provenance must FAIL on the known-bad fixture.
 
-    .sources.json stores only id/filename/hash — no author or url fields.
-    PR1 hard gate must fire (0% < 80% threshold).  If this test starts PASSING
-    it means either the fixture was modified (check .sources.json) or the grader
-    stopped checking correctly.
+    .sources.json carries author+url for all 5 entries (registry coverage is
+    100%), but citations.md's footnote defs render only bare de-slugged
+    filenames — simulating the pre-#25 render-discard bug. The PR1 gate is
+    now RENDER-based, so it must fire (0% of citations render their url) even
+    though registry coverage alone would report 100% and wrongly pass. This
+    is the whole point of the recalibration: registry coverage could not
+    have caught this regression; the render check does.
     """
     assert not provenance_result.passed, (
         "grade_provenance should FAIL on the known-bad fixture (PR1 gate must fire); "
-        "if it passes, either .sources.json unexpectedly gained author/url fields "
-        "or the PR1 gate was broken"
+        "if it passes, either citations.md unexpectedly gained real author/url "
+        "text in its footnote defs, or the PR1 render gate was broken/reverted "
+        "to registry-coverage-only checking"
     )
 
 
@@ -156,12 +170,29 @@ def test_provenance_pr1_gate_present_in_failures(provenance_result):
     )
 
 
-def test_provenance_pct_is_zero(provenance_result):
-    """pct_sources_with_author_url must be 0.0% on the known-bad fixture.
+def test_provenance_gate_basis_is_render(provenance_result):
+    """The gate must report it evaluated on RENDER, not registry-coverage.
 
-    The known-bad registry stores only filename + hash (no author, no url).
-    Any non-zero value means either (a) the fixture was modified or
-    (b) the grader is miscounting fields.
+    Guards against silently reverting to the old coverage-only semantics —
+    the known-bad fixture's registry has 100% coverage, so if the gate basis
+    ever falls back to coverage here it would wrongly PASS.
+    """
+    basis_notes = [n for n in provenance_result.notes if "gate_basis" in n]
+    assert basis_notes, f"no gate_basis note found; notes={provenance_result.notes!r}"
+    assert "render" in basis_notes[0], (
+        f"expected gate_basis to be 'render' on known-bad fixture (registry has "
+        f"100% coverage, only the render check can catch the regression), "
+        f"got: {basis_notes[0]!r}"
+    )
+
+
+def test_provenance_pct_is_zero(provenance_result):
+    """pct_citations_rendered_with_provenance must be 0.0% on the known-bad fixture.
+
+    citations.md's footnote defs are bare filenames with no author/url text,
+    despite the registry carrying url for all 5 sources. Any non-zero value
+    means either (a) the fixture was modified or (b) the grader is not
+    actually checking rendered output.
     """
     pct = _extract_provenance_pct(provenance_result)
     assert pct != -1.0, (
@@ -169,8 +200,29 @@ def test_provenance_pct_is_zero(provenance_result):
         f"failures={provenance_result.failures!r}, notes={provenance_result.notes!r}"
     )
     assert pct == pytest.approx(0.0, abs=0.01), (
-        f"expected 0.0% sources with author+url on known-bad fixture, got {pct:.1%}; "
-        "fixture .sources.json may have been modified OR the grader is counting wrong fields"
+        f"expected 0.0% of citations rendering their url on known-bad fixture, "
+        f"got {pct:.1%}; fixture citations.md may have been modified OR the "
+        "grader is not checking rendered footnote defs"
+    )
+
+
+def test_provenance_registry_coverage_diagnostic_is_high(provenance_result):
+    """The registry-coverage DIAGNOSTIC must show ~100% on the known-bad fixture.
+
+    This is the key regression-detection proof: registry coverage alone
+    (the OLD gate) would have reported 100% and PASSED this fixture. The
+    diagnostic note must still report that number (transparency), while the
+    gate itself (checked above) FAILs on the render mismatch.
+    """
+    diag_notes = [
+        n for n in provenance_result.notes if "pct_sources_with_author_and_url" in n
+    ]
+    assert diag_notes, (
+        f"no registry-coverage diagnostic note found; notes={provenance_result.notes!r}"
+    )
+    assert "100.0%" in diag_notes[0], (
+        f"expected registry-coverage diagnostic ~100% on known-bad fixture "
+        f"(all 5 entries carry author+url), got: {diag_notes[0]!r}"
     )
 
 
@@ -285,16 +337,22 @@ def _extract_opener_count(result) -> int:
 
 
 def _extract_provenance_pct(result) -> float:
-    """Parse pct_sources_with_author_url from PR1 gate messages.
+    """Parse the PR1 gate percentage from grade_provenance messages.
 
-    Handles both:
-      FAIL state:  "PR1 FAIL: 0.0% sources have author+url ..."   (in failures)
-      PASS state:  "PR1 pct_sources_with_author_url: 0.0% ..."    (in notes)
+    PR1 is now render-based (pct_citations_rendered_with_provenance), with a
+    registry-coverage fallback label (pct_sources_with_author_url) used only
+    when no registry source carries a url at all. Handles both:
+      FAIL state:  "PR1 FAIL: 0.0% of citations with a registry url ..."  (in failures)
+                   "PR1 FAIL: 0.0% sources have author+url ..."          (fallback path)
+      PASS state:  "PR1 pct_citations_rendered_with_provenance: 100.0% ..." (in notes)
+                   "PR1 pct_sources_with_author_url: 100.0% ..."           (fallback path)
     Returns -1.0 if not found.
     """
     _fail_pat = re.compile(r"\bPR1 FAIL:\s*([\d.]+)%", re.IGNORECASE)
     _pass_pat = re.compile(
-        r"\bPR1 pct_sources_with_author_url:\s*([\d.]+)%", re.IGNORECASE
+        r"\bPR1 pct_(?:citations_rendered_with_provenance|sources_with_author_url):"
+        r"\s*([\d.]+)%",
+        re.IGNORECASE,
     )
 
     for msg in result.failures:
