@@ -31,7 +31,7 @@ sys.path.insert(0, str(_REPO))
 # rather than erroring. Matches test_claim_retention.py / test_preflight_gate.py.
 pytest.importorskip("wiki_weaver.engine_runner")
 
-from wiki_weaver.cli import FAILED, INBOX, SOURCES, cmd_ingest  # noqa: E402
+from wiki_weaver.cli import INBOX, SOURCES, cmd_ingest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +46,31 @@ def _bypass_env_gate(monkeypatch):
     whether or not foundation is installed or a key is set.
     """
     monkeypatch.setattr("wiki_weaver.cli.preflight", lambda **_kw: [])
+
+
+@pytest.fixture(autouse=True)
+def _bypass_reweave_gate(monkeypatch):
+    """Stub the Item-2 overview re-weave gate (wiki_weaver/reweave.py).
+
+    These tests exercise drain-loop ORCHESTRATION (text/binary routing,
+    re-glob, dedup) and use minimal synthetic wikis with no real
+    index.md/overview.md content -- an orthogonal concern to the overview
+    quality gate, which is covered in isolation by eval/test_reweave.py.
+    Without this stub, grade_overview() would legitimately fail on these
+    bare fixtures and attempt a real re-weave (real LLM call).
+    """
+    from wiki_weaver.reweave import ReweaveGateResult
+
+    monkeypatch.setattr(
+        "wiki_weaver.reweave.reweave_overview_if_needed",
+        lambda *_a, **_kw: ReweaveGateResult(
+            initial_passed=True,
+            attempts=0,
+            final_passed=True,
+            initial_report="stub: bypassed for drain-orchestration test",
+            final_report="stub: bypassed for drain-orchestration test",
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
