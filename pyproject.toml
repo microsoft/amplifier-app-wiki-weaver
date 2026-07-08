@@ -41,6 +41,10 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pyyaml>=6",
+    # Not a runtime dep -- needed only so eval/test_hatch_build.py can import
+    # the real hatchling.builders.hooks.plugin.interface.BuildHookInterface
+    # that hatch_build.py's build hook subclasses.
+    "hatchling>=1.28.0",
 ]
 
 [tool.pytest.ini_options]
@@ -53,6 +57,11 @@ wiki-weaver = "wiki_weaver.cli:main"
 [tool.hatch.metadata]
 # Required so hatchling will build a wheel whose dependencies use direct git URLs.
 allow-direct-references = true
+
+[tool.hatch.build.hooks.custom]
+# Bakes a git-derived version (commit date + short SHA) into
+# wiki_weaver/_version.py at wheel-build time -- see hatch_build.py.
+path = "hatch_build.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wiki_weaver"]

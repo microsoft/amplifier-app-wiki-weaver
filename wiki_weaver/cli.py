@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 
 from wiki_weaver._version import __version__
+from wiki_weaver._version_resolve import resolve_version
 
 # ---------------------------------------------------------------------------
 # Re-exports: symbols imported by tests from wiki_weaver.cli
@@ -206,14 +207,32 @@ def cmd_build_dashboard(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+class _VersionAction(argparse.Action):
+    """Resolves + prints the version lazily, only when --version is passed.
+
+    Unlike argparse's built-in "version" action (which formats its string
+    eagerly at add_argument() time), this defers resolve_version() until the
+    flag is actually invoked -- so a possible dev-mode git subprocess call
+    (see wiki_weaver._version_resolve) never runs on ordinary command
+    invocations, only on `wiki-weaver --version` itself.
+    """
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, **kwargs) -> None:
+        kwargs.setdefault("nargs", 0)
+        kwargs.setdefault("help", "show program's version number and exit")
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        print(f"wiki-weaver {resolve_version(__version__)}")
+        parser.exit()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="wiki-weaver",
         description="LLM-wiki ingest pipeline driven by the attractor engine.",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"wiki-weaver {__version__}"
-    )
+    parser.add_argument("--version", action=_VersionAction)
     sub = parser.add_subparsers(dest="command")
 
     p_init = sub.add_parser(

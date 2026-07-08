@@ -29,10 +29,14 @@ jobs:
           # Test runner + the lightweight PyPI runtime deps the deterministic
           # suite needs. tinycss2 + markdown are REAL runtime deps (dashboard
           # CSS sanitizer + markdown rendering); they must be present because
-          # dashboard.py imports them at top level (no silent-degrade). They are
-          # installed explicitly here because the package install below uses
+          # dashboard.py imports them at top level (no silent-degrade). hatchling
+          # is a test-only dep: eval/test_hatch_build.py imports BuildHookInterface
+          # to unit-test hatch_build.py's git-derived-version build hook (it is
+          # already a [build-system] requirement, but that's only installed into
+          # the isolated build env, not this test env). They are all installed
+          # explicitly here because the package install below uses
           # --no-deps to avoid git-cloning the two @main Amplifier deps.
-          pip install pytest pytest-asyncio pyyaml tinycss2 markdown
+          pip install pytest pytest-asyncio pyyaml tinycss2 markdown hatchling
           pip install --no-deps -e .
 
       - name: Run eval tests
