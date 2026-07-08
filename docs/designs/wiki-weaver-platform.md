@@ -332,3 +332,176 @@ These are deliberately small calls, already defaulted to a chosen answer; the hu
 - **Secrets UX:** env-first + optional 0600 `secrets.toml` *(chosen)* vs. env-only.
 - **`provider config` interaction:** inspect-and-edit *(chosen, shown above)* vs. interactive prompt (interactive optional).
 - **Default provider re-confirm:** `anthropic` *(chosen)* vs. `chat-completions` — flip only if the real target user is local-LLM-first.
+
+---
+
+## 11. Addendum (2026-07-08): Phase 0/1 status finding, and Phase 2 (continuous ingestion) design
+
+> **Status:** DESIGN-ONLY. Validated via design conversation + 6-lens council review
+> (council-here, cold fan-out, no FAILs — 1 PASS, 5 CONCERN). Not implemented. Per
+> AGENTS.md's own docs discipline ("a design/plan doc that describes a *rejected*
+> strategy is context poison — delete or retcon it"), §11.1 below is a **status
+> correction the human should confirm or redline**, not an assumption this addendum
+> quietly relies on.
+
+### 11.1 Correction — Phase 0/1 appear un-executed, not merely "unproven"
+
+Re-reading this doc against the actual repo state (89 commits, 2026-06-10 →
+2026-07-08) surfaced a discrepancy worth naming plainly rather than inheriting
+silently:
+
+- **No `provider` subcommand exists anywhere in `wiki_weaver/cli.py`.** §4 of this doc
+  describes the provider registry (`wiki-weaver provider list/install/config/login`) as
+  **Phase 1 — "the active build."** It was never built. The CLI dispatch table is
+  exactly `{init, ingest, lint, doctor, update, ask, build-dashboard, migrate}`.
+- **README.md's own current framing contradicts this doc's stated goal.** §1's goal is
+  *"make wiki-weaver usable by someone who has **not** installed `amplifier-app-cli`...
+  clean machine + one API key + `uv tool install` → it just works."* The shipped
+  `README.md` instead says: *"`wiki-weaver` is a **companion** to an installed
+  Amplifier: it tracks `@main` of the Amplifier..."* — i.e. the actual product still
+  assumes a pre-existing Amplifier install, the opposite of the Phase-0 goal.
+- **No test or CI evidence of the Phase 0 bare-DTU proof.** `.github/workflows/ci.yml`
+  explicitly defers it: *"The real `uv tool install` + `@main` resolution is validated
+  by the DTU install proof, not CI."* No artifact, doc, or commit records that proof
+  having been run.
+- **A separate, actively-executed roadmap exists and has absorbed the team's real
+  effort instead:** `docs/designs/evolution-plan.md` (negotiated 2026-06-13, trued-up
+  2026-07-05) tracks a **different** Phase lettering (A–E) covering synthesis quality,
+  the reader/`ask` layer, provenance, and schema externalization — **not** packaging,
+  providers, or daemons. That plan shows real, evidenced proof: a documented A/B
+  ("wiki-wins=6, raw-wins=0, tie=2, contested=1, never lost"), a 748-article corpus run
+  (frozen at 144 converged pages), and — per its own §8 — **a different team already
+  using wiki-weaver's code on a different problem space (meeting transcripts) with
+  positive, dogfooded results.** The 89 commits in this repo overwhelmingly implement
+  *that* plan's items (dashboard, citations, directory-hygiene/`migrate`, schema
+  externalization), not this doc's Phase 0/1/2/3.
+
+**What this means for "unproven," precisely:** wiki-weaver's **core value** (synthesis
+quality, reliable refusal, real multi-week production use by people who already have
+Amplifier installed) is genuinely, heavily proven — this is not in question. What is
+specifically unproven is the **narrow Phase-0 claim**: a person with **zero pre-existing
+Amplifier footprint** running `uv tool install` + one key and having it self-bootstrap.
+That is a different claim than "does wiki-weaver work," and the team's two weeks of
+heavy use — on machines that already have Amplifier set up — does not speak to it either
+way.
+
+**Recommendation (human to confirm or redline):** don't treat Phase 0 as a live blocker
+for *this* feature. The near-term audience for continuous ingestion is the team already
+running wiki-weaver successfully today, on machines with Amplifier already installed —
+the clean-machine bootstrap gate is orthogonal to them. Separately, and independent of
+this feature: **§§2–9 of this doc (bundle/app split, provider system, Phase 0 gate)
+should be explicitly marked either "still intended, not yet started" or "superseded by
+evolution-plan.md" —** leaving two roadmaps with overlapping "Phase N" numbering and no
+stated relationship between them is exactly the "context poison" AGENTS.md warns
+against. This addendum does not make that call; it surfaces it.
+
+### 11.2 Design (per council-here, 2026-07-08; simplified per human decision, 2026-07-08)
+
+**Goal.** Extend `amplifier-app-wiki-weaver` to support unattended, continuous
+ingestion — replacing manual `wiki-weaver ingest` re-invocation — via **scheduled
+periodic scans** (cron-triggered, skip-if-already-running, no-op if nothing new). Must
+support many independent concurrent instances (different source dirs / output wikis)
+on one device.
+
+**Settled (unanimous across all 6 lenses):**
+- Build inside `amplifier-app-wiki-weaver` — no new repo.
+- **N independent single-mapping processes** (one instance per source-dir↔wiki pair),
+  not one daemon internally tracking multiple dir→wiki mappings — smaller blast radius,
+  matches the requirement for independently startable/stoppable instances, aligns with
+  each wiki's already-isolated `.wiki/` state directory. This deviates from this doc's
+  original §3 Phase-2 phrasing ("a headless daemon that watches multiple input
+  directories... multi-dir → multi-output"); the deviation is judged correct by the
+  panel because the literal phrasing predates the multi-instance requirement.
+- Reuse the existing, already-idempotent `ingest()` core unchanged; add only a
+  triggering layer on top.
+- Treat this round as **design-only** pending resolution of §11.1 above (not the
+  original Phase-0-as-written framing, but the live status-ambiguity it surfaced).
+
+**Decided (2026-07-08, human call): drop the filesystem-watch mechanism. Cron-only.**
+
+The council left this open as cranky-old-sam's dissent (§ below, superseded); on
+review, the answer is yes, drop it, and go further than the original either/or framing:
+
+- **Ingest latency dwarfs any watch-vs-poll difference.** This is an LLM-driven
+  multi-cycle convergence pipeline — per-source ingest is a minutes-scale operation, not
+  milliseconds. A 5-minute poll delay before a run even *starts* is noise against that.
+  There is no stated requirement for sub-minute reactivity; "watch a directory" in the
+  original ask meant "don't make me run the command," not "notice instantly."
+- **Cron-only doesn't just remove one of two trigger mechanisms — it removes an entire
+  service-management subsystem.** A poll-loop-as-a-persistent-process (the
+  `--interval` framing originally on the table) still needs systemd/launchd to keep it
+  alive across crashes/reboots — i.e. still needs muxplex's unit-generation pattern.
+  Pure cron (medium-tools' pattern: install a managed block, `run-now` does one
+  check-and-drain, exit) needs **no persistent process and no unit-file generation at
+  all** — the OS's own cron daemon *is* the entire "keep this recurring" mechanism.
+  That deletes muxplex's systemd/launchd pattern from this design outright, not just
+  the watch half of it.
+- **This also deletes real complexity, not just code:** every inotify-specific
+  must-fix below (atomic-write-via-rename detection, debounce ceiling, watch-count
+  budget, network-filesystem fallback) disappears because there is no filesystem
+  watching. The "lock must be mode-agnostic across watch+schedule" concern disappears
+  because there is only one mode.
+- **The user's own proposed shape is correct and is what's specced below:** run every
+  N minutes, skip the cycle if a previous run is still going, no-op cheaply if nothing
+  new (already true for free — `ingest()` draining an empty/already-seen `_inbox/` is a
+  fast pass over the content-hash ledger, not a synthesis run).
+- **Parked, not killed:** if a real need for near-instant reactivity shows up later
+  (someone actively watching a wiki update while working), it can be bolted on as an
+  *additional* trigger calling the same underlying `run-now` — it doesn't require
+  redesigning anything below. Named and parked, per Restless-Old-Brian's own rule:
+  don't kill a good idea, park it with a reason.
+
+**Proposed shape:**
+1. **Instance isolation** (`instance-storage-patterns`): instance ID derived from a
+   **canonicalized** wiki path (realpath, symlinks resolved, no trailing slash — see
+   must-fix #3 below). Config at `~/.config/wiki-weaver/instances/{id}/`, state/PID/logs
+   at `~/.local/share/wiki-weaver/instances/{id}/`, single `WIKI_WEAVER_DATA_DIR`
+   env override.
+2. **One core, one trigger mechanism:** `wiki-weaver schedule install --wiki <dir>
+   --every 5m` (friendly interval sugar; `--cron "<expr>"` remains available for
+   power users who want a non-uniform schedule) — medium-tools-style managed crontab
+   block, instance-scoped marker. Installs an entry that calls `wiki-weaver schedule
+   run-now --wiki <dir>` on each tick, which acquires the per-wiki lock, drains
+   `_inbox/` via the existing `ingest()` core, and exits. No persistent process between
+   ticks.
+3. **New mandatory concurrency fix:** a per-wiki PID lock around any automated ingest
+   trigger, modeled on `migrate`'s existing lock (`lib.py:1798-1855`) — today only
+   `migrate` is locked, `ingest` is not. **Must check PID liveness, not just file
+   existence** (see must-fix #1).
+4. **Service management:** medium-tools' cron pattern only, instance-scoped. No
+   systemd/launchd unit generation anywhere in this design.
+
+**Must-fix gaps (convergent across 3+ lenses — not optional polish):**
+1. PID lock must check process liveness (`kill(pid, 0)`), not just file existence — a
+   crashed run must not leave a permanently-stuck lock (crusty-old-engineer,
+   restless-old-brian, tester-breaker).
+2. Every skipped ingest cycle (lock contention) must be logged loudly, with an
+   escalating alert after N consecutive skips (user-advocate, restless-old-brian,
+   crusty-old-engineer).
+3. **Instance ID must be a canonicalized path** — raw path strings let two aliases of
+   the same wiki (symlink, trailing slash, relative vs. absolute) acquire separate
+   locks and **reintroduce the exact concurrent-write race `parallelism=1` exists to
+   prevent** (tester-breaker; flagged critical).
+4. Full lifecycle CLI needed: `remove`/`status`/`list`, not just `install`
+   (user-advocate; `stop`/`start` no longer apply now there's no persistent process —
+   the equivalent is `remove`/`install`).
+5. Crontab install/uninstall mutation needs its **own** lock, separate from the ingest
+   lock — concurrent installs can lose a cron block (crusty-old-engineer).
+6. Cron+lock starvation: if ingest ever runs longer than the interval, every tick
+   skips forever with no distinction from a normal one-off collision — needs backoff /
+   an escalating alert, same mechanism as #2 (tester-breaker).
+7. Path-escaping required wherever user-supplied wiki paths are interpolated into the
+   cron command line (smaller surface than unit-file templating, but still real)
+   (crusty-old-engineer).
+8. No observability/alerting story for a system meant to run unattended — at minimum
+   name it as a stated non-goal with a named follow-up phase (crusty-old-engineer).
+9. No story for renaming/moving a wiki directory while its instance is scheduled
+   (user-advocate) — likely simpler now than under a live daemon (no open process
+   holding the old path), but still needs an explicit answer (e.g. `schedule remove`
+   the old path, `schedule install` the new one).
+
+**Superseded — original open tradeoff (resolved 2026-07-08):** ~~cranky-old-sam
+challenges whether two trigger mechanisms (fs-watch + cron) and two service-generation
+patterns (systemd/launchd + cron) are needed at all, versus a single interval-based
+poll loop.~~ Resolved: yes, drop fs-watch; go further and drop persistent-process
+polling too — cron-only, per the reasoning above.

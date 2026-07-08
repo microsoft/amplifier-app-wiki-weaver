@@ -109,12 +109,30 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     if rc := _gate(require_api_key=True):
         return rc
 
-    return ingest(
-        args.wiki,
-        source=args.source,
-        max_cycles=args.max_cycles,
-        keep_going=args.keep_going,
-    )
+    # Acquire the per-wiki ingest lock (D3) so a manual `wiki-weaver ingest` and a
+    # scheduled `schedule run-now` tick on the same wiki cannot run concurrently.
+    # This is a triggering-layer concern only -- `ingest()` itself stays lock-free.
+    from wiki_weaver import instances as _inst
+    from wiki_weaver import pidlock as _lock
+    from wiki_weaver.schedule import EXIT_SKIP
+
+    lock = _inst.ingest_lock_path(args.wiki)
+    res = _lock.try_acquire(lock)
+    if not res.acquired:
+        _fail(
+            f"another ingest is already running for this wiki (PID {res.holder_pid}); "
+            f"skipping to avoid a concurrent-write race."
+        )
+        return EXIT_SKIP
+    try:
+        return ingest(
+            args.wiki,
+            source=args.source,
+            max_cycles=args.max_cycles,
+            keep_going=args.keep_going,
+        )
+    finally:
+        _lock.release(lock)
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
@@ -154,6 +172,37 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
     corpus = Path(args.corpus).expanduser().resolve()
     return migrate(corpus, dry_run=args.dry_run, force=args.force)
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    """Dispatch a `schedule` subcommand (install/remove/status/list/run-now).
+
+    Deterministic dispatch only -- the schedule module owns all logic.
+    """
+    from wiki_weaver import schedule as sched
+
+    cmd = args.schedule_command
+    if cmd == "install":
+        return sched.install(
+            args.wiki, every=args.every, cron=args.cron, alert_after=args.alert_after
+        )
+    if cmd == "remove":
+        if not args.wiki and not args.instance_id:
+            _fail("schedule remove: pass --wiki or --id")
+            return 2
+        return sched.remove(args.wiki, instance_id=args.instance_id, purge=args.purge)
+    if cmd == "status":
+        if not args.wiki and not args.instance_id:
+            _fail("schedule status: pass --wiki or --id")
+            return 2
+        return sched.status(args.wiki, instance_id=args.instance_id)
+    if cmd == "list":
+        return sched.list_all()
+    if cmd == "run-now":
+        return sched.run_now(args.wiki)
+    # no subcommand -> print schedule help
+    _fail("schedule: specify install|remove|status|list|run-now")
+    return 2
 
 
 def cmd_build_dashboard(args: argparse.Namespace) -> int:
@@ -384,6 +433,58 @@ def main() -> None:
         help="re-run even if the migration sentinel already exists",
     )
 
+    p_sched = sub.add_parser(
+        "schedule", help="manage unattended, cron-scheduled ingestion"
+    )
+    sched_sub = p_sched.add_subparsers(dest="schedule_command")
+
+    s_install = sched_sub.add_parser("install", help="install a cron entry for a wiki")
+    s_install.add_argument("--wiki", required=True, help="wiki directory to schedule")
+    g = s_install.add_mutually_exclusive_group(required=True)
+    g.add_argument(
+        "--every",
+        metavar="INTERVAL",
+        help="friendly interval sugar, e.g. 5m, 30m, 1h, 1d",
+    )
+    g.add_argument(
+        "--cron",
+        metavar="EXPR",
+        help="raw 5-field cron expression (power-user escape hatch)",
+    )
+    s_install.add_argument(
+        "--alert-after",
+        type=int,
+        default=3,
+        dest="alert_after",
+        help="escalate after N consecutive skipped cycles (default: 3)",
+    )
+
+    s_remove = sched_sub.add_parser("remove", help="remove a wiki's cron entry")
+    s_remove.add_argument(
+        "--wiki", help="wiki directory (canonicalized to find the instance)"
+    )
+    s_remove.add_argument(
+        "--id", dest="instance_id", help="instance id (use after moving a wiki)"
+    )
+    s_remove.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete the instance's stored config/state/logs",
+    )
+
+    s_status = sched_sub.add_parser(
+        "status", help="show a wiki's schedule + last-run state"
+    )
+    s_status.add_argument("--wiki", help="wiki directory")
+    s_status.add_argument("--id", dest="instance_id", help="instance id")
+
+    sched_sub.add_parser("list", help="list all scheduled wikis and their state")
+
+    s_run = sched_sub.add_parser(
+        "run-now", help="run one ingest tick now (what cron invokes)"
+    )
+    s_run.add_argument("--wiki", required=True, help="wiki directory")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -395,6 +496,7 @@ def main() -> None:
         "ask": cmd_ask,
         "build-dashboard": cmd_build_dashboard,
         "migrate": cmd_migrate,
+        "schedule": cmd_schedule,
     }
     if args.command is None:
         parser.print_help()

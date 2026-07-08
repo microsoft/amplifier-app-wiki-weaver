@@ -30,6 +30,34 @@ renamed to visible `_sources/`). Also rewrites absolute-path ledger fields (`arc
 before verification passes. `--dry-run` prints the plan without changes; `--force` bypasses the
 sentinel.
 
+`schedule install|remove|status|list|run-now` manages unattended, **cron-only** continuous
+ingestion (see `docs/designs/scheduled-ingestion-spec.md`): `install --wiki <dir> --every 5m`
+(interval sugar, or `--cron '<5-field expr>'` for the power-user escape hatch) installs a
+per-instance managed block in the user's crontab (`# >>> wiki-weaver:<id> >>>` /
+`# <<< wiki-weaver:<id> <<<`) whose command is `wiki-weaver schedule run-now --wiki <path>`; N
+independent wikis coexist in one crontab, each block independently upsert/removable. Each tick
+(`run-now`) acquires a liveness-checked per-wiki PID lock (`<data>/instances/<id>/ingest.lock`,
+ported from `migrate`'s lock algorithm into the reusable `wiki_weaver/pidlock.py`), drains
+`_inbox/` via the existing `ingest()` core **unchanged**, and skips cleanly (exit 0, loud
+WARN/ERROR log line, never a cron `MAILTO` spam) if a previous run is still in flight — consecutive
+skips escalate to an `alert_active` flag surfaced by `status`/`list` after `--alert-after` (default
+3) cycles. The SAME per-wiki lock is also acquired by manual `wiki-weaver ingest`
+(`cli.cmd_ingest`), so a manual run and a scheduled tick on one wiki can never race each other; a
+manual run only skips (`EXIT_SKIP` = 75) when a tick is genuinely in flight. `remove` /`status` /
+`list` round out the lifecycle; a separate GLOBAL `crontab.lock` (also `pidlock`-based) guards
+concurrent crontab read-modify-write during install/remove. Instance identity is the
+**canonicalized** wiki path (`expanduser().resolve()`) hashed into `{slug}-{sha256[:12]}`, so
+aliases of one wiki (`./w`, `w/`, an absolute path, a symlink) share one lock and one id.
+Storage: `~/.config/wiki-weaver/instances/<id>/` (install-time config + an 0600 `ANTHROPIC_API_KEY`
+snapshot captured at install so cron's minimal env still works) and
+`~/.local/share/wiki-weaver/instances/<id>/` (the lock, run-state, rotated `logs/ingest.log`);
+both relocate under a single `WIKI_WEAVER_DATA_DIR` override. **Renaming/moving a scheduled
+wiki:** the instance id changes with the path, so run `schedule list` to find the OLD id, then
+`schedule remove --id <OLD_ID> --purge` (the reliable path once the old directory is gone —
+`--wiki <OLD_PATH>` only works if the old path still resolves), move the directory, then
+`schedule install --wiki <NEW_PATH> --every ...` again. A stale orphaned block self-announces:
+`run-now` on a missing wiki dir returns 1 with a loud "wiki dir not found" message.
+
 ## Architecture
 
 Commands are **thin lib wrappers over attractor `.dot` pipelines**:
