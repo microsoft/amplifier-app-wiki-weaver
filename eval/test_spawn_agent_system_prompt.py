@@ -120,7 +120,14 @@ class TestResolveAgentBundleDeliversContext:
             "block from the inline overlay. The system-prompt factory will never fire."
         )
 
-        # 2. the include resolved to the provider system-prompt file
+        # 2. the include resolved to the provider system-prompt file, under the
+        #    exact include name (not just "some" key -- a regression that resolved
+        #    the right path under the wrong dict key would still corrupt downstream
+        #    consumers that look up context by name).
+        expected_key = f"../context/system-{provider}.md"
+        assert list(child_bundle.context.keys()) == [expected_key], (
+            f"Expected context key {expected_key!r}, got {list(child_bundle.context.keys())}"
+        )
         resolved_paths = list(child_bundle.context.values())
         assert len(resolved_paths) == 1, (
             f"Expected 1 context entry, got {len(resolved_paths)}: {resolved_paths}"
@@ -184,6 +191,73 @@ class TestResolveAgentBundleDeliversContext:
         resolved = list(child_bundle.context.values())[0]
         assert resolved.exists(), f"Resolved path does not exist: {resolved}"
         assert sentinel in resolved.read_text(encoding="utf-8")
+
+    def test_two_agents_resolve_distinct_non_cross_contaminated_context(
+        self, tmp_path: Path
+    ) -> None:
+        """Guards the gap a bare non-emptiness check cannot catch: a NON-EMPTY but
+        WRONG prompt (e.g. agent A silently resolving to agent B's system prompt,
+        or a hardcoded placeholder shared across agents).
+
+        ``assert child_bundle.context`` alone would happily pass even if every
+        agent resolved to the same (wrong) file. This test resolves TWO distinct
+        agents in the same run and asserts each one's resolved context contains
+        ONLY its own distinctive sentinel and NEVER the other agent's -- proving
+        the content that flows through is agent-specific, not just "present".
+        """
+        from wiki_weaver.engine_runner import _resolve_agent_bundle
+
+        bundles_dir = tmp_path / "bundles"
+        context_dir = tmp_path / "context"
+        bundles_dir.mkdir()
+        context_dir.mkdir()
+
+        sentinel_a = "AGENT_A_DISTINCT_SENTINEL_4f1c8e"
+        sentinel_b = "AGENT_B_DISTINCT_SENTINEL_9d3a71"
+        (context_dir / "system-agent-a.md").write_text(
+            f"# Agent A Instructions\n\n{sentinel_a}\n", encoding="utf-8"
+        )
+        (context_dir / "system-agent-b.md").write_text(
+            f"# Agent B Instructions\n\n{sentinel_b}\n", encoding="utf-8"
+        )
+
+        config_a = {
+            "description": "Agent A",
+            "session": {"orchestrator": {"module": "loop-agent", "config": {}}},
+            "context": {"include": ["../context/system-agent-a.md"]},
+        }
+        config_b = {
+            "description": "Agent B",
+            "session": {"orchestrator": {"module": "loop-agent", "config": {}}},
+            "context": {"include": ["../context/system-agent-b.md"]},
+        }
+
+        bundle_a = asyncio.run(
+            _resolve_agent_bundle("agent-a", config_a, base_path=bundles_dir)
+        )
+        bundle_b = asyncio.run(
+            _resolve_agent_bundle("agent-b", config_b, base_path=bundles_dir)
+        )
+
+        content_a = list(bundle_a.context.values())[0].read_text(encoding="utf-8")
+        content_b = list(bundle_b.context.values())[0].read_text(encoding="utf-8")
+
+        assert sentinel_a in content_a, (
+            "agent-a's resolved context is missing its own sentinel -- "
+            f"content was: {content_a!r}"
+        )
+        assert sentinel_b not in content_a, (
+            "agent-a's resolved context leaked agent-b's system prompt content "
+            "-- cross-agent contamination in _resolve_agent_bundle"
+        )
+        assert sentinel_b in content_b, (
+            "agent-b's resolved context is missing its own sentinel -- "
+            f"content was: {content_b!r}"
+        )
+        assert sentinel_a not in content_b, (
+            "agent-b's resolved context leaked agent-a's system prompt content "
+            "-- cross-agent contamination in _resolve_agent_bundle"
+        )
 
     def test_no_context_block_still_works(self, tmp_path: Path) -> None:
         """An inline overlay with NO context block must still return a valid Bundle.
