@@ -25,6 +25,8 @@ import asyncio
 import os
 import re
 import shlex
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -126,6 +128,34 @@ _ATTRACTOR_REPO_ROOT: Path | None = (
 # LLM-driven node ids in the DOT (need an explicit llm_provider so the engine
 # routes them to a child agent). Tool nodes (validate) do not.
 LLM_NODE_IDS = ("ingest", "assess", "feedback")
+
+# Wall-clock ceiling for a single child-agent spawn (one pipeline node's full
+# execution: the LLM call(s) plus any tool-call rounds it makes internally).
+#
+# WHY THIS EXISTS: ``prepared.spawn()`` (called from ``spawn_capability``
+# below) has no timeout of its own. The underlying unified-llm-client Anthropic
+# adapter never sets an explicit ``timeout`` on the SDK client either, so a
+# single LLM completion silently inherits the Anthropic Python SDK's default
+# ``Timeout(connect=5.0, read=600, write=600, pool=600)`` -- a 10-minute cap
+# nobody configured and nothing in wiki-weaver or loop-agent surfaces. Worse,
+# a node like "ingest" makes MANY sequential LLM+tool-call rounds in one spawn
+# (observed: 250+ tool calls touching many existing pages), so the aggregate
+# spawn duration is not bounded by any single call's timeout at all.
+#
+# Investigation (see docs/investigations -- or PR description) confirmed via a
+# 20+ minute uninterrupted live reproduction that legitimate per-node spawns
+# regularly take several minutes (observed up to ~6 minutes for the "assess"
+# grading node across multiple refine cycles) with zero errors -- i.e. this is
+# NOT an unbounded hang, it is an invisible, unconfigured wait that is
+# indistinguishable from a hang to an operator watching CPU/log activity over
+# a shorter window. Bounding it here makes a stalled spawn fail loud (a clear,
+# actionable TimeoutError) instead of blocking the shared event loop forever.
+#
+# Default is generous headroom above every legitimately observed duration
+# (multiples of the ~6-minute worst case seen live) so normal slow-but-working
+# runs are never falsely killed. Override via WIKI_WEAVER_SPAWN_TIMEOUT for
+# unusually large corpora / slower models.
+SPAWN_TIMEOUT_SECONDS = float(os.environ.get("WIKI_WEAVER_SPAWN_TIMEOUT", "1800"))
 
 
 @dataclass
@@ -460,6 +490,60 @@ def _constrain_agent_fs(child_bundle: Any, wiki_dir: Path) -> None:
         cfg["denied_write_paths"] = merged
 
 
+async def _spawn_with_timeout(
+    prepared: Any,
+    *,
+    agent_name: str,
+    instruction: str,
+    child_bundle: Any,
+    session_id: str | None,
+    parent_session: Any,
+    orchestrator_config: dict[str, Any] | None,
+    parent_messages: list[dict[str, Any]] | None,
+    provider_preferences: list | None,
+    self_delegation_depth: int,
+) -> dict[str, Any]:
+    """Call ``prepared.spawn(...)`` bounded by ``SPAWN_TIMEOUT_SECONDS``.
+
+    ``prepared.spawn`` has no timeout of its own, and neither does anything
+    beneath it (see the comment on ``SPAWN_TIMEOUT_SECONDS`` above): a single
+    child-agent execution can legitimately run for minutes (multiple LLM
+    calls interleaved with many tool-call rounds) with zero errors, so a
+    stalled call is otherwise indistinguishable from a slow-but-working one.
+    ``asyncio.wait_for`` makes that structurally impossible to hang forever --
+    on expiry the child task is cancelled and a clear, actionable
+    ``TimeoutError`` is raised (fail loud; never silently swallowed). The
+    loop-pipeline backend that calls this capability already wraps it in a
+    ``try/except Exception`` that converts any raise into a FAIL Outcome, so
+    this routes through the pipeline's existing goal-gate/retry_target
+    machinery exactly like any other node failure -- no new failure path.
+    """
+    try:
+        return await asyncio.wait_for(
+            prepared.spawn(
+                child_bundle=child_bundle,
+                instruction=instruction,
+                session_id=session_id,
+                parent_session=parent_session,
+                orchestrator_config=orchestrator_config,
+                parent_messages=parent_messages,
+                provider_preferences=provider_preferences,
+                self_delegation_depth=self_delegation_depth,
+            ),
+            timeout=SPAWN_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Child agent '{agent_name}' did not complete within "
+            f"{SPAWN_TIMEOUT_SECONDS:.0f}s (WIKI_WEAVER_SPAWN_TIMEOUT). "
+            f"instruction preview: {instruction[:200]!r}. "
+            "This bounds what would otherwise be an unbounded wait on the "
+            "LLM provider / tool-call loop; increase WIKI_WEAVER_SPAWN_TIMEOUT "
+            "if this node is legitimately slower than normal, or investigate "
+            "provider connectivity if it recurs."
+        ) from exc
+
+
 def make_spawn_fn(prepared: Any, wiki_dir: Path | None = None):
     """Build the ``session.spawn`` capability for a prepared bundle.
 
@@ -504,9 +588,11 @@ def make_spawn_fn(prepared: Any, wiki_dir: Path | None = None):
         if wiki_dir is not None:
             _constrain_agent_fs(child_bundle, wiki_dir)
 
-        return await prepared.spawn(
-            child_bundle=child_bundle,
+        return await _spawn_with_timeout(
+            prepared,
+            agent_name=agent_name,
             instruction=instruction,
+            child_bundle=child_bundle,
             session_id=sub_session_id,
             parent_session=parent_session,
             orchestrator_config=orchestrator_config,
@@ -647,9 +733,11 @@ def make_ask_spawn_fn(prepared: Any, wiki_dir: Path, answer_file: Path):
         # THE MECHANISM: constrain this child to read-only wiki access.
         _constrain_ask_agent(child_bundle, wiki_dir, answer_file)
 
-        return await prepared.spawn(
-            child_bundle=child_bundle,
+        return await _spawn_with_timeout(
+            prepared,
+            agent_name=agent_name,
             instruction=instruction,
+            child_bundle=child_bundle,
             session_id=sub_session_id,
             parent_session=parent_session,
             orchestrator_config=orchestrator_config,
@@ -948,7 +1036,7 @@ def run_ask(
     )
     (logs_dir / "ask.dot").write_text(dot_source, encoding="utf-8")
 
-    raw_text, _data = asyncio.run(
+    raw_text, _data = _run_coro(
         _run_ask_pipeline(dot_source, logs_dir, wiki_dir, answer_file)
     )
 
@@ -987,13 +1075,73 @@ def run_ask(
 
 # In-process cache: load the base bundle once; install deps once, then reuse the
 # offline path for subsequent sources in the same sweep.
+#
+# The cached bundle carries the LLM provider's httpx AsyncClient (+ connection
+# pool), which binds to whichever event loop first used it. We therefore also
+# remember WHICH loop the cache was built on: reuse is valid only while that loop
+# is still the live one. See _load_base() and shared_engine_loop() below.
 _BASE_BUNDLE: Any = None
+_BASE_BUNDLE_LOOP: asyncio.AbstractEventLoop | None = None
 _DEPS_INSTALLED = False
+
+# Single shared event loop for one ingest DRIVE (Option A). While a runner is
+# installed here, every engine pipeline run (run_inner per source, the overview
+# re-weave) reuses ONE loop, so the load-once _BASE_BUNDLE provider client stays
+# bound to a LIVE loop for the whole drain. Without this, each per-source
+# asyncio.run() opened and CLOSED its own loop, and source N+1 reused the
+# closed-loop client -> "RuntimeError: Event loop is closed" (fatal on 3.13).
+_ACTIVE_RUNNER: asyncio.Runner | None = None
+
+
+def _run_coro(coro: Any) -> Any:
+    """Drive a coroutine to completion on the right loop.
+
+    Reuses the shared ingest loop when ``shared_engine_loop()`` is active
+    (single-loop drain); otherwise falls back to a private one-shot
+    ``asyncio.run()`` loop (single-file ingest, ask/lint/init, the tool-module
+    ``run_ingest`` path, and ``__main__``). Callers are unchanged sync code.
+    """
+    if _ACTIVE_RUNNER is not None:
+        return _ACTIVE_RUNNER.run(coro)
+    return asyncio.run(coro)
+
+
+@contextmanager
+def shared_engine_loop() -> Iterator[asyncio.Runner]:
+    """Install ONE asyncio event loop for an entire ingest drive.
+
+    Every ``_run_coro()`` call made inside this context shares the runner's
+    loop, so the cached ``_BASE_BUNDLE`` provider client is created and reused
+    on a single live loop for the whole drain (sources + the final re-weave).
+    The loop is closed exactly once, when the context exits.
+
+    Re-entrant: a nested call reuses the already-installed runner rather than
+    opening a second loop.
+    """
+    global _ACTIVE_RUNNER
+    if _ACTIVE_RUNNER is not None:
+        # Already inside a shared loop -> reuse it; don't nest runners.
+        yield _ACTIVE_RUNNER
+        return
+    runner = asyncio.Runner()
+    _ACTIVE_RUNNER = runner
+    try:
+        yield runner
+    finally:
+        _ACTIVE_RUNNER = None
+        runner.close()
 
 
 async def _load_base() -> Any:
-    global _BASE_BUNDLE
-    if _BASE_BUNDLE is not None:
+    global _BASE_BUNDLE, _BASE_BUNDLE_LOOP
+    running = asyncio.get_running_loop()
+    # Reuse the cached bundle ONLY while its provider client is still bound to
+    # the live loop. If the loop that built it is gone (a *new* ingest drive in
+    # the same process -- e.g. the agent-tool path invoking ingest twice), the
+    # cached client would reference a closed loop: reload under the current loop
+    # instead. This closes the cross-invocation sibling of the _BASE_BUNDLE bug
+    # while preserving load-once WITHIN a single drive (same loop -> cache hit).
+    if _BASE_BUNDLE is not None and _BASE_BUNDLE_LOOP is running:
         return _BASE_BUNDLE
     from amplifier_foundation import load_bundle
 
@@ -1002,6 +1150,7 @@ async def _load_base() -> Any:
     for src in candidates:
         try:
             _BASE_BUNDLE = await load_bundle(src)
+            _BASE_BUNDLE_LOOP = running
             return _BASE_BUNDLE
         except Exception as e:  # noqa: BLE001
             last_err = e
@@ -1057,6 +1206,30 @@ async def _build_prepared(dot_source: str, logs_dir: Path) -> Any:
     return prepared
 
 
+async def _drain_session_tasks(tasks_before: set[asyncio.Task[Any]]) -> None:
+    """Cancel + await tasks a single pipeline run spawned but left pending.
+
+    Under the single-loop ingest drive the per-run ``loop.close()`` that used to
+    reap dangling child-agent spawn tasks is gone, so debris from source N must
+    be drained before source N+1 begins. We touch ONLY tasks created after
+    ``tasks_before`` was captured (this run's own tasks), leaving the shared
+    provider client + bundle infrastructure untouched. Called on every exit
+    path (see ``_run_pipeline``'s ``finally``).
+    """
+    current = asyncio.current_task()
+    leaked = [
+        t
+        for t in asyncio.all_tasks()
+        if t is not current and t not in tasks_before and not t.done()
+    ]
+    if not leaked:
+        return
+    for t in leaked:
+        t.cancel()
+    # Await cancellation so no half-cancelled task survives into the next source.
+    await asyncio.gather(*leaked, return_exceptions=True)
+
+
 async def _run_pipeline(
     dot_source: str,
     logs_dir: Path,
@@ -1080,8 +1253,19 @@ async def _run_pipeline(
         "session.spawn", make_spawn_fn(prepared, wiki_dir=wiki_dir)
     )
 
-    async with session:
-        raw = await session.execute(execute_prompt)
+    # Per-source cleanup (single-loop drain): capture the task set AFTER session
+    # setup so the sweep targets only THIS run's execution/spawn debris -- not
+    # the shared provider client's or bundle's tasks. Previously each source's
+    # loop.close() reaped dangling child-agent tasks for free; under one shared
+    # loop that boundary is gone, so we cancel + await them explicitly on ALL
+    # exit paths (success, refine/retry, validator-fail/fail-route, exception)
+    # so debris from source N cannot leak into source N+1.
+    tasks_before = set(asyncio.all_tasks())
+    try:
+        async with session:
+            raw = await session.execute(execute_prompt)
+    finally:
+        await _drain_session_tasks(tasks_before)
 
     text = str(raw)
     try:
@@ -1130,7 +1314,7 @@ def run_inner(
     dot_source = build_dot(source_path, wiki_dir, policy, source_id=source_id)
     (logs_dir / "inner.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, data = asyncio.run(
+    _text, data = _run_coro(
         _run_pipeline(dot_source, logs_dir, wiki_dir, wiki_dir=wiki_dir)
     )
     status = data.get("status", "unknown")
@@ -1223,7 +1407,7 @@ def run_ingest(
 
     (logs_dir / "ingest.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, data = asyncio.run(
+    _text, data = _run_coro(
         _run_pipeline(dot_source, logs_dir, wiki_dir, wiki_dir=wiki_dir)
     )
     status = data.get("status", "unknown")
@@ -1272,7 +1456,7 @@ def run_thin_slice(
     dot_source = THIN_SLICE_DOT.format(provider=PROVIDER, out_path=str(out_path))
     (logs_dir / "thin.dot").write_text(dot_source, encoding="utf-8")
 
-    text, _data = asyncio.run(
+    text, _data = _run_coro(
         _run_pipeline(dot_source, logs_dir, cwd, execute_prompt="Run the pipeline")
     )
     return {
@@ -1392,7 +1576,7 @@ def run_lint(wiki_dir: str | Path) -> int:
     dot_source = build_lint_dot_from_file(wiki_dir, lint_result_file)
     (logs_dir / "lint.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, _data = asyncio.run(
+    _text, _data = _run_coro(
         _run_pipeline(dot_source, logs_dir, wiki_dir, execute_prompt="Run the pipeline")
     )
 
@@ -1662,7 +1846,7 @@ def run_init(
     )
     (logs_dir / "init.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, _data = asyncio.run(
+    _text, _data = _run_coro(
         _run_pipeline(
             dot_source,
             logs_dir,

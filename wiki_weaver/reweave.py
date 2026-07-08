@@ -44,16 +44,26 @@ the schema-design agent write schema.md directly.
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .engine_runner import MODEL, PROVIDER, _dot_escape_prompt, _run_pipeline
-from .grading import GradeResult, grade_overview
+from .engine_runner import MODEL, PROVIDER, _dot_escape_prompt, _run_coro, _run_pipeline
 from .lib import wiki_runs
 from .model_resolver import resolve_model
 from .policy import load_policy
+
+# grade_overview lives in eval/, which is NOT a Python package (it's the eval
+# harness directory, kept out of the installed wiki_weaver package on
+# purpose -- see pyproject.toml). Every eval/test_*.py already imports
+# grade_wiki via this same sys.path convention; mirrored here so runtime code
+# and tests resolve the identical module.
+_EVAL_DIR = Path(__file__).resolve().parent.parent / "eval"
+if str(_EVAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_EVAL_DIR))
+from grade_wiki import GradeResult, grade_overview  # noqa: E402  pyright: ignore[reportMissingImports]
 
 __all__ = [
     "ReweaveGateResult",
@@ -189,7 +199,10 @@ def reweave_overview(wiki_dir: str | Path) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / "reweave.dot").write_text(dot_source, encoding="utf-8")
 
-    asyncio.run(_run_reweave_pipeline(dot_source, logs_dir, wiki_dir))
+    # Runs on the shared ingest loop when driven from ingest()'s
+    # shared_engine_loop() context (single-loop drain); otherwise a private
+    # one-shot loop. Either way the load-once _BASE_BUNDLE stays loop-consistent.
+    _run_coro(_run_reweave_pipeline(dot_source, logs_dir, wiki_dir))
 
     overview_path = wiki_dir / "overview.md"
     if (
