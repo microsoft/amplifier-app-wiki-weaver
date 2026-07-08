@@ -43,14 +43,13 @@ the schema-design agent write schema.md directly.
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .engine_runner import MODEL, PROVIDER, _dot_escape_prompt, _run_pipeline
+from .engine_runner import MODEL, PROVIDER, _dot_escape_prompt, _run_coro, _run_pipeline
 from .lib import wiki_runs
 from .model_resolver import resolve_model
 from .policy import load_policy
@@ -199,7 +198,10 @@ def reweave_overview(wiki_dir: str | Path) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / "reweave.dot").write_text(dot_source, encoding="utf-8")
 
-    asyncio.run(_run_reweave_pipeline(dot_source, logs_dir, wiki_dir))
+    # Runs on the shared ingest loop when driven from ingest()'s
+    # shared_engine_loop() context (single-loop drain); otherwise a private
+    # one-shot loop. Either way the load-once _BASE_BUNDLE stays loop-consistent.
+    _run_coro(_run_reweave_pipeline(dot_source, logs_dir, wiki_dir))
 
     overview_path = wiki_dir / "overview.md"
     if (

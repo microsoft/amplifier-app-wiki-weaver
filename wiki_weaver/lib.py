@@ -864,7 +864,7 @@ def ingest(
 
     # Import the engine runner lazily so `doctor`/`init`/`lint` never pay the
     # cost of pulling in the attractor engine.
-    from wiki_weaver.engine_runner import run_inner
+    from wiki_weaver.engine_runner import run_inner, shared_engine_loop
 
     processed = _processed_sources(wiki)
     summary_drain: list[tuple[str, str]] = []
@@ -879,163 +879,171 @@ def ingest(
     _FRESH_RETRIES_MAX = 5
     _fresh_retries = 0
 
-    while True:
-        pending = sorted(
-            p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
-        )
-        now = time.time()
-        ready = [p for p in pending if (now - p.stat().st_mtime) >= _DEBOUNCE_SECS]
+    # Single event loop for the ENTIRE drain + final re-weave (Option A):
+    # every per-source run_inner() and the overview re-weave share ONE loop,
+    # so the load-once _BASE_BUNDLE provider client stays bound to a live loop
+    # for the whole ingest (was: a fresh asyncio.run() per source that closed
+    # its loop, wedging source N+1 on the closed-loop client).
+    with shared_engine_loop():
+        while True:
+            pending = sorted(
+                p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
+            )
+            now = time.time()
+            ready = [p for p in pending if (now - p.stat().st_mtime) >= _DEBOUNCE_SECS]
 
-        if not ready:
-            if pending and _fresh_retries < _FRESH_RETRIES_MAX:
-                # Files exist but all too-fresh; wait and retry.
-                _fresh_retries += 1
-                time.sleep(0.5)
+            if not ready:
+                if pending and _fresh_retries < _FRESH_RETRIES_MAX:
+                    # Files exist but all too-fresh; wait and retry.
+                    _fresh_retries += 1
+                    time.sleep(0.5)
+                    continue
+                # No files at all, or fresh-retry budget exhausted → drain complete.
+                break
+
+            _fresh_retries = 0  # reset whenever we find a ready file
+            src = ready[0]
+            name = src.name
+
+            # Text sniff: route binary files to _failed/ without calling run_inner.
+            if not _looks_like_text(src):
+                _fail(
+                    f"{src.name}: unsupported binary source (no text handler)"
+                    " — routing to _failed/"
+                )
+                _collision_safe_move(src, failed_dir)
+                summary_drain.append((src.name, "binary"))
                 continue
-            # No files at all, or fresh-retry budget exhausted → drain complete.
-            break
 
-        _fresh_retries = 0  # reset whenever we find a ready file
-        src = ready[0]
-        name = src.name
+            # Fix 3: assign/look up a STABLE id by content hash BEFORE ingest and
+            # dedupe an already-ingested source (same bytes) regardless of filename.
+            entry, is_new = _assign_source_id(wiki, src)
+            source_id = entry["id"]
+            file_hash = entry["hash"]
+            already_done = entry.get("ingested") or name in processed
+            if already_done:
+                _warn(
+                    f"skip (already ingested as source id [{source_id}], "
+                    f"hash {file_hash[:12]}): {name}"
+                )
+                # Drain mode: move dup out of inbox to clear it (prevents spin).
+                _collision_safe_move(src, sources_dir)
+                summary_drain.append((name, "skipped"))
+                continue
+            if is_new:
+                print(f"  assigned stable source id [{source_id}] for {name}")
+            else:
+                print(f"  reusing stable source id [{source_id}] for {name}")
 
-        # Text sniff: route binary files to _failed/ without calling run_inner.
-        if not _looks_like_text(src):
-            _fail(
-                f"{src.name}: unsupported binary source (no text handler)"
-                " — routing to _failed/"
+            print(f"\n=== ingest: {name} (source id [{source_id}]) ===")
+
+            # Fix 1b: snapshot process state so we can detect any agent-written
+            # ledger line / archive move performed DURING the inner run (the lib
+            # writes process state only AFTER this, on real convergence).
+            before_state = _snapshot_process_state(wiki)
+
+            try:
+                result = run_inner(
+                    src, wiki, max_cycles=max_cycles, source_id=source_id
+                )
+            except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
+                _fail(f"engine error on {name}: {type(e).__name__}: {e}")
+                if src.is_file() and src.parent == inbox:
+                    _collision_safe_move(src, failed_dir)
+                summary_drain.append((name, "error"))
+                continue  # drain always continues; exit code is set after drain
+
+            # Fix 1b: never trust agent-written process state. Undo + fail loud.
+            violations = _detect_and_undo_tamper(wiki, before_state)
+            if violations:
+                _fail(
+                    f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
+                    f"state it does not own. Convergence is NOT trusted; "
+                    f"fabricated records were reverted."
+                )
+                for v in violations:
+                    _fail(f"    - {v}")
+                if src.is_file() and src.parent == inbox:
+                    _collision_safe_move(src, failed_dir)
+                summary_drain.append((name, "tampered"))
+                continue
+
+            if result.converged:
+                dest = sources_dir / name
+                if src.is_file() and src.parent == inbox:
+                    src.replace(dest)
+                _append_ledger(
+                    wiki,
+                    {
+                        "source": name,
+                        "source_id": source_id,
+                        "hash": file_hash,
+                        "status": result.status,
+                        "converged": result.converged,
+                        "archived_to": str(dest),
+                        "logs_dir": str(result.logs_dir),
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+                _mark_source_ingested(wiki, file_hash)
+                _ok(f"{name}: converged (logs: {result.logs_dir})")
+                summary_drain.append((name, "converged"))
+            else:
+                _fail(
+                    f"{name}: did not converge "
+                    f"(status={result.status}, reason={result.failure_reason})"
+                )
+                if src.is_file() and src.parent == inbox:
+                    _collision_safe_move(src, failed_dir)
+                summary_drain.append((name, "not-converged"))
+                # Drain mode: always continue (never halt on non-convergence).
+
+        _print_summary(summary_drain)
+        # Fail-loud after the drain: surface anything routed to _failed/ as a
+        # distinct, un-missable block (not merely a yellow bullet in the summary) so
+        # silently-dropped sources cannot slip past the operator.
+        failed_items = [
+            (n, s)
+            for n, s in summary_drain
+            if s in {"error", "not-converged", "tampered", "binary"}
+        ]
+        if failed_items:
+            print(
+                f"\n{RED}!! {len(failed_items)} source(s) were NOT added to the wiki"
+                f" -- moved to {failed_dir}{RESET}"
             )
-            _collision_safe_move(src, failed_dir)
-            summary_drain.append((src.name, "binary"))
-            continue
-
-        # Fix 3: assign/look up a STABLE id by content hash BEFORE ingest and
-        # dedupe an already-ingested source (same bytes) regardless of filename.
-        entry, is_new = _assign_source_id(wiki, src)
-        source_id = entry["id"]
-        file_hash = entry["hash"]
-        already_done = entry.get("ingested") or name in processed
-        if already_done:
-            _warn(
-                f"skip (already ingested as source id [{source_id}], "
-                f"hash {file_hash[:12]}): {name}"
-            )
-            # Drain mode: move dup out of inbox to clear it (prevents spin).
-            _collision_safe_move(src, sources_dir)
-            summary_drain.append((name, "skipped"))
-            continue
-        if is_new:
-            print(f"  assigned stable source id [{source_id}] for {name}")
-        else:
-            print(f"  reusing stable source id [{source_id}] for {name}")
-
-        print(f"\n=== ingest: {name} (source id [{source_id}]) ===")
-
-        # Fix 1b: snapshot process state so we can detect any agent-written
-        # ledger line / archive move performed DURING the inner run (the lib
-        # writes process state only AFTER this, on real convergence).
-        before_state = _snapshot_process_state(wiki)
-
-        try:
-            result = run_inner(src, wiki, max_cycles=max_cycles, source_id=source_id)
-        except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
-            _fail(f"engine error on {name}: {type(e).__name__}: {e}")
-            if src.is_file() and src.parent == inbox:
-                _collision_safe_move(src, failed_dir)
-            summary_drain.append((name, "error"))
-            continue  # drain always continues; exit code is set after drain
-
-        # Fix 1b: never trust agent-written process state. Undo + fail loud.
-        violations = _detect_and_undo_tamper(wiki, before_state)
-        if violations:
-            _fail(
-                f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
-                f"state it does not own. Convergence is NOT trusted; "
-                f"fabricated records were reverted."
-            )
-            for v in violations:
-                _fail(f"    - {v}")
-            if src.is_file() and src.parent == inbox:
-                _collision_safe_move(src, failed_dir)
-            summary_drain.append((name, "tampered"))
-            continue
-
-        if result.converged:
-            dest = sources_dir / name
-            if src.is_file() and src.parent == inbox:
-                src.replace(dest)
-            _append_ledger(
-                wiki,
-                {
-                    "source": name,
-                    "source_id": source_id,
-                    "hash": file_hash,
-                    "status": result.status,
-                    "converged": result.converged,
-                    "archived_to": str(dest),
-                    "logs_dir": str(result.logs_dir),
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                },
-            )
-            _mark_source_ingested(wiki, file_hash)
-            _ok(f"{name}: converged (logs: {result.logs_dir})")
-            summary_drain.append((name, "converged"))
-        else:
-            _fail(
-                f"{name}: did not converge "
-                f"(status={result.status}, reason={result.failure_reason})"
-            )
-            if src.is_file() and src.parent == inbox:
-                _collision_safe_move(src, failed_dir)
-            summary_drain.append((name, "not-converged"))
-            # Drain mode: always continue (never halt on non-convergence).
-
-    _print_summary(summary_drain)
-    # Fail-loud after the drain: surface anything routed to _failed/ as a
-    # distinct, un-missable block (not merely a yellow bullet in the summary) so
-    # silently-dropped sources cannot slip past the operator.
-    failed_items = [
-        (n, s)
-        for n, s in summary_drain
-        if s in {"error", "not-converged", "tampered", "binary"}
-    ]
-    if failed_items:
-        print(
-            f"\n{RED}!! {len(failed_items)} source(s) were NOT added to the wiki"
-            f" -- moved to {failed_dir}{RESET}"
-        )
-        for n, s in failed_items:
-            print(f"{RED}   - {n}  ({s}){RESET}")
-        print(
-            f"{RED}   review these, fix, and re-drop into _inbox/ to retry,"
-            f" or remove them.{RESET}"
-        )
-
-    # ---------------------------------------------------------------------- #
-    # Item 2 (overview re-weave): runs ONCE HERE, after the ENTIRE _inbox/    #
-    # drain has completed -- never per source. grade_overview() is free and  #
-    # deterministic; a re-weave LLM call only happens when overview.md has   #
-    # actually degraded into a per-source narration log. Bounded retries;    #
-    # fails loud (never silently reports success on a still-failing gate).   #
-    # See wiki_weaver/reweave.py for the mechanism + cost-bounded design.    #
-    # ---------------------------------------------------------------------- #
-    from wiki_weaver.reweave import reweave_overview_if_needed
-
-    reweave_result = reweave_overview_if_needed(wiki)
-    if reweave_result.attempts:
-        if reweave_result.final_passed:
-            _ok(
-                f"overview.md re-woven into a synthesized map "
-                f"({reweave_result.attempts} attempt(s))"
-            )
-        else:
-            _fail(
-                f"overview.md still fails grade_overview() after "
-                f"{reweave_result.attempts} re-weave attempt(s):\n"
-                f"{reweave_result.final_report}"
+            for n, s in failed_items:
+                print(f"{RED}   - {n}  ({s}){RESET}")
+            print(
+                f"{RED}   review these, fix, and re-drop into _inbox/ to retry,"
+                f" or remove them.{RESET}"
             )
 
-    return 1 if failed_items or not reweave_result.final_passed else 0
+        # ---------------------------------------------------------------------- #
+        # Item 2 (overview re-weave): runs ONCE HERE, after the ENTIRE _inbox/    #
+        # drain has completed -- never per source. grade_overview() is free and  #
+        # deterministic; a re-weave LLM call only happens when overview.md has   #
+        # actually degraded into a per-source narration log. Bounded retries;    #
+        # fails loud (never silently reports success on a still-failing gate).   #
+        # See wiki_weaver/reweave.py for the mechanism + cost-bounded design.    #
+        # ---------------------------------------------------------------------- #
+        from wiki_weaver.reweave import reweave_overview_if_needed
+
+        reweave_result = reweave_overview_if_needed(wiki)
+        if reweave_result.attempts:
+            if reweave_result.final_passed:
+                _ok(
+                    f"overview.md re-woven into a synthesized map "
+                    f"({reweave_result.attempts} attempt(s))"
+                )
+            else:
+                _fail(
+                    f"overview.md still fails grade_overview() after "
+                    f"{reweave_result.attempts} re-weave attempt(s):\n"
+                    f"{reweave_result.final_report}"
+                )
+
+        return 1 if failed_items or not reweave_result.final_passed else 0
 
 
 # ---------------------------------------------------------------------------
