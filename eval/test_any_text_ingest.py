@@ -128,6 +128,7 @@ def _args(wiki: Path, *, source: str | None = None) -> argparse.Namespace:
         source=source,
         max_cycles=None,
         keep_going=False,
+        limit=None,
     )
 
 

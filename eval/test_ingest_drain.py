@@ -122,12 +122,14 @@ def _args(
     *,
     source: str | None = None,
     keep_going: bool = False,
+    limit: int | None = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         wiki=str(wiki),
         source=source,
         max_cycles=None,
         keep_going=keep_going,
+        limit=limit,
     )
 
 
