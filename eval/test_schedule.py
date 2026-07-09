@@ -20,6 +20,7 @@ monkeypatched to a stub wherever run_now/cmd_ingest would otherwise invoke it.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -105,6 +106,251 @@ def test_interval_to_cron_non_dividing_minutes_warns_but_returns(
     assert result == "*/7 * * * *"
     captured = capsys.readouterr()
     assert "7" in captured.out  # the _warn() call prints to stdout
+
+
+# ---------------------------------------------------------------------------
+# validate_limit [C5]
+# ---------------------------------------------------------------------------
+
+
+def test_validate_limit_negative_rejected() -> None:
+    with pytest.raises(ValueError):
+        sched.validate_limit(-1)
+
+
+@pytest.mark.parametrize("n", [None, 0, 1, 10, 1000])
+def test_validate_limit_accepts_none_and_nonnegative(n: int | None) -> None:
+    assert sched.validate_limit(n) == n
+
+
+def test_negative_limit_rejected_by_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCrontab()
+    _patch_crontab_backend(monkeypatch, fake)
+    wiki = _make_wiki(tmp_path, "w")
+
+    rc = sched.install(str(wiki), every="5m", cron=None, limit=-1)
+
+    assert rc == 2
+    assert fake.write_calls == []
+
+
+def test_negative_limit_rejected_by_run_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wiki = _make_wiki(tmp_path, "w")
+    ingest_calls: list[tuple] = []
+    monkeypatch.setattr(
+        sched, "_ingest", lambda canon, **kw: ingest_calls.append((canon, kw)) or 0
+    )
+
+    rc = sched.run_now(str(wiki), limit=-1)
+
+    assert rc == 2
+    assert ingest_calls == []
+
+
+def test_negative_limit_rejected_by_cmd_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wiki_weaver import cli
+
+    wiki = _make_wiki(tmp_path, "w")
+    ingest_calls: list[tuple] = []
+    monkeypatch.setattr(cli, "ingest", lambda *a, **kw: ingest_calls.append(a) or 0)
+
+    args = argparse.Namespace(
+        wiki=str(wiki),
+        source=None,
+        max_cycles=None,
+        keep_going=False,
+        limit=-1,
+    )
+    rc = cli.cmd_ingest(args)
+
+    assert rc == 2
+    assert ingest_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Defaults [C6]
+# ---------------------------------------------------------------------------
+
+
+def test_install_persists_default_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCrontab()
+    _patch_crontab_backend(monkeypatch, fake)
+    wiki = _make_wiki(tmp_path, "w")
+
+    rc = sched.install(str(wiki), every="5m", cron=None)
+    assert rc == 0
+
+    iid = inst.instance_id(wiki)
+    cfg = inst.read_instance_config(iid)
+    assert cfg is not None
+    assert cfg.limit == sched._DEFAULT_SCHEDULED_LIMIT
+
+
+def test_install_explicit_limit_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCrontab()
+    _patch_crontab_backend(monkeypatch, fake)
+    wiki = _make_wiki(tmp_path, "w")
+
+    rc = sched.install(str(wiki), every="5m", cron=None, limit=7)
+    assert rc == 0
+
+    iid = inst.instance_id(wiki)
+    cfg = inst.read_instance_config(iid)
+    assert cfg is not None
+    assert cfg.limit == 7
+
+
+def test_bare_run_now_uses_unattended_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No installed config -> effective cap falls to _DEFAULT_SCHEDULED_LIMIT."""
+    wiki = _make_wiki(tmp_path, "w")
+    captured_kwargs: dict = {}
+
+    def _fake_ingest(canon, **kw):
+        captured_kwargs.update(kw)
+        return 0
+
+    monkeypatch.setattr(sched, "_ingest", _fake_ingest)
+
+    rc = sched.run_now(str(wiki))
+
+    assert rc == 0
+    assert captured_kwargs["limit"] == sched._DEFAULT_SCHEDULED_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc override [C7]
+# ---------------------------------------------------------------------------
+
+
+def test_run_now_override_does_not_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCrontab()
+    _patch_crontab_backend(monkeypatch, fake)
+    wiki = _make_wiki(tmp_path, "w")
+    sched.install(str(wiki), every="5m", cron=None, limit=5)
+
+    captured_kwargs: dict = {}
+
+    def _fake_ingest(canon, **kw):
+        captured_kwargs.update(kw)
+        return 0
+
+    monkeypatch.setattr(sched, "_ingest", _fake_ingest)
+
+    rc = sched.run_now(str(wiki), limit=2)
+
+    assert rc == 0
+    assert captured_kwargs["limit"] == 2
+
+    iid = inst.instance_id(wiki)
+    cfg = inst.read_instance_config(iid)
+    assert cfg is not None
+    assert cfg.limit == 5  # unchanged by the ad-hoc override
+
+
+def test_run_now_inherits_persisted_when_no_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeCrontab()
+    _patch_crontab_backend(monkeypatch, fake)
+    wiki = _make_wiki(tmp_path, "w")
+    sched.install(str(wiki), every="5m", cron=None, limit=5)
+
+    captured_kwargs: dict = {}
+
+    def _fake_ingest(canon, **kw):
+        captured_kwargs.update(kw)
+        return 0
+
+    monkeypatch.setattr(sched, "_ingest", _fake_ingest)
+
+    rc = sched.run_now(str(wiki))
+
+    assert rc == 0
+    assert captured_kwargs["limit"] == 5
+
+
+def test_run_now_hit_limit_recorded_in_run_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_now sets report.hit_limit -> st.hit_limit persisted, surfaced by status."""
+    from wiki_weaver.lib import DrainReport
+
+    wiki = _make_wiki(tmp_path, "w")
+    iid = inst.instance_id(wiki)
+
+    def _fake_ingest(canon, *, limit=None, report: DrainReport | None = None):
+        if report is not None:
+            report.hit_limit = True
+        return 0
+
+    monkeypatch.setattr(sched, "_ingest", _fake_ingest)
+
+    rc = sched.run_now(str(wiki), limit=1)
+
+    assert rc == 0
+    st = inst.read_run_state(iid)
+    assert st.hit_limit is True
+
+
+# ---------------------------------------------------------------------------
+# status on a legacy instance (command-level proof of the [C1] crash fix)
+# ---------------------------------------------------------------------------
+
+
+def test_status_on_legacy_instance(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A pre-addendum instance.json/run-state.json (no limit/hit_limit) must
+    not crash `schedule status` -- it should load with the new fields
+    defaulted."""
+    wiki = _make_wiki(tmp_path, "w")
+    iid = inst.instance_id(wiki)
+
+    legacy_cfg = {
+        "instance_id": iid,
+        "canonical_wiki": str(inst.canonical_wiki_path(wiki)),
+        "cron_expr": "*/5 * * * *",
+        "every": "5m",
+        "alert_after": 3,
+        "uses_env_file": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    (inst.instance_config_dir(iid) / "instance.json").write_text(
+        json.dumps(legacy_cfg), encoding="utf-8"
+    )
+    legacy_state = {
+        "consecutive_skips": 0,
+        "alert_active": False,
+        "last_run_at": None,
+        "last_exit": None,
+        "last_duration_s": None,
+        "last_skip_at": None,
+        "last_holder_pid": None,
+    }
+    (inst.instance_data_dir(iid) / "run-state.json").write_text(
+        __import__("json").dumps(legacy_state), encoding="utf-8"
+    )
+
+    rc = sched.status(str(wiki))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "limit: None" in out
+    assert "hit_limit: False" in out
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +535,9 @@ def test_run_now_skip_path_does_not_call_ingest_and_logs_warn(
     iid = inst.instance_id(wiki)
 
     ingest_calls: list[Path] = []
-    monkeypatch.setattr(sched, "_ingest", lambda canon: ingest_calls.append(canon) or 0)
+    monkeypatch.setattr(
+        sched, "_ingest", lambda canon, **_kw: ingest_calls.append(canon) or 0
+    )
 
     # Pre-acquire the ingest lock with a "live" PID.
     lock_path = inst.ingest_lock_path(wiki)
@@ -360,7 +608,7 @@ def test_run_now_run_path_calls_ingest_once_and_records_state(
 
     ingest_calls: list[Path] = []
 
-    def _fake_ingest(canon: Path) -> int:
+    def _fake_ingest(canon: Path, **_kw) -> int:
         ingest_calls.append(canon)
         return 0
 
@@ -390,7 +638,7 @@ def test_run_now_run_path_returns_stub_rc(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wiki = _make_wiki(tmp_path, "w")
-    monkeypatch.setattr(sched, "_ingest", lambda canon: 1)
+    monkeypatch.setattr(sched, "_ingest", lambda canon, **_kw: 1)
 
     rc = sched.run_now(str(wiki))
     assert rc == 1
@@ -436,7 +684,11 @@ def test_cmd_ingest_guard_returns_exit_skip_and_does_not_call_ingest(
     monkeypatch.setattr(pidlock, "pid_alive", lambda pid: True)
 
     args = argparse.Namespace(
-        wiki=str(wiki), source=None, max_cycles=None, keep_going=False
+        wiki=str(wiki),
+        source=None,
+        max_cycles=None,
+        keep_going=False,
+        limit=None,
     )
     rc = cli.cmd_ingest(args)
 

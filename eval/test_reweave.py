@@ -183,7 +183,11 @@ def test_ingest_drain_calls_reweave_gate_exactly_once(tmp_path: Path) -> None:
         )
 
     args = argparse.Namespace(
-        wiki=str(wiki), source=None, max_cycles=None, keep_going=False
+        wiki=str(wiki),
+        source=None,
+        max_cycles=None,
+        keep_going=False,
+        limit=None,
     )
 
     with (

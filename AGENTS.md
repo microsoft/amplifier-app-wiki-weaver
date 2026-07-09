@@ -31,14 +31,20 @@ before verification passes. `--dry-run` prints the plan without changes; `--forc
 sentinel.
 
 `schedule install|remove|status|list|run-now` manages unattended, **cron-only** continuous
-ingestion (see `docs/designs/scheduled-ingestion-spec.md`): `install --wiki <dir> --every 5m`
+ingestion (see `docs/designs/scheduled-ingestion-spec.md`, and the `--limit` addendum at
+`docs/designs/scheduled-ingestion-limit-addendum.md`): `install --wiki <dir> --every 5m`
 (interval sugar, or `--cron '<5-field expr>'` for the power-user escape hatch) installs a
 per-instance managed block in the user's crontab (`# >>> wiki-weaver:<id> >>>` /
 `# <<< wiki-weaver:<id> <<<`) whose command is `wiki-weaver schedule run-now --wiki <path>`; N
 independent wikis coexist in one crontab, each block independently upsert/removable. Each tick
 (`run-now`) acquires a liveness-checked per-wiki PID lock (`<data>/instances/<id>/ingest.lock`,
 ported from `migrate`'s lock algorithm into the reusable `wiki_weaver/pidlock.py`), drains
-`_inbox/` via the existing `ingest()` core **unchanged**, and skips cleanly (exit 0, loud
+`_inbox/` via the existing `ingest()` core with its sort/selection order and single-file
+`--source` path **unchanged** — the only addition is a per-tick `--limit` cap on how many
+sources reach real LLM synthesis in drain mode (unattended default: 10; manual `ingest`
+defaults to unlimited; `schedule install --limit N` persists a cap; `run-now --limit N`
+overrides it for one tick without rewriting config; a cap-hit is a loud `WARN`, not a failure,
+and is surfaced by `status`/`list` as `hit_limit`/` CAPPED`) — and skips cleanly (exit 0, loud
 WARN/ERROR log line, never a cron `MAILTO` spam) if a previous run is still in flight — consecutive
 skips escalate to an `alert_active` flag surfaced by `status`/`list` after `--alert-after` (default
 3) cycles. The SAME per-wiki lock is also acquired by manual `wiki-weaver ingest`

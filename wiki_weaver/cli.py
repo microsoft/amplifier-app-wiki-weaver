@@ -114,7 +114,13 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     # This is a triggering-layer concern only -- `ingest()` itself stays lock-free.
     from wiki_weaver import instances as _inst
     from wiki_weaver import pidlock as _lock
-    from wiki_weaver.schedule import EXIT_SKIP
+    from wiki_weaver.schedule import EXIT_SKIP, validate_limit
+
+    try:
+        limit = validate_limit(args.limit)
+    except ValueError as exc:
+        _fail(str(exc))
+        return 2
 
     lock = _inst.ingest_lock_path(args.wiki)
     res = _lock.try_acquire(lock)
@@ -130,6 +136,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             source=args.source,
             max_cycles=args.max_cycles,
             keep_going=args.keep_going,
+            limit=limit,
         )
     finally:
         _lock.release(lock)
@@ -184,7 +191,11 @@ def cmd_schedule(args: argparse.Namespace) -> int:
     cmd = args.schedule_command
     if cmd == "install":
         return sched.install(
-            args.wiki, every=args.every, cron=args.cron, alert_after=args.alert_after
+            args.wiki,
+            every=args.every,
+            cron=args.cron,
+            alert_after=args.alert_after,
+            limit=args.limit,
         )
     if cmd == "remove":
         if not args.wiki and not args.instance_id:
@@ -199,7 +210,7 @@ def cmd_schedule(args: argparse.Namespace) -> int:
     if cmd == "list":
         return sched.list_all()
     if cmd == "run-now":
-        return sched.run_now(args.wiki)
+        return sched.run_now(args.wiki, limit=args.limit)
     # no subcommand -> print schedule help
     _fail("schedule: specify install|remove|status|list|run-now")
     return 2
@@ -325,6 +336,12 @@ def main() -> None:
         "--keep-going",
         action="store_true",
         help="continue to next source after a failure",
+    )
+    p_ingest.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="cap real-ingest sources this run (default: unlimited)",
     )
 
     p_lint = sub.add_parser("lint", help="run the structural validator")
@@ -458,6 +475,12 @@ def main() -> None:
         dest="alert_after",
         help="escalate after N consecutive skipped cycles (default: 3)",
     )
+    s_install.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="per-tick cap on real-ingest sources (default: 10)",
+    )
 
     s_remove = sched_sub.add_parser("remove", help="remove a wiki's cron entry")
     s_remove.add_argument(
@@ -484,6 +507,12 @@ def main() -> None:
         "run-now", help="run one ingest tick now (what cron invokes)"
     )
     s_run.add_argument("--wiki", required=True, help="wiki directory")
+    s_run.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="override the persisted per-tick cap for THIS tick only",
+    )
 
     args = parser.parse_args()
 

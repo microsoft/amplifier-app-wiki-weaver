@@ -20,7 +20,7 @@ from typing import IO
 from wiki_weaver import crontab as _ct
 from wiki_weaver import instances as _inst
 from wiki_weaver import pidlock as _lock
-from wiki_weaver.lib import _fail, _ok, _warn
+from wiki_weaver.lib import DrainReport, _fail, _ok, _warn
 from wiki_weaver.lib import ingest as _ingest
 from wiki_weaver.lib import preflight as _preflight
 
@@ -31,6 +31,7 @@ __all__ = [
     "list_all",
     "run_now",
     "interval_to_cron",
+    "validate_limit",
     "EXIT_SKIP",
 ]
 
@@ -38,6 +39,17 @@ EXIT_SKIP = 75  # EX_TEMPFAIL -- used by cmd_ingest's manual-guard skip (D3); ru
 _LOG_MAX_BYTES = 10 * 1024 * 1024
 _LOG_BACKUPS = 5
 _DEFAULT_ALERT_AFTER = 3
+
+# Unattended default cap (scheduled-ingestion-limit-addendum [C6]). A scheduled
+# tick runs with NOBODY watching, so one tick must not balloon into hours of
+# LLM-driven synthesis (the maintainer's 800+-article backlog case).
+# Sizing: real per-source convergence is multi-cycle and empirically runs a few
+# minutes each. At ~3-5 min/source, 10 real ingests is roughly 30-50 min of
+# work -- comfortably inside a common cron cadence (e.g. hourly) with margin,
+# so a large backlog drains steadily over many bounded ticks instead of one
+# unbounded marathon. Operators who want more per tick set an explicit
+# `schedule install --limit N` (persisted) or `run-now --limit N` (one-off).
+_DEFAULT_SCHEDULED_LIMIT = 10
 
 
 def utcnow_iso() -> str:
@@ -104,6 +116,16 @@ def _validate_cron_expr(expr: str) -> str:
     return expr
 
 
+def validate_limit(n: int | None) -> int | None:
+    """Reject a negative --limit. None = unlimited; 0 = pause real ingestion this run."""
+    if n is not None and n < 0:
+        raise ValueError(
+            f"--limit must be >= 0 (got {n}); use 0 to process zero real-ingestion "
+            f"sources this run, or omit --limit for unlimited"
+        )
+    return n
+
+
 # ---------------------------------------------------------------------------
 # 7.2 install
 # ---------------------------------------------------------------------------
@@ -115,6 +137,7 @@ def install(
     every: str | None,
     cron: str | None,
     alert_after: int = _DEFAULT_ALERT_AFTER,
+    limit: int | None = None,
 ) -> int:
     if not _ct.crontab_available():
         _fail("crontab binary not found on PATH")
@@ -133,9 +156,15 @@ def install(
 
     try:
         cron_expr = interval_to_cron(every) if every else _validate_cron_expr(cron)  # type: ignore[arg-type]
+        limit = validate_limit(limit)
     except ValueError as exc:
         _fail(str(exc))
         return 2
+
+    # Persisted cap: an explicit --limit wins; otherwise the unattended default
+    # (10) is written so a plain `schedule install` is bounded from tick one
+    # [C6][C5].
+    persisted_limit = limit if limit is not None else _DEFAULT_SCHEDULED_LIMIT
 
     try:
         binary = _ct.resolve_binary()
@@ -185,6 +214,7 @@ def install(
         alert_after=alert_after,
         uses_env_file=uses_env_file,
         created_at=utcnow_iso(),
+        limit=persisted_limit,
     )
     _inst.write_instance_config(cfg)
     _inst.logs_dir(iid)  # pre-create so the first tick never fails on a missing dir
@@ -287,6 +317,7 @@ def status(wiki: str | None, *, instance_id: str | None = None) -> int:
         print(f"alert_after: {cfg.alert_after}")
         print(f"uses_env_file: {cfg.uses_env_file}")
         print(f"created_at: {cfg.created_at}")
+        print(f"limit: {cfg.limit}")
 
     st = _inst.read_run_state(iid)
     print(f"last_run_at: {st.last_run_at}")
@@ -296,6 +327,7 @@ def status(wiki: str | None, *, instance_id: str | None = None) -> int:
     print(f"alert_active: {st.alert_active}")
     print(f"last_skip_at: {st.last_skip_at}")
     print(f"last_holder_pid: {st.last_holder_pid}")
+    print(f"hit_limit: {st.hit_limit}")
 
     lock_path = _inst.instance_data_dir(iid) / "ingest.lock"
     if lock_path.exists():
@@ -345,10 +377,11 @@ def list_all() -> int:
             else (blocks[iid].cron_line if iid in blocks else "<n/a>")
         )
         alert = " ALERT" if st.alert_active else ""
+        capped = " CAPPED" if st.hit_limit else ""
         print(
             f"{iid}  wiki={wiki}  cron={cron_expr}  "
             f"last_run={st.last_run_at}  last_exit={st.last_exit}  "
-            f"skips={st.consecutive_skips}{alert}"
+            f"skips={st.consecutive_skips}{alert}{capped}"
         )
     return 0
 
@@ -405,7 +438,13 @@ def rotate_log_if_needed(log: Path, max_bytes: int, backups: int) -> None:
     log.replace(log.with_name(f"{log.name}.1"))
 
 
-def run_now(wiki: str) -> int:
+def run_now(wiki: str, *, limit: int | None = None) -> int:
+    try:
+        limit = validate_limit(limit)
+    except ValueError as exc:
+        _fail(str(exc))
+        return 2
+
     canon = _inst.canonical_wiki_path(wiki)
     if not canon.is_dir():
         _fail(
@@ -414,10 +453,27 @@ def run_now(wiki: str) -> int:
         return 1
 
     iid = _inst.instance_id(canon)
+    # NOTE [C9b]: cfg is read ONCE here, at the top of the tick. A persisted
+    # --limit change made via `schedule install` therefore takes effect on the
+    # NEXT tick, not a currently-running one -- expected behavior, not a bug
+    # (see docs/designs/scheduled-ingestion-limit-addendum.md §6).
     cfg = _inst.read_instance_config(
         iid
     )  # may be None (bare run-now); default alert_after
     alert_after = cfg.alert_after if cfg else _DEFAULT_ALERT_AFTER
+
+    # Resolve the effective per-tick cap: ad-hoc override > persisted > the
+    # unattended default. Bare run-now and legacy pre-feature instances (no
+    # persisted limit) always fall to the conservative default, so unattended
+    # paths stay bounded by construction -- the only route to unbounded
+    # unattended work is an explicit large --limit [C6][C7].
+    if limit is not None:  # ad-hoc override, incl. 0
+        effective = limit
+    elif cfg is not None and cfg.limit is not None:
+        effective = cfg.limit  # persisted per-instance cap
+    else:
+        effective = _DEFAULT_SCHEDULED_LIMIT  # bare run-now OR legacy config w/o limit
+
     log = _inst.ingest_log_path(iid)
     rotate_log_if_needed(log, _LOG_MAX_BYTES, _LOG_BACKUPS)
 
@@ -467,20 +523,28 @@ def run_now(wiki: str) -> int:
             st = _inst.read_run_state(iid)
             st.consecutive_skips = 0
             st.alert_active = False
+            st.hit_limit = False
             _inst.write_run_state(iid, st)
             started = time.monotonic()
             gate_failed = False
+            report = DrainReport()
             with _tee_stdout_stderr(fh):
                 if rc := _gate():
                     gate_failed = True
                 else:
-                    rc = _ingest(canon)
+                    rc = _ingest(canon, limit=effective, report=report)
             # Record run-state for BOTH outcomes (gate failure or real ingest) --
             # a persistently broken environment must show up in `status`/`list`,
             # not just the log, or an operator polling state never sees it (C1).
             st.last_run_at = utcnow_iso()
             st.last_exit = rc
             st.last_duration_s = round(time.monotonic() - started, 3)
+            # The loud WARN cap-hit signal already came from inside ingest()
+            # and was captured into the tick log by the _tee_stdout_stderr
+            # wrapper above [C8]; this just makes it queryable via status/list.
+            # A cap-hit is NOT a failure -- rc is whatever ingest() returned
+            # (0 on a clean capped drain), so cron sends no MAILTO spam.
+            st.hit_limit = report.hit_limit
             _inst.write_run_state(iid, st)
             suffix = " (environment gate failed)" if gate_failed else ""
             _mark(fh, f"--- tick done exit={rc} dur={st.last_duration_s}s{suffix} ---")

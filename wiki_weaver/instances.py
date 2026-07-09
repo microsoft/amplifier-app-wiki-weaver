@@ -14,7 +14,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 __all__ = [
@@ -146,6 +146,11 @@ class InstanceConfig:
     alert_after: int  # consecutive-skip threshold for escalation (default 3)
     uses_env_file: bool  # True if an env snapshot was written at install
     created_at: str  # ISO-8601 UTC
+    # Appended field (scheduled-ingestion-limit-addendum [C1]): MUST stay defaulted
+    # and MUST stay last, so an on-disk instance.json written before this field
+    # existed still unpacks without a TypeError -- see _reconstruct below.
+    limit: int | None = None  # per-instance cap; None = not configured (run_now falls
+    # back to the unattended default). Set concretely by `schedule install`.
 
 
 @dataclass
@@ -157,6 +162,9 @@ class RunState:
     last_duration_s: float | None = None
     last_skip_at: str | None = None
     last_holder_pid: int | None = None  # PID that held the lock on the most recent skip
+    # Appended field (scheduled-ingestion-limit-addendum [C1]): defaulted for the
+    # same backward-compat reason as InstanceConfig.limit above.
+    hit_limit: bool = False  # did the most recent RUN tick stop early on --limit?
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -184,6 +192,24 @@ def _run_state_path(id: str) -> Path:
     return instance_data_dir(id) / "run-state.json"
 
 
+def _reconstruct(cls, raw: dict):
+    """Tolerant dataclass reconstruction (scheduled-ingestion-limit-addendum [C1]).
+
+    A bare ``cls(**raw)`` kwarg-unpack raises ``TypeError`` if *raw* is missing
+    a required field or carries a key the dataclass doesn't declare. Both
+    directions happen in practice: an on-disk instance.json/run-state.json
+    written by an OLDER version of this code lacks fields added later (missing
+    keys); a NEWER version reading a file written by code with an added field
+    later removed would carry an unknown key. Filtering to known field names
+    means missing keys fall through to the dataclass defaults and unknown keys
+    are silently dropped -- neither can raise. This is what keeps `schedule
+    list` / `status` / `run-now` from crashing on every already-scheduled
+    instance the moment a new field is added.
+    """
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in raw.items() if k in known})
+
+
 def write_instance_config(cfg: InstanceConfig) -> None:
     _atomic_write_json(_instance_config_path(cfg.instance_id), asdict(cfg))
 
@@ -194,7 +220,7 @@ def read_instance_config(id: str) -> InstanceConfig | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
-    return InstanceConfig(**raw)
+    return _reconstruct(InstanceConfig, raw)
 
 
 def read_run_state(id: str) -> RunState:
@@ -203,7 +229,7 @@ def read_run_state(id: str) -> RunState:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return RunState()
-    return RunState(**raw)
+    return _reconstruct(RunState, raw)
 
 
 def write_run_state(id: str, state: RunState) -> None:

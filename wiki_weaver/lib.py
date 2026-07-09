@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -693,12 +694,28 @@ def _print_summary(summary: list[tuple[str, str]]) -> None:
         print(f"  total={len(summary)}  converged={converged_n}  failed={failed_n}")
 
 
+@dataclass
+class DrainReport:
+    """Opt-in out-channel for the drain's ``--limit`` cap-hit signal.
+
+    ``ingest()``'s return type stays ``-> int`` (a contract existing callers and
+    tests depend on -- see the rationale in ``ingest()``'s docstring below).
+    Callers who need to know whether a drain stopped early because it ran out
+    of budget (rather than because the inbox was empty) pass a ``DrainReport``
+    in and read ``.hit_limit`` back out after the call.
+    """
+
+    hit_limit: bool = False
+
+
 def ingest(
     wiki: str | Path = ".",
     *,
     source: str | Path | None = None,
     max_cycles: int | None = None,
     keep_going: bool = False,
+    limit: int | None = None,  # drain-path cap on real-ingest sources; None = unlimited
+    report: DrainReport | None = None,  # opt-in out-channel for hit_limit
 ) -> int:
     """Integrate inbox sources via the engine.
 
@@ -715,6 +732,19 @@ def ingest(
         In single-file mode: continue to the next source after a failure.
         In drain mode: this flag is a documented NO-OP — failures always route
         to ``_failed/`` and draining always continues regardless.
+    limit:
+        Caps the number of sources that reach real LLM synthesis (``run_inner``)
+        in **drain mode only**.  ``None`` means unlimited.  ``0`` means process
+        zero real-ingestion sources this call (cheap dispositions -- binary
+        rejects, already-ingested duplicates -- still run for free).  Has no
+        effect in single-file (``source=``) mode, which always processes
+        exactly the one file given.
+    report:
+        Optional out-channel.  When provided, ``.hit_limit`` is set to ``True``
+        if the drain stopped early because the ``--limit`` budget was spent
+        (see ``DrainReport`` above).  The loud cap-hit signal (a ``WARN`` log
+        line) does not depend on this -- it fires regardless of whether a
+        report was passed.
     """
     wiki = Path(wiki).resolve()
     if not wiki.is_dir():
@@ -730,6 +760,8 @@ def ingest(
         # ------------------------------------------------------------------ #
         # SINGLE-FILE PATH — behavior UNCHANGED from original.                #
         # keep_going and exit-on-first-failure semantics are preserved here.  #
+        # NOTE [C9c]: --limit is a no-op in single-file mode (exactly one     #
+        # source is ever processed here regardless of the cap).              #
         # ------------------------------------------------------------------ #
         sources: list[Path] = [Path(source).resolve()]
 
@@ -879,6 +911,12 @@ def ingest(
     _FRESH_RETRIES_MAX = 5
     _fresh_retries = 0
 
+    # --limit budget: counts only commitments to run_inner (real LLM work).
+    # Cheap dispositions (binary reject, already-ingested duplicate) never
+    # touch this counter -- see the gate below and
+    # docs/designs/scheduled-ingestion-limit-addendum.md §2 [C3][C4].
+    real_count = 0
+
     # Single event loop for the ENTIRE drain + final re-weave (Option A):
     # every per-source run_inner() and the overview re-weave share ONE loop,
     # so the load-once _BASE_BUNDLE provider client stays bound to a live loop
@@ -886,6 +924,12 @@ def ingest(
     # its loop, wedging source N+1 on the closed-loop client).
     with shared_engine_loop():
         while True:
+            # NOTE [C9a]: selection order is existing alphabetical-by-filename,
+            # unrelated to --limit and unchanged by this addendum. Under
+            # sustained new arrivals with early-sorting names, an older
+            # backlog item with a late-sorting name can be deferred across
+            # many ticks -- accepted, not a fairness bug introduced here (see
+            # docs/designs/scheduled-ingestion-limit-addendum.md §6).
             pending = sorted(
                 p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
             )
@@ -934,6 +978,34 @@ def ingest(
                 print(f"  assigned stable source id [{source_id}] for {name}")
             else:
                 print(f"  reusing stable source id [{source_id}] for {name}")
+
+            # --limit gate [C4]: eligibility is already determined at this
+            # point (text file, not a duplicate, real source) -- check *then*
+            # increment, so "capped" is decided precisely and cheaply, with no
+            # extra end-of-loop inbox rescan. With limit == N, files 1..N each
+            # pass here (real_count is 0..N-1 at check time) and the drain
+            # reports complete; the (N+1)-th eligible file holds here with
+            # real_count == N, sets hit_limit, and breaks -- leaving it in
+            # _inbox/ for the next tick. _assign_source_id above may have
+            # pre-registered this deferred source's stable id; that is
+            # idempotent and harmless, the next tick just re-looks-it-up. This
+            # break (not continue) preserves the drain's "every file picked
+            # from _inbox/ must leave _inbox/ this pass" invariant: we haven't
+            # picked this file for a disposition, we've stopped the whole
+            # drain with it still sitting in _inbox/. See
+            # docs/designs/scheduled-ingestion-limit-addendum.md §2 [C3][C4][C5].
+            if limit is not None and real_count >= limit:
+                if report is not None:
+                    report.hit_limit = True
+                _warn(
+                    f"LIMIT REACHED: processed {real_count} real-ingest source(s) this "
+                    f"pass (--limit {limit}); at least one more eligible source remains "
+                    f"in _inbox/ and will be handled on the next tick. Raise the cap "
+                    f"with `schedule install --limit N`, or process more now with "
+                    f"`schedule run-now --wiki <dir> --limit N`."
+                )
+                break
+            real_count += 1
 
             print(f"\n=== ingest: {name} (source id [{source_id}]) ===")
 

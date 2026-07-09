@@ -16,6 +16,7 @@ Pure stdlib -- no engine, no LLM, no network.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -206,6 +207,98 @@ def test_run_state_write_read_round_trip(tmp_path: Path) -> None:
 def test_read_run_state_missing_returns_fresh_state() -> None:
     fresh = inst.read_run_state("no-such-instance")
     assert fresh == inst.RunState()
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility for the --limit addendum [C1] (highest priority):
+# on-disk instance.json / run-state.json written before `limit` / `hit_limit`
+# existed must NOT crash `_reconstruct` -- missing keys fall back to defaults,
+# unknown keys are dropped. See docs/designs/scheduled-ingestion-limit-addendum.md §5.
+# ---------------------------------------------------------------------------
+
+
+def test_read_instance_config_legacy_no_limit(tmp_path: Path) -> None:
+    iid = "legacy-instance"
+    legacy = {
+        "instance_id": iid,
+        "canonical_wiki": str(tmp_path / "w"),
+        "cron_expr": "*/5 * * * *",
+        "every": "5m",
+        "alert_after": 3,
+        "uses_env_file": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        # NOTE: no "limit" key -- simulates a pre-addendum instance.json.
+    }
+    path = inst.instance_config_dir(iid) / "instance.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    cfg = inst.read_instance_config(iid)
+
+    assert cfg is not None
+    assert cfg.limit is None
+    assert cfg.instance_id == iid
+
+
+def test_read_run_state_legacy_no_hit_limit(tmp_path: Path) -> None:
+    iid = "legacy-instance-2"
+    legacy = {
+        "consecutive_skips": 1,
+        "alert_active": False,
+        "last_run_at": "2026-01-01T00:00:00+00:00",
+        "last_exit": 0,
+        "last_duration_s": 2.5,
+        "last_skip_at": None,
+        "last_holder_pid": None,
+        # NOTE: no "hit_limit" key -- simulates a pre-addendum run-state.json.
+    }
+    path = inst.instance_data_dir(iid) / "run-state.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    st = inst.read_run_state(iid)
+
+    assert st.hit_limit is False
+    assert st.consecutive_skips == 1
+
+
+def test_readers_drop_unknown_keys(tmp_path: Path) -> None:
+    iid = "future-instance"
+    cfg_raw = {
+        "instance_id": iid,
+        "canonical_wiki": str(tmp_path / "w"),
+        "cron_expr": "*/5 * * * *",
+        "every": "5m",
+        "alert_after": 3,
+        "uses_env_file": False,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "limit": 5,
+        "totally_unknown_future_field": "should be dropped",
+    }
+    (inst.instance_config_dir(iid) / "instance.json").write_text(
+        json.dumps(cfg_raw), encoding="utf-8"
+    )
+    st_raw = {
+        "consecutive_skips": 0,
+        "alert_active": False,
+        "last_run_at": None,
+        "last_exit": None,
+        "last_duration_s": None,
+        "last_skip_at": None,
+        "last_holder_pid": None,
+        "hit_limit": True,
+        "another_unknown_field": 42,
+    }
+    (inst.instance_data_dir(iid) / "run-state.json").write_text(
+        json.dumps(st_raw), encoding="utf-8"
+    )
+
+    cfg = inst.read_instance_config(iid)
+    st = inst.read_run_state(iid)
+
+    assert cfg is not None
+    assert cfg.limit == 5
+    assert not hasattr(cfg, "totally_unknown_future_field")
+    assert st.hit_limit is True
+    assert not hasattr(st, "another_unknown_field")
 
 
 # ---------------------------------------------------------------------------

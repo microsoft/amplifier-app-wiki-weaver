@@ -10,6 +10,10 @@
 > the existing `ingest()` core stays **unchanged** — this feature adds only a triggering
 > layer on top.
 >
+> **Addendum:** `docs/designs/scheduled-ingestion-limit-addendum.md` adds a `--limit` cap on
+> real-ingest sources per drain (a parameter + one gate inside the drain loop only; the core
+> sort/selection order and single-file `--source` path remain unchanged as settled here).
+>
 > **Date:** 2026-07-08
 
 ---

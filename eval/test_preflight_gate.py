@@ -77,7 +77,11 @@ def test_cmd_ingest_gates_before_engine(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.setattr("wiki_weaver.cli.ingest", _boom)
 
     args = argparse.Namespace(
-        wiki=str(tmp_path), source=None, max_cycles=None, keep_going=False
+        wiki=str(tmp_path),
+        source=None,
+        max_cycles=None,
+        keep_going=False,
+        limit=None,
     )
     rc = cmd_ingest(args)
 
