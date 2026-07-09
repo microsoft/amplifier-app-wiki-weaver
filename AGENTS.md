@@ -41,6 +41,12 @@ Commands are **thin lib wrappers over attractor `.dot` pipelines**:
 - `wiki_weaver/engine_runner.py` — runs the inner pipelines on the attractor engine. The `.dot` files
   are `$token` templates; `build_*_from_file()` fills them with concrete paths/prompts before
   execution. The `.dot` files are **not** drop-in standalone.
+  - **Changelog:** the legacy `{"bundle": "attractor:agents/<name>"}` per-agent config shape in
+    `_resolve_agent_bundle()` is **no longer supported** (removed). It was superseded by the inline
+    agent-config shape since attractor commit `fd777ed` (#74); a repo-wide consumer search (this repo,
+    amplifier-bundle-attractor, amplifier, amplifier-core, amplifier-foundation, medium-tools,
+    amplifier-bundle-llm-wiki) found no remaining users. Configs still using the old shape now fail
+    loud with an actionable migration message at resolution time instead of being silently resolved.
 - `wiki_weaver/policy.py` — resolves per-wiki schema/rubric/model overrides (`<wiki>/.wiki/policy/…`).
 
 **Deterministic dashboard layer** (no engine, no LLM, no Amplifier runtime — pure stdlib + `tinycss2`

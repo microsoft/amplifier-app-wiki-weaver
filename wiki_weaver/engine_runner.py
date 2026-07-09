@@ -116,15 +116,6 @@ MODEL = os.environ.get("WIKI_WEAVER_MODEL", "sonnet")
 # omitted entirely, so default behaviour (e.g. Wave 1 anthropic) is unchanged.
 REASONING_EFFORT = os.environ.get("WIKI_WEAVER_REASONING_EFFORT")
 
-# Attractor namespace root (repo that owns ``attractor:agents/...`` refs). The
-# per-provider agent bundles live under ``<root>/agents/<name>.yaml``.
-# Set only when WIKI_WEAVER_ATTRACTOR_PIPELINE points at a local checkout.
-_ATTRACTOR_REPO_ROOT: Path | None = (
-    Path(ATTRACTOR_PIPELINE_LOCAL).resolve().parent.parent
-    if ATTRACTOR_PIPELINE_LOCAL
-    else None
-)
-
 # LLM-driven node ids in the DOT (need an explicit llm_provider so the engine
 # routes them to a child agent). Tool nodes (validate) do not.
 LLM_NODE_IDS = ("ingest", "assess", "feedback")
@@ -392,45 +383,40 @@ async def _resolve_agent_bundle(
     single-agent loop; the parent's context-intelligence hook is still inherited
     through the same merge.
 
-    Two ``config`` shapes are accepted:
+    Only ONE ``config`` shape is accepted:
 
-    * Inline definition (current) -- a full agent dict carrying its own
-      ``session`` (with the inline ``loop-agent`` orchestrator), ``providers``,
-      ``tools``, ``hooks``, ``instruction``. This is what attractor-pipeline's
-      ``agents:`` block declares today, and it is materialised directly into a
-      ``Bundle`` in the inline branch below.
-    * ``{"bundle": "attractor:agents/<name>"}`` reference (legacy) -- resolved
-      via ``load_bundle``. attractor-pipeline@main no longer emits this form;
-      it was replaced by inline ``session.orchestrator`` declarations in
-      attractor commit ``fd777ed`` (#74, which also added the identity-based
-      recursion guard). The reference branch is retained only for backward
-      compatibility with older agent declarations.
+    * Inline definition -- a full agent dict carrying its own ``session``
+      (with the inline ``loop-agent`` orchestrator), ``providers``, ``tools``,
+      ``hooks``, ``instruction``. This is what attractor-pipeline's ``agents:``
+      block declares today, and it is materialised directly into a ``Bundle``
+      below.
+
+    A legacy ``{"bundle": "attractor:agents/<name>"}`` reference shape (resolved
+    via ``load_bundle``) was removed here (see CHANGELOG). It was superseded by
+    the inline ``session.orchestrator`` declarations added in attractor commit
+    ``fd777ed`` (#74, which also added the identity-based recursion guard), and
+    a repo-wide consumer search across wiki-weaver, amplifier-bundle-attractor,
+    and the local ecosystem (amplifier, amplifier-core, amplifier-foundation,
+    medium-tools, amplifier-bundle-llm-wiki) found no remaining users of the
+    per-agent bundle-ref shape. Configs still using it now fail loud below with
+    a migration message instead of being silently resolved.
     """
-    from amplifier_foundation import load_bundle
-
-    ref = config.get("bundle") if isinstance(config, dict) else None
-    if ref:
-        # e.g. "attractor:agents/attractor-agent-anthropic"
-        ns, _, rel = str(ref).partition(":")
-        if rel:
-            candidates: list[str] = []
-            if _ATTRACTOR_REPO_ROOT is not None:
-                local = (_ATTRACTOR_REPO_ROOT / rel).with_suffix(".yaml")
-                candidates.append(str(local))
-            candidates.append(
-                f"git+https://github.com/microsoft/amplifier-bundle-attractor@main"
-                f"#subdirectory={rel}.yaml"
-            )
-        else:
-            candidates = [str(ref)]
-        last_err: Exception | None = None
-        for src in candidates:
-            try:
-                return await load_bundle(src)
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-        raise RuntimeError(
-            f"Could not resolve agent bundle '{agent_name}' ({ref}): {last_err}"
+    if isinstance(config, dict) and config.get("bundle") is not None:
+        legacy_ref = config["bundle"]
+        raise ValueError(
+            f"Agent '{agent_name}' uses the unsupported legacy "
+            f'{{"bundle": {legacy_ref!r}}} config shape. This per-agent '
+            "bundle-reference form is no longer supported (removed -- no "
+            "remaining consumers found in a repo-wide search). It was "
+            "superseded by inline agent config since attractor commit "
+            "fd777ed (#74). To fix: declare this agent inline instead -- "
+            "give it its own 'session.orchestrator' set to a NON-pipeline "
+            "orchestrator (module: loop-agent), plus 'providers' / 'tools' / "
+            "'hooks' / 'instruction' / 'context' as needed. See the 'Inline "
+            "definition' section of _resolve_agent_bundle's docstring "
+            "(wiki_weaver/engine_runner.py) for the exact expected structure, "
+            "or bundles/attractor-pipeline.yaml's 'agents:' block in "
+            "amplifier-bundle-attractor for a working example."
         )
 
     # Inline config form (already a full agent definition).
