@@ -21,9 +21,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 # Make wiki_weaver importable without installing.
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
+
+# _resolve_agent_bundle lives in wiki_weaver.engine_runner, which imports
+# wiki_weaver.model_resolver, which imports unified_llm at module load time.
+# Skip cleanly in lightweight CI (no @main resolution of the attractor engine
+# deps) rather than erroring -- matches test_ingest_drain.py / test_reweave.py /
+# test_model_resolver.py / test_policy_fallback.py / test_any_text_ingest.py.
+pytest.importorskip("wiki_weaver.engine_runner")
 
 
 # ---------------------------------------------------------------------------
