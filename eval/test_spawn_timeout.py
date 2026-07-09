@@ -49,7 +49,7 @@ def _fake_prepared(spawn_coro_factory) -> SimpleNamespace:
         return await spawn_coro_factory(**kwargs)
 
     return SimpleNamespace(
-        bundle=SimpleNamespace(agents={"writer": {"model": "sonnet"}}),
+        bundle=SimpleNamespace(agents={"writer": {"model": "sonnet"}}, base_path=None),
         spawn=spawn,
     )
 

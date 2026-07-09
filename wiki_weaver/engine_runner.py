@@ -376,7 +376,11 @@ def build_dot(
 # --------------------------------------------------------------------------
 
 
-async def _resolve_agent_bundle(agent_name: str, config: dict[str, Any]) -> Any:
+async def _resolve_agent_bundle(
+    agent_name: str,
+    config: dict[str, Any],
+    base_path: Path | None = None,
+) -> Any:
     """Resolve a per-node agent into a full, self-contained child Bundle.
 
     The recursion-avoidance mechanism: every child agent must carry an inline
@@ -430,7 +434,20 @@ async def _resolve_agent_bundle(agent_name: str, config: dict[str, Any]) -> Any:
         )
 
     # Inline config form (already a full agent definition).
+    #
+    # The ``context`` block (e.g. ``{include: ["../context/system-anthropic.md"]}``)
+    # must be processed into ``dict[str, Path]`` before passing to Bundle — raw YAML
+    # is not the right type for ``Bundle.context``.  foundation's ``_parse_context``
+    # handles the include-list->resolved-path conversion given a ``base_path``.
+    #
+    # Without this, ``Bundle.context`` defaults to ``{}`` and the system-prompt
+    # factory guard (``if effective_bundle.instruction or effective_bundle.context:``)
+    # never fires, leaving all spawned node agents on a stub Layer-1 prompt.
     from amplifier_foundation import Bundle
+    from amplifier_foundation.bundle._dataclass import _parse_context
+
+    context_config = config.get("context") or {}
+    resolved_context, pending_context = _parse_context(context_config, base_path)
 
     return Bundle(
         name=agent_name,
@@ -441,6 +458,8 @@ async def _resolve_agent_bundle(agent_name: str, config: dict[str, Any]) -> Any:
         hooks=config.get("hooks", []),
         instruction=config.get("instruction")
         or config.get("system", {}).get("instruction"),
+        context=resolved_context,
+        _pending_context=pending_context,
     )
 
 
@@ -579,7 +598,9 @@ def make_spawn_fn(prepared: Any, wiki_dir: Path | None = None):
             raise ValueError(f"Agent '{agent_name}' not found. Available: {available}")
 
         if agent_name not in _agent_cache:
-            _agent_cache[agent_name] = await _resolve_agent_bundle(agent_name, config)
+            _agent_cache[agent_name] = await _resolve_agent_bundle(
+                agent_name, config, base_path=prepared.bundle.base_path
+            )
         child_bundle = _agent_cache[agent_name]
 
         # Fix 1: physically deny the spawned node write access to the ledger and
@@ -727,7 +748,9 @@ def make_ask_spawn_fn(prepared: Any, wiki_dir: Path, answer_file: Path):
             raise ValueError(f"Agent '{agent_name}' not found. Available: {available}")
 
         if agent_name not in _agent_cache:
-            _agent_cache[agent_name] = await _resolve_agent_bundle(agent_name, config)
+            _agent_cache[agent_name] = await _resolve_agent_bundle(
+                agent_name, config, base_path=prepared.bundle.base_path
+            )
         child_bundle = _agent_cache[agent_name]
 
         # THE MECHANISM: constrain this child to read-only wiki access.
