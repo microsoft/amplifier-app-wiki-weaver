@@ -24,14 +24,18 @@ reweave_overview_if_needed`` succeeds. This is the test that would have
 caught the regression before merge -- a real wheel build + a real install +
 a real import, not a mock of the import machinery.
 
-``unified_llm`` is stubbed with a tiny fake package. It is a SEPARATE,
-network-installed (git) runtime dependency reached at import time by
-``wiki_weaver.model_resolver`` -- a pre-existing condition unrelated to this
-fix. Stubbing it isolates this test to the packaging question it exists to
-guard, without requiring a live git-dependency install
-(``amplifier-unified-llm-client`` / ``amplifier-foundation``) in CI. This
-mirrors the "no real LLM calls, no network access" discipline already used
-by ``eval/test_reweave.py`` for the same module.
+``unified_llm`` and ``amplifier_module_pipeline_runner`` are each stubbed with
+a tiny fake package. Both are SEPARATE, network-installed (git) runtime
+dependencies reached at import time -- ``unified_llm`` by
+``wiki_weaver.model_resolver``, ``amplifier_module_pipeline_runner`` by
+``wiki_weaver.engine_runner`` / ``wiki_weaver.reweave`` (the pipeline-runner
+migration) -- a pre-existing condition (now joined by a second one) unrelated
+to this fix. Stubbing them isolates this test to the packaging question it
+exists to guard, without requiring a live git-dependency install
+(``amplifier-unified-llm-client`` / ``amplifier-foundation`` /
+``amplifier-module-pipeline-runner``) in CI. This mirrors the "no real LLM
+calls, no network access" discipline already used by ``eval/test_reweave.py``
+for the same modules.
 """
 
 from __future__ import annotations
@@ -93,14 +97,35 @@ def test_reweave_importable_from_wheel_without_eval_dir(tmp_path: Path) -> None:
         "packaging boundary changed; update this test's assumptions"
     )
 
-    # 2. A minimal local stub for `unified_llm` -- see module docstring for
-    # why this is stubbed rather than installed for real.
+    # 2. Minimal local stubs for the two SEPARATE, network-installed runtime
+    # deps reached at import time -- see module docstring for why these are
+    # stubbed rather than installed for real.
     stub_pkg = stub_dir / "unified_llm"
     stub_pkg.mkdir(parents=True)
     (stub_pkg / "__init__.py").write_text(
         textwrap.dedent(
             """
             async def resolve_latest_for(provider, glob, stable_only=True):
+                raise NotImplementedError("stub -- not exercised by this test")
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    pipeline_runner_stub = stub_dir / "amplifier_module_pipeline_runner"
+    pipeline_runner_stub.mkdir(parents=True)
+    (pipeline_runner_stub / "__init__.py").write_text(
+        textwrap.dedent(
+            """
+            class PipelineResult:
+                def __init__(self, status="", notes="", logs_dir=None, raw=""):
+                    self.status = status
+                    self.notes = notes
+                    self.logs_dir = logs_dir
+                    self.raw = raw
+
+
+            async def run_pipeline(dot_source, **kwargs):
                 raise NotImplementedError("stub -- not exercised by this test")
             """
         ),

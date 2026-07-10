@@ -1,31 +1,29 @@
-"""Regression test for the ``ingest`` hang investigation.
+"""Regression test: SPAWN_TIMEOUT_SECONDS reaches run_pipeline's spawn_timeout seam.
 
-CONFIRMED ROOT CAUSE (see PR / investigation notes): ``spawn_capability``
-(built by ``make_spawn_fn`` / ``make_ask_spawn_fn`` in engine_runner.py) awaited
-``prepared.spawn(...)`` with NO timeout at all. Neither wiki-weaver, loop-agent,
-nor unified-llm-client's Anthropic adapter set an explicit per-call timeout --
-every LLM call silently inherited the Anthropic Python SDK's undocumented
-default (``Timeout(connect=5.0, read=600, write=600, pool=600)``), and a single
-node's spawn can make MANY sequential LLM+tool-call rounds, so the aggregate
-spawn duration was not bounded by any single call's timeout either. A stalled
-child agent therefore blocked the shared event loop indefinitely with zero
-feedback -- indistinguishable, from the outside, from a slow-but-working node
-(live investigation confirmed legitimate per-node durations up to ~6 minutes
-with zero errors).
+HISTORICAL CONTEXT: wiki-weaver used to enforce this timeout itself, via a
+local ``_spawn_with_timeout`` wrapper around ``prepared.spawn(...)`` inside
+its own ``make_spawn_fn`` / ``make_ask_spawn_fn`` (see git history for the
+original investigation into a stalled-spawn hang). The pipeline-runner
+migration (Slice 4) moved the actual timeout ENFORCEMENT mechanism entirely
+into ``amplifier_module_pipeline_runner.run_pipeline``'s own ``make_spawn_fn``
+-- that producer module owns proving the enforcement itself now (its own test
+suite covers "stalled spawn raises TimeoutError" / "fast spawn is unaffected"
+/ "slow-but-bounded spawn still succeeds").
 
-This test proves the fix: ``_spawn_with_timeout`` wraps the same call in
-``asyncio.wait_for`` bounded by ``SPAWN_TIMEOUT_SECONDS`` (overridable via
-``WIKI_WEAVER_SPAWN_TIMEOUT``), so a stalled spawn fails loud with a clear,
-actionable ``TimeoutError`` instead of hanging forever. No real LLM calls;
-the slow/stalled provider call is mocked with ``asyncio.sleep``.
+wiki-weaver's remaining responsibility is just the WIRING: every entrypoint in
+engine_runner.py (and reweave.py) must thread
+``spawn_timeout=SPAWN_TIMEOUT_SECONDS`` through to ``run_pipeline`` on every
+call, so a stalled child agent still fails loud instead of hanging. This test
+proves that wiring by mocking ``run_pipeline`` and asserting the kwarg arrives
+-- it does NOT re-test the timeout mechanism itself (that would duplicate
+coverage that belongs to pipeline-runner).
 """
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -33,150 +31,116 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 # These tests import wiki_weaver.engine_runner, which imports the attractor
-# engine deps. Skip cleanly in lightweight CI (no @main resolution) rather
-# than erroring -- matches eval/test_ingest_drain.py's convention.
+# engine deps (amplifier_module_pipeline_runner, unified_llm). Skip cleanly in
+# lightweight CI (no @main resolution) rather than erroring -- matches
+# eval/test_ingest_drain.py's convention.
 pytest.importorskip("wiki_weaver.engine_runner")
 
 import wiki_weaver.engine_runner as er  # noqa: E402
 
 
-def _fake_prepared(spawn_coro_factory) -> SimpleNamespace:
-    """Minimal stand-in for a PreparedBundle: only ``.bundle.agents`` and
-    ``.spawn()`` are touched by ``spawn_capability``.
-    """
+def _fake_result(status: str = "success", notes: str = "ok") -> Any:
+    from amplifier_module_pipeline_runner import PipelineResult
 
-    async def spawn(**kwargs):
-        return await spawn_coro_factory(**kwargs)
-
-    return SimpleNamespace(
-        bundle=SimpleNamespace(agents={"writer": {"model": "sonnet"}}, base_path=None),
-        spawn=spawn,
-    )
+    return PipelineResult(status=status, notes=notes, logs_dir=Path("/tmp"), raw="{}")
 
 
-# ---------------------------------------------------------------------------
-# Test 1 -- a spawn that never returns is bounded, not infinite
-# ---------------------------------------------------------------------------
+def _capture_run_pipeline(monkeypatch, captured: dict) -> None:
+    """Patch er.run_pipeline to record its kwargs and return a fake success."""
 
+    async def fake_run_pipeline(dot_source: str, **kwargs: Any) -> Any:
+        captured["dot_source"] = dot_source
+        captured.update(kwargs)
+        return _fake_result()
 
-async def test_stalled_spawn_times_out_instead_of_hanging(monkeypatch) -> None:
-    """A child agent that never completes must fail loud within the
-    configured ceiling -- proving the wait is bounded, not unbounded.
-
-    Uses a near-instant timeout (0.05s) so the test itself runs in
-    milliseconds rather than waiting out a real multi-minute timeout.
-    """
-    monkeypatch.setattr(er, "SPAWN_TIMEOUT_SECONDS", 0.05)
-
-    async def never_returns(**kwargs):
-        # Simulates a stalled LLM call: awaits "forever" relative to the
-        # configured timeout. Bounded at 5s so a REGRESSION (timeout not
-        # applied) fails the test quickly rather than hanging the suite.
-        await asyncio.sleep(5)
-        return {"output": "should never get here"}
-
-    prepared = _fake_prepared(never_returns)
-    spawn_capability = er.make_spawn_fn(prepared)
-
-    with pytest.raises(TimeoutError, match="did not complete within"):
-        await asyncio.wait_for(
-            spawn_capability(
-                agent_name="writer",
-                instruction="do the thing",
-                parent_session=None,
-                agent_configs={},
-            ),
-            timeout=5,  # test-level safety net; the real bound is 0.05s above
-        )
+    monkeypatch.setattr(er, "run_pipeline", fake_run_pipeline)
 
 
 # ---------------------------------------------------------------------------
-# Test 2 -- a normal (fast) spawn is unaffected
+# Test 1 -- run_thin_slice threads spawn_timeout through
 # ---------------------------------------------------------------------------
 
 
-async def test_fast_spawn_completes_normally(monkeypatch) -> None:
-    """A child agent that completes well within the timeout must return
-    its result unchanged -- the fix must not alter the happy path.
-    """
-    monkeypatch.setattr(er, "SPAWN_TIMEOUT_SECONDS", 5.0)
+def test_run_thin_slice_threads_spawn_timeout(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(er, "SPAWN_TIMEOUT_SECONDS", 42.0)
+    captured: dict = {}
+    _capture_run_pipeline(monkeypatch, captured)
 
-    async def completes_quickly(**kwargs):
-        await asyncio.sleep(0.01)
-        return {"output": "done", "session_id": "abc123"}
+    out_path = tmp_path / "proof.txt"
+    er.run_thin_slice(out_path, cwd=tmp_path)
 
-    prepared = _fake_prepared(completes_quickly)
-    spawn_capability = er.make_spawn_fn(prepared)
-
-    result = await spawn_capability(
-        agent_name="writer",
-        instruction="do the thing",
-        parent_session=None,
-        agent_configs={},
-    )
-    assert result == {"output": "done", "session_id": "abc123"}
+    assert captured.get("spawn_timeout") == 42.0
 
 
 # ---------------------------------------------------------------------------
-# Test 3 -- a slow-but-legitimate spawn under the ceiling still succeeds
+# Test 2 -- run_ask threads spawn_timeout AND a read-only child_constraint
 # ---------------------------------------------------------------------------
 
 
-async def test_slow_but_bounded_spawn_still_succeeds(monkeypatch) -> None:
-    """Regression guard for the exact failure mode observed live: a node
-    that legitimately takes several minutes (here, simulated as slower than
-    a short timeout but still under the configured ceiling) must NOT be
-    falsely killed. Guards against an overly aggressive timeout regression.
-    """
-    monkeypatch.setattr(er, "SPAWN_TIMEOUT_SECONDS", 0.2)
-
-    async def slow_but_fine(**kwargs):
-        await asyncio.sleep(0.05)  # well under the 0.2s ceiling
-        return {"output": "converged"}
-
-    prepared = _fake_prepared(slow_but_fine)
-    spawn_capability = er.make_spawn_fn(prepared)
-
-    result = await spawn_capability(
-        agent_name="writer",
-        instruction="do the thing",
-        parent_session=None,
-        agent_configs={},
-    )
-    assert result == {"output": "converged"}
-
-
-# ---------------------------------------------------------------------------
-# Test 4 -- the ask-pipeline spawn function gets the same protection
-# ---------------------------------------------------------------------------
-
-
-async def test_ask_spawn_fn_also_times_out(monkeypatch, tmp_path: Path) -> None:
-    """``make_ask_spawn_fn`` shares ``_spawn_with_timeout`` -- prove it too
-    fails loud on a stalled child rather than hanging.
-    """
-    monkeypatch.setattr(er, "SPAWN_TIMEOUT_SECONDS", 0.05)
-
-    async def never_returns(**kwargs):
-        await asyncio.sleep(5)
-        return {"output": "should never get here"}
-
-    prepared = _fake_prepared(never_returns)
+def test_run_ask_threads_spawn_timeout_and_constraint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(er, "SPAWN_TIMEOUT_SECONDS", 7.5)
     wiki_dir = tmp_path / "wiki"
     wiki_dir.mkdir()
-    answer_file = tmp_path / "answer.json"
-    spawn_capability = er.make_ask_spawn_fn(prepared, wiki_dir, answer_file)
+    captured: dict = {}
+    _capture_run_pipeline(monkeypatch, captured)
 
-    with pytest.raises(TimeoutError, match="did not complete within"):
-        await asyncio.wait_for(
-            spawn_capability(
-                agent_name="writer",
-                instruction="answer the question",
-                parent_session=None,
-                agent_configs={},
-            ),
-            timeout=5,
-        )
+    er.run_ask(wiki_dir, "does the wiki cover anything?")
+
+    assert captured.get("spawn_timeout") == 7.5
+    assert callable(captured.get("child_constraint")), (
+        "run_ask must pass a child_constraint (the read-only ask scoping) "
+        "to run_pipeline"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 3 -- run_inner threads spawn_timeout AND the fs isolation constraint
+# ---------------------------------------------------------------------------
+
+
+def test_run_inner_threads_spawn_timeout_and_constraint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(er, "SPAWN_TIMEOUT_SECONDS", 13.0)
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    source = tmp_path / "source.md"
+    source.write_text("hello world", encoding="utf-8")
+    captured: dict = {}
+    _capture_run_pipeline(monkeypatch, captured)
+
+    er.run_inner(source, wiki_dir)
+
+    assert captured.get("spawn_timeout") == 13.0
+    assert callable(captured.get("child_constraint")), (
+        "run_inner must pass a child_constraint (Fix 1 filesystem isolation) "
+        "to run_pipeline"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 -- every call also carries the CI hook overlay + profiles=None
+# ---------------------------------------------------------------------------
+
+
+def test_run_thin_slice_carries_ci_overlay_and_default_profiles(
+    monkeypatch, tmp_path: Path
+) -> None:
+    captured: dict = {}
+    _capture_run_pipeline(monkeypatch, captured)
+
+    er.run_thin_slice(tmp_path / "proof.txt", cwd=tmp_path)
+
+    assert captured.get("profiles") is None, (
+        "profiles=None lets run_pipeline's own DEFAULT_PROFILES route "
+        "anthropic/openai/gemini -- wiki-weaver must not override it"
+    )
+    overlays = captured.get("extra_overlays")
+    assert overlays and len(overlays) == 1, (
+        f"expected exactly one extra_overlays entry (the CI hook), got: {overlays}"
+    )
 
 
 # ---------------------------------------------------------------------------
