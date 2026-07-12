@@ -69,6 +69,7 @@ from wiki_weaver.grading import (  # noqa: E402
     OVERVIEW_OPENER_THRESHOLD,
     OVERVIEW_WIKILINK_MIN,
     GradeResult,
+    _build_judge_fn,
     grade_overview,
 )
 
@@ -77,6 +78,7 @@ __all__ = [
     "grade_overview",
     "OVERVIEW_OPENER_THRESHOLD",
     "OVERVIEW_WIKILINK_MIN",
+    "_build_judge_fn",
 ]
 
 LEDGER_NAME = ".processed.jsonl"
@@ -710,30 +712,10 @@ def judge_claim_framing(page_text: str, judge_fn) -> dict:
     return {"score": 3, "rationale": "parse error", "examples": []}
 
 
-def _build_judge_fn():
-    """Wire judge_fn to unified_llm.generate() if importable; else return None.
-
-    Uses the top-level generate() convenience function (Spec §4.3) which takes
-    a plain-text ``prompt`` kwarg and returns a GenerateResult with a .text
-    attribute.  generate() is async; asyncio.run() bridges the sync CLI caller.
-    """
-    try:
-        import asyncio  # noqa: PLC0415
-
-        from unified_llm import generate  # type: ignore  # noqa: PLC0415
-
-        def _judge(prompt: str) -> str:
-            result = asyncio.run(generate("claude-sonnet-4-6", prompt=prompt))
-            return result.text
-
-        return _judge
-    except Exception as exc:
-        print(
-            f"WARN: unified_llm not importable ({exc}); "
-            "falling back to deterministic-only grading.",
-            file=sys.stderr,
-        )
-        return None
+# NOTE: _build_judge_fn() now lives in wiki_weaver/grading.py and is imported
+# (see top of file) rather than defined here -- same dependency-inversion
+# relocation as GradeResult/grade_overview (commit 7062a17, PR #29), extended
+# to cover the claim-retention grader's LLM-judge plumbing.
 
 
 # ---------------------------------------------------------------------------

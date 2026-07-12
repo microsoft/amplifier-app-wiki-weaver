@@ -45,6 +45,9 @@ LEDGER_NAME = ".processed.jsonl"
 INBOX = "_inbox"
 SOURCES = "_sources"  # was ARCHIVE; stays visible at corpus root
 FAILED = "_failed"  # logical name; actual path via wiki_failed()
+# Claim-retention gate's consecutive-grader-failure counter (fail-open/fail-closed
+# escalation state) -- see wiki_retention_state() below and wiki_weaver/retention.py.
+RETENTION_STATE_NAME = ".retention_gate_state.json"
 
 # Pipeline assets resolve to the wheel sibling (wiki_weaver_pipeline/) on a real
 # install or the repo-root pipeline/ in a dev tree -- see wiki_weaver._assets.
@@ -75,6 +78,18 @@ def wiki_registry(wiki: Path) -> Path:
 def wiki_failed(wiki: Path) -> Path:
     """Return the failed-sources dir: ``<wiki>/.wiki/failed``."""
     return wiki / WIKI_DIR / "failed"
+
+
+def wiki_retention_state(wiki: Path) -> Path:
+    """Return the claim-retention gate's consecutive-grader-failure counter path:
+    ``<wiki>/.wiki/.retention_gate_state.json``.
+
+    Sibling to ``wiki_registry()`` (``.sources.json``) and the ledger -- same
+    ``.wiki/`` process-state subtree, same small-JSON-file convention. See
+    ``wiki_weaver/retention.py`` for the reader/writer and the fail-open/
+    fail-closed escalation policy built on top of this counter.
+    """
+    return wiki / WIKI_DIR / RETENTION_STATE_NAME
 
 
 def wiki_runs(wiki: Path) -> Path:
@@ -768,6 +783,7 @@ def ingest(
         # Import the engine runner lazily so `doctor`/`init`/`lint` never pay
         # the cost of pulling in the attractor engine.
         from wiki_weaver.engine_runner import run_inner
+        from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
 
         processed = _processed_sources(wiki)
         summary: list[tuple[str, str]] = []
@@ -808,63 +824,108 @@ def ingest(
             # writes process state only AFTER this, on real convergence).
             before_state = _snapshot_process_state(wiki)
 
+            # Claim-retention backstop: snapshot the current page BODIES before
+            # the inner run so a post-convergence independent re-check can tell
+            # whether the re-write silently dropped any prior content. See
+            # wiki_weaver/retention.py for the full mechanism + honest framing
+            # (this is an LLM-judge-backed re-check, NOT a deterministic gate).
+            retention_snapshot_dir = (
+                wiki_runs(wiki)
+                / f".retention-snap-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+            )
+            snapshot_pages(wiki, retention_snapshot_dir)
+
             try:
-                result = run_inner(
-                    src, wiki, max_cycles=max_cycles, source_id=source_id
-                )
-            except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
-                _fail(f"engine error on {name}: {type(e).__name__}: {e}")
-                summary.append((name, "error"))
-                if not keep_going:
-                    _print_summary(summary)
-                    return 1
-                continue
+                try:
+                    result = run_inner(
+                        src, wiki, max_cycles=max_cycles, source_id=source_id
+                    )
+                except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
+                    _fail(f"engine error on {name}: {type(e).__name__}: {e}")
+                    summary.append((name, "error"))
+                    if not keep_going:
+                        _print_summary(summary)
+                        return 1
+                    continue
 
-            # Fix 1b: never trust agent-written process state. Undo + fail loud.
-            violations = _detect_and_undo_tamper(wiki, before_state)
-            if violations:
-                _fail(
-                    f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
-                    f"state it does not own. Convergence is NOT trusted; "
-                    f"fabricated records were reverted."
-                )
-                for v in violations:
-                    _fail(f"    - {v}")
-                summary.append((name, "tampered"))
-                if not keep_going:
-                    _print_summary(summary)
-                    return 1
-                continue
+                # Fix 1b: never trust agent-written process state. Undo + fail loud.
+                violations = _detect_and_undo_tamper(wiki, before_state)
+                if violations:
+                    _fail(
+                        f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
+                        f"state it does not own. Convergence is NOT trusted; "
+                        f"fabricated records were reverted."
+                    )
+                    for v in violations:
+                        _fail(f"    - {v}")
+                    summary.append((name, "tampered"))
+                    if not keep_going:
+                        _print_summary(summary)
+                        return 1
+                    continue
 
-            if result.converged:
-                dest = sources_dir / name
-                if src.is_file() and src.parent == inbox:
-                    src.replace(dest)
-                _append_ledger(
-                    wiki,
-                    {
-                        "source": name,
-                        "source_id": source_id,
-                        "hash": file_hash,
-                        "status": result.status,
-                        "converged": result.converged,
-                        "archived_to": str(dest),
-                        "logs_dir": str(result.logs_dir),
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    },
-                )
-                _mark_source_ingested(wiki, file_hash)
-                _ok(f"{name}: converged (logs: {result.logs_dir})")
-                summary.append((name, "converged"))
-            else:
-                _fail(
-                    f"{name}: did not converge "
-                    f"(status={result.status}, reason={result.failure_reason})"
-                )
-                summary.append((name, "not-converged"))
-                if not keep_going:
-                    _print_summary(summary)
-                    return 1
+                if result.converged:
+                    # Claim-retention backstop: an independent, LLM-judge-backed
+                    # re-check of whether this re-write silently dropped prior
+                    # content. On CONFIRMED_LOSS this source is refused --
+                    # archiving/ledger-advancing does NOT happen, matching the
+                    # tamper-guard's "never trust, verify, fail loud" posture.
+                    retention_decision = enforce_retention_gate(
+                        wiki, retention_snapshot_dir
+                    )
+                    if retention_decision.action == "block_confirmed_loss":
+                        _fail(f"{name}: {retention_decision.message}")
+                        summary.append((name, "retention-blocked"))
+                        if not keep_going:
+                            _print_summary(summary)
+                            return 1
+                        continue
+                    if retention_decision.action == "block_escalated_errors":
+                        _fail(f"{name}: {retention_decision.message}")
+                        summary.append((name, "retention-blocked"))
+                        if not keep_going:
+                            _print_summary(summary)
+                            return 1
+                        continue
+                    if retention_decision.message:
+                        # Either a plain PASS note or a fail-open WARN -- both
+                        # non-blocking; the source proceeds to archive below.
+                        print(f"  {retention_decision.message}")
+
+                    dest = sources_dir / name
+                    if src.is_file() and src.parent == inbox:
+                        src.replace(dest)
+                    _append_ledger(
+                        wiki,
+                        {
+                            "source": name,
+                            "source_id": source_id,
+                            "hash": file_hash,
+                            "status": result.status,
+                            "converged": result.converged,
+                            "archived_to": str(dest),
+                            "logs_dir": str(result.logs_dir),
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        },
+                    )
+                    _mark_source_ingested(wiki, file_hash)
+                    _ok(f"{name}: converged (logs: {result.logs_dir})")
+                    summary.append((name, "converged"))
+                else:
+                    _fail(
+                        f"{name}: did not converge "
+                        f"(status={result.status}, reason={result.failure_reason})"
+                    )
+                    summary.append((name, "not-converged"))
+                    if not keep_going:
+                        _print_summary(summary)
+                        return 1
+            finally:
+                # Belt-and-suspenders: enforce_retention_gate() already removes
+                # retention_snapshot_dir on every path it runs; this covers the
+                # error/tamper/not-converged paths above where it is never
+                # invoked. ignore_errors=True tolerates an already-removed dir.
+                shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
 
         _print_summary(summary)
         return 0
@@ -897,6 +958,7 @@ def ingest(
     # Import the engine runner lazily so `doctor`/`init`/`lint` never pay the
     # cost of pulling in the attractor engine.
     from wiki_weaver.engine_runner import run_inner, shared_engine_loop
+    from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
 
     processed = _processed_sources(wiki)
     summary_drain: list[tuple[str, str]] = []
@@ -1014,61 +1076,99 @@ def ingest(
             # writes process state only AFTER this, on real convergence).
             before_state = _snapshot_process_state(wiki)
 
+            # Claim-retention backstop: snapshot the current page BODIES before
+            # the inner run so a post-convergence independent re-check can tell
+            # whether the re-write silently dropped any prior content. See
+            # wiki_weaver/retention.py for the full mechanism + honest framing
+            # (this is an LLM-judge-backed re-check, NOT a deterministic gate).
+            retention_snapshot_dir = (
+                wiki_runs(wiki)
+                / f".retention-snap-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+            )
+            snapshot_pages(wiki, retention_snapshot_dir)
+
             try:
-                result = run_inner(
-                    src, wiki, max_cycles=max_cycles, source_id=source_id
-                )
-            except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
-                _fail(f"engine error on {name}: {type(e).__name__}: {e}")
-                if src.is_file() and src.parent == inbox:
-                    _collision_safe_move(src, failed_dir)
-                summary_drain.append((name, "error"))
-                continue  # drain always continues; exit code is set after drain
+                try:
+                    result = run_inner(
+                        src, wiki, max_cycles=max_cycles, source_id=source_id
+                    )
+                except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
+                    _fail(f"engine error on {name}: {type(e).__name__}: {e}")
+                    if src.is_file() and src.parent == inbox:
+                        _collision_safe_move(src, failed_dir)
+                    summary_drain.append((name, "error"))
+                    continue  # drain always continues; exit code is set after drain
 
-            # Fix 1b: never trust agent-written process state. Undo + fail loud.
-            violations = _detect_and_undo_tamper(wiki, before_state)
-            if violations:
-                _fail(
-                    f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
-                    f"state it does not own. Convergence is NOT trusted; "
-                    f"fabricated records were reverted."
-                )
-                for v in violations:
-                    _fail(f"    - {v}")
-                if src.is_file() and src.parent == inbox:
-                    _collision_safe_move(src, failed_dir)
-                summary_drain.append((name, "tampered"))
-                continue
+                # Fix 1b: never trust agent-written process state. Undo + fail loud.
+                violations = _detect_and_undo_tamper(wiki, before_state)
+                if violations:
+                    _fail(
+                        f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
+                        f"state it does not own. Convergence is NOT trusted; "
+                        f"fabricated records were reverted."
+                    )
+                    for v in violations:
+                        _fail(f"    - {v}")
+                    if src.is_file() and src.parent == inbox:
+                        _collision_safe_move(src, failed_dir)
+                    summary_drain.append((name, "tampered"))
+                    continue
 
-            if result.converged:
-                dest = sources_dir / name
-                if src.is_file() and src.parent == inbox:
-                    src.replace(dest)
-                _append_ledger(
-                    wiki,
-                    {
-                        "source": name,
-                        "source_id": source_id,
-                        "hash": file_hash,
-                        "status": result.status,
-                        "converged": result.converged,
-                        "archived_to": str(dest),
-                        "logs_dir": str(result.logs_dir),
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    },
-                )
-                _mark_source_ingested(wiki, file_hash)
-                _ok(f"{name}: converged (logs: {result.logs_dir})")
-                summary_drain.append((name, "converged"))
-            else:
-                _fail(
-                    f"{name}: did not converge "
-                    f"(status={result.status}, reason={result.failure_reason})"
-                )
-                if src.is_file() and src.parent == inbox:
-                    _collision_safe_move(src, failed_dir)
-                summary_drain.append((name, "not-converged"))
-                # Drain mode: always continue (never halt on non-convergence).
+                if result.converged:
+                    # Claim-retention backstop: an independent, LLM-judge-backed
+                    # re-check of whether this re-write silently dropped prior
+                    # content. On CONFIRMED_LOSS this source is refused --
+                    # archiving/ledger-advancing does NOT happen; it routes to
+                    # _failed/ like any other non-convergence disposition.
+                    retention_decision = enforce_retention_gate(
+                        wiki, retention_snapshot_dir
+                    )
+                    if retention_decision.action in (
+                        "block_confirmed_loss",
+                        "block_escalated_errors",
+                    ):
+                        _fail(f"{name}: {retention_decision.message}")
+                        if src.is_file() and src.parent == inbox:
+                            _collision_safe_move(src, failed_dir)
+                        summary_drain.append((name, "retention-blocked"))
+                        continue
+                    if retention_decision.message:
+                        print(f"  {retention_decision.message}")
+
+                    dest = sources_dir / name
+                    if src.is_file() and src.parent == inbox:
+                        src.replace(dest)
+                    _append_ledger(
+                        wiki,
+                        {
+                            "source": name,
+                            "source_id": source_id,
+                            "hash": file_hash,
+                            "status": result.status,
+                            "converged": result.converged,
+                            "archived_to": str(dest),
+                            "logs_dir": str(result.logs_dir),
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        },
+                    )
+                    _mark_source_ingested(wiki, file_hash)
+                    _ok(f"{name}: converged (logs: {result.logs_dir})")
+                    summary_drain.append((name, "converged"))
+                else:
+                    _fail(
+                        f"{name}: did not converge "
+                        f"(status={result.status}, reason={result.failure_reason})"
+                    )
+                    if src.is_file() and src.parent == inbox:
+                        _collision_safe_move(src, failed_dir)
+                    summary_drain.append((name, "not-converged"))
+                    # Drain mode: always continue (never halt on non-convergence).
+            finally:
+                # Belt-and-suspenders: enforce_retention_gate() already removes
+                # retention_snapshot_dir on every path it runs; this covers the
+                # error/tamper/not-converged paths above where it is never
+                # invoked. ignore_errors=True tolerates an already-removed dir.
+                shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
 
         _print_summary(summary_drain)
         # Fail-loud after the drain: surface anything routed to _failed/ as a
