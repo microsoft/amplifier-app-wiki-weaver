@@ -783,6 +783,7 @@ def ingest(
         # Import the engine runner lazily so `doctor`/`init`/`lint` never pay
         # the cost of pulling in the attractor engine.
         from wiki_weaver.engine_runner import run_inner
+        from wiki_weaver.grading import no_duplicate_pages
         from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
 
         processed = _processed_sources(wiki)
@@ -892,6 +893,24 @@ def ingest(
                         # non-blocking; the source proceeds to archive below.
                         print(f"  {retention_decision.message}")
 
+                    # Duplicate-page backstop: a cheap, deterministic scan for
+                    # merge-fragment duplicates (e.g. concept-2.md alongside
+                    # concept.md -- the "appended instead of fused" failure
+                    # signature). Free/no-LLM, so it always runs -- no
+                    # fail-open/fail-closed escalation needed (see
+                    # wiki_weaver/grading.py's no_duplicate_pages()).
+                    dup_pages = no_duplicate_pages(wiki)
+                    if dup_pages:
+                        _fail(
+                            f"{name}: duplicate-page gate: merge-fragment "
+                            f"duplicate(s) detected: {', '.join(dup_pages)}"
+                        )
+                        summary.append((name, "duplicate-blocked"))
+                        if not keep_going:
+                            _print_summary(summary)
+                            return 1
+                        continue
+
                     dest = sources_dir / name
                     if src.is_file() and src.parent == inbox:
                         src.replace(dest)
@@ -958,6 +977,7 @@ def ingest(
     # Import the engine runner lazily so `doctor`/`init`/`lint` never pay the
     # cost of pulling in the attractor engine.
     from wiki_weaver.engine_runner import run_inner, shared_engine_loop
+    from wiki_weaver.grading import no_duplicate_pages
     from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
 
     processed = _processed_sources(wiki)
@@ -1134,6 +1154,20 @@ def ingest(
                         continue
                     if retention_decision.message:
                         print(f"  {retention_decision.message}")
+
+                    # Duplicate-page backstop: cheap, deterministic, always-on
+                    # (no fail-open/fail-closed escalation needed -- see
+                    # wiki_weaver/grading.py's no_duplicate_pages()).
+                    dup_pages = no_duplicate_pages(wiki)
+                    if dup_pages:
+                        _fail(
+                            f"{name}: duplicate-page gate: merge-fragment "
+                            f"duplicate(s) detected: {', '.join(dup_pages)}"
+                        )
+                        if src.is_file() and src.parent == inbox:
+                            _collision_safe_move(src, failed_dir)
+                        summary_drain.append((name, "duplicate-blocked"))
+                        continue
 
                     dest = sources_dir / name
                     if src.is_file() and src.parent == inbox:

@@ -37,6 +37,20 @@ requires ``judge_fn`` (an LLM call) to produce a verdict; see its docstring for
 the honest framing. ``eval/grade_claim_retention.py`` and ``eval/grade_wiki.py``
 both import from here and re-export, so existing callers keep working
 unchanged. Pure relocation, not a behavior change.
+
+THIRD RELOCATION (duplicate-page check): ``eval/grade_wiki.py``'s
+``no_duplicate_pages()`` detects merge-fragment duplicate pages (e.g.
+``slug-2.md`` alongside ``slug.md`` -- the "appended instead of fused"
+failure signature) but was eval-only, never invoked at runtime. Unlike
+``grade_claim_retention()``, this check is purely deterministic -- a glob +
+regex scan of the wiki's root ``*.md`` files, no LLM/judge dependency, no
+network, effectively free. It is wired into ``wiki_weaver/lib.py``'s
+``ingest()`` (both paths) and ``wiki_weaver/engine_runner.py``'s
+``run_ingest()`` alongside the claim-retention gate, but -- being free and
+having no "judge unavailable" failure mode -- it always runs unconditionally
+and needs no fail-open/fail-closed escalation counter. ``eval/grade_wiki.py``
+imports it from here and re-exports it. Pure relocation, not a behavior
+change.
 """
 
 from __future__ import annotations
@@ -53,6 +67,8 @@ __all__ = [
     "OVERVIEW_WIKILINK_MIN",
     "RetentionResult",
     "grade_claim_retention",
+    "DUP_PAGE",
+    "no_duplicate_pages",
 ]
 
 # ---------------------------------------------------------------------------
@@ -556,3 +572,38 @@ def grade_claim_retention(
 
     result.claims = [c for c in claims if isinstance(c, dict)]
     return result
+
+
+# ---------------------------------------------------------------------------
+# no_duplicate_pages -- deterministic merge-fragment duplicate detector
+# ---------------------------------------------------------------------------
+
+# Numeric-suffix slug pattern used to detect merge-fragment duplicates.
+# See no_duplicate_pages() -- the regex alone is not enough; we also require
+# the base slug to exist so legitimate version-named pages (gemma-4.md,
+# deepseek-v3-2.md, kimi-k2-5.md, ...) are NOT flagged as duplicates.
+DUP_PAGE = re.compile(r"-\d+\.md$")
+
+
+def no_duplicate_pages(wiki: Path) -> list[str]:
+    """Return fragment pages whose base slug already exists as a separate page.
+
+    Catches per-source duplicate concept fragments (e.g. concept-2.md when
+    concept.md also exists) while ignoring legitimate version- or number-named
+    entity pages like gemma-4.md, deepseek-v3-2.md, kimi-k2-5.md (no matching
+    base page present in the wiki).
+
+    Purely deterministic -- a glob + regex scan of the wiki's root ``*.md``
+    files. No LLM/judge dependency, no network. Unlike ``grade_claim_retention``,
+    there is no "judge unavailable" failure mode for this check, so callers
+    do not need a fail-open/fail-closed escalation policy for it.
+    """
+    dups = []
+    for p in sorted(wiki.glob("*.md")):
+        if not DUP_PAGE.search(p.name):
+            continue
+        # Only flag when the de-numbered base slug also exists as a page.
+        base_name = DUP_PAGE.sub(".md", p.name)
+        if (wiki / base_name).is_file():
+            dups.append(p.name)
+    return dups
