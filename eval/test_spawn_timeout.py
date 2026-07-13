@@ -39,19 +39,33 @@ pytest.importorskip("wiki_weaver.engine_runner")
 import wiki_weaver.engine_runner as er  # noqa: E402
 
 
-def _fake_result(status: str = "success", notes: str = "ok") -> Any:
+def _fake_result(
+    status: str = "success", notes: str = "ok", failure_reason: str | None = None
+) -> Any:
     from amplifier_module_pipeline_runner import PipelineResult
 
-    return PipelineResult(status=status, notes=notes, logs_dir=Path("/tmp"), raw="{}")
+    return PipelineResult(
+        status=status,
+        notes=notes,
+        logs_dir=Path("/tmp"),
+        raw="{}",
+        failure_reason=failure_reason,
+    )
 
 
-def _capture_run_pipeline(monkeypatch, captured: dict) -> None:
-    """Patch er.run_pipeline to record its kwargs and return a fake success."""
+def _capture_run_pipeline(
+    monkeypatch,
+    captured: dict,
+    *,
+    status: str = "success",
+    failure_reason: str | None = None,
+) -> None:
+    """Patch er.run_pipeline to record its kwargs and return a fake result."""
 
     async def fake_run_pipeline(dot_source: str, **kwargs: Any) -> Any:
         captured["dot_source"] = dot_source
         captured.update(kwargs)
-        return _fake_result()
+        return _fake_result(status=status, failure_reason=failure_reason)
 
     monkeypatch.setattr(er, "run_pipeline", fake_run_pipeline)
 
@@ -117,6 +131,54 @@ def test_run_inner_threads_spawn_timeout_and_constraint(
     assert callable(captured.get("child_constraint")), (
         "run_inner must pass a child_constraint (Fix 1 filesystem isolation) "
         "to run_pipeline"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 3b -- regression: failure_reason propagates from PipelineResult into
+# InnerResult on both run_inner and run_ingest, instead of being hardcoded to
+# None (PipelineResult DOES carry failure_reason -- see
+# amplifier_module_pipeline_runner.runner.PipelineResult).
+# ---------------------------------------------------------------------------
+
+
+def test_run_inner_propagates_failure_reason(monkeypatch, tmp_path: Path) -> None:
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    source = tmp_path / "source.md"
+    source.write_text("hello world", encoding="utf-8")
+    captured: dict = {}
+    _capture_run_pipeline(
+        monkeypatch,
+        captured,
+        status="fail",
+        failure_reason="no matching edge from node assess",
+    )
+
+    result = er.run_inner(source, wiki_dir)
+
+    assert result.failure_reason == "no matching edge from node assess", (
+        "run_inner must propagate PipelineResult.failure_reason into "
+        "InnerResult, not hardcode None"
+    )
+
+
+def test_run_ingest_propagates_failure_reason(monkeypatch, tmp_path: Path) -> None:
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    captured: dict = {}
+    _capture_run_pipeline(
+        monkeypatch,
+        captured,
+        status="fail",
+        failure_reason="max_drain_iters exceeded",
+    )
+
+    result = er.run_ingest(wiki_dir)
+
+    assert result.failure_reason == "max_drain_iters exceeded", (
+        "run_ingest must propagate PipelineResult.failure_reason into "
+        "InnerResult, not hardcode None"
     )
 
 

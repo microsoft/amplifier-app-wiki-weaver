@@ -1024,9 +1024,7 @@ def run_inner(
         converged=status == "success",
         logs_dir=logs_dir,
         notes=result.notes[:2000],
-        # NOTE: PipelineResult does not carry the engine's Outcome.failure_reason
-        # (only status/notes) -- see the migration report for this known gap.
-        failure_reason=None,
+        failure_reason=result.failure_reason,
     )
 
 
@@ -1128,8 +1126,7 @@ def run_ingest(
         converged=status == "success",
         logs_dir=logs_dir,
         notes=result.notes[:2000],
-        # See run_inner's note: PipelineResult carries no failure_reason.
-        failure_reason=None,
+        failure_reason=result.failure_reason,
     )
 
 
