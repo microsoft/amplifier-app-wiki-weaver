@@ -68,8 +68,11 @@ from validate_wiki import validate  # noqa: E402
 from wiki_weaver.grading import (  # noqa: E402
     OVERVIEW_OPENER_THRESHOLD,
     OVERVIEW_WIKILINK_MIN,
+    DUP_PAGE,
     GradeResult,
+    _build_judge_fn,
     grade_overview,
+    no_duplicate_pages,
 )
 
 __all__ = [
@@ -77,16 +80,14 @@ __all__ = [
     "grade_overview",
     "OVERVIEW_OPENER_THRESHOLD",
     "OVERVIEW_WIKILINK_MIN",
+    "_build_judge_fn",
+    "DUP_PAGE",
+    "no_duplicate_pages",
 ]
 
 LEDGER_NAME = ".processed.jsonl"
 REGISTRY_NAME = ".sources.json"
 ARCHIVE = "_archive"
-# Numeric-suffix slug pattern used to detect merge-fragment duplicates.
-# See no_duplicate_pages() — the regex alone is not enough; we also require
-# the base slug to exist so legitimate version-named pages (gemma-4.md,
-# deepseek-v3-2.md, kimi-k2-5.md, …) are NOT flagged as duplicates.
-DUP_PAGE = re.compile(r"-\d+\.md$")
 # Parse a frontmatter ``sources: [1, 2]`` list into a set of ints.
 SOURCES_FM = re.compile(r"^sources:\s*\[([^\]]*)\]", re.MULTILINE)
 
@@ -171,25 +172,6 @@ HUB_REDUNDANCY_THRESHOLD: float = 0.30
 def structural_clean(wiki: Path) -> tuple[bool, list[str]]:
     r = validate(wiki)
     return bool(r.get("passed")), list(r.get("failures", []))
-
-
-def no_duplicate_pages(wiki: Path) -> list[str]:
-    """Return fragment pages whose base slug already exists as a separate page.
-
-    Catches per-source duplicate concept fragments (e.g. concept-2.md when
-    concept.md also exists) while ignoring legitimate version- or number-named
-    entity pages like gemma-4.md, deepseek-v3-2.md, kimi-k2-5.md (no matching
-    base page present in the wiki).
-    """
-    dups = []
-    for p in sorted(wiki.glob("*.md")):
-        if not DUP_PAGE.search(p.name):
-            continue
-        # Only flag when the de-numbered base slug also exists as a page.
-        base_name = DUP_PAGE.sub(".md", p.name)
-        if (wiki / base_name).is_file():
-            dups.append(p.name)
-    return dups
 
 
 def _read_ledger(wiki: Path) -> list[dict]:
@@ -710,30 +692,10 @@ def judge_claim_framing(page_text: str, judge_fn) -> dict:
     return {"score": 3, "rationale": "parse error", "examples": []}
 
 
-def _build_judge_fn():
-    """Wire judge_fn to unified_llm.generate() if importable; else return None.
-
-    Uses the top-level generate() convenience function (Spec §4.3) which takes
-    a plain-text ``prompt`` kwarg and returns a GenerateResult with a .text
-    attribute.  generate() is async; asyncio.run() bridges the sync CLI caller.
-    """
-    try:
-        import asyncio  # noqa: PLC0415
-
-        from unified_llm import generate  # type: ignore  # noqa: PLC0415
-
-        def _judge(prompt: str) -> str:
-            result = asyncio.run(generate("claude-sonnet-4-6", prompt=prompt))
-            return result.text
-
-        return _judge
-    except Exception as exc:
-        print(
-            f"WARN: unified_llm not importable ({exc}); "
-            "falling back to deterministic-only grading.",
-            file=sys.stderr,
-        )
-        return None
+# NOTE: _build_judge_fn() now lives in wiki_weaver/grading.py and is imported
+# (see top of file) rather than defined here -- same dependency-inversion
+# relocation as GradeResult/grade_overview (commit 7062a17, PR #29), extended
+# to cover the claim-retention grader's LLM-judge plumbing.
 
 
 # ---------------------------------------------------------------------------

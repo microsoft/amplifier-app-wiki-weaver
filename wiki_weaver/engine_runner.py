@@ -1057,7 +1057,38 @@ def run_ingest(
     ``max_cycles`` is unused (the policy is read by ingest_setup.py and
     passed as a context key into synthesize.dot). Retained for API symmetry
     with run_inner.
+
+    PROTECTIONS (claim-retention backstop, duplicate-page check, overview
+    re-weave): wired here so an agent-driven ingest (this function, called by
+    the ``wiki_weaver_ingest`` tool) gets the same backstops as the CLI/
+    scheduled-ingest path (``wiki_weaver/lib.py``'s ``ingest()``). See
+    wiki_weaver/retention.py, wiki_weaver/grading.py's ``no_duplicate_pages``,
+    and wiki_weaver/reweave.py for the mechanisms.
+
+    HONEST FRAMING -- this wiring is NOT identical in strength to lib.py's.
+    ``ingest.dot`` archives each source (moves it out of ``_inbox/``, appends
+    the ledger) INSIDE the engine run, via its own ``archive`` tool node, one
+    full drain-loop iteration per source, all before this function ever
+    regains control. lib.py's Python drain loop, by contrast, calls
+    ``run_inner()`` per source and only archives AFTER its own Python-level
+    gate checks pass -- it can refuse to archive a bad re-write. Here, by the
+    time ``run_pipeline()`` below returns, every source in this drain has
+    ALREADY been archived by the engine, gate or no gate. So the checks below
+    are a POST-HOC detect-and-fail-loud backstop over the WHOLE drain (one
+    before-snapshot taken before the drain starts, one check after it ends)
+    -- not a per-source block-before-archive gate. A confirmed loss or
+    duplicate page here surfaces as ``converged=False`` with an actionable
+    ``failure_reason`` (so the calling agent/tool sees a clear failure, not a
+    false success) -- it does NOT undo the archive. A true block-before-
+    archive gate would require a retention/duplicate-check node inside
+    ingest.dot itself (Phase 2 scope -- see wiki_weaver/retention.py's module
+    docstring), not built here.
+
+    The overview re-weave is NOT subject to this limitation: overview.md is
+    rewritten wholesale, once, after the whole drain -- identical in
+    strength to lib.py's placement.
     """
+    import shutil
     import sys
 
     wiki_dir = Path(wiki_dir).resolve()
@@ -1108,25 +1139,109 @@ def run_ingest(
 
     (logs_dir / "ingest.dot").write_text(dot_source, encoding="utf-8")
 
-    result = _run_coro(
-        run_pipeline(
-            dot_source,
-            cwd=wiki_dir,
-            logs_root=logs_dir,
-            provider=policy.provider,
-            profiles=None,
-            extra_overlays=[_ci_overlay()],
-            child_constraint=_fs_child_constraint(wiki_dir),
-            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+    # Claim-retention + duplicate-page backstop: snapshot the wiki's current
+    # page BODIES before the drain starts. See the HONEST FRAMING section of
+    # this function's docstring -- this is a single before/after check over
+    # the WHOLE drain (every source in _inbox/), not per-source like
+    # lib.py's Python drain loop, because ingest.dot archives each source
+    # internally before this function regains control.
+    from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
+
+    retention_snapshot_dir = wiki_runs(wiki_dir) / f".retention-snap-ingest-{timestamp}"
+    snapshot_pages(wiki_dir, retention_snapshot_dir)
+
+    try:
+        result = _run_coro(
+            run_pipeline(
+                dot_source,
+                cwd=wiki_dir,
+                logs_root=logs_dir,
+                provider=policy.provider,
+                profiles=None,
+                extra_overlays=[_ci_overlay()],
+                child_constraint=_fs_child_constraint(wiki_dir),
+                spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+            )
         )
-    )
-    status = result.status or "unknown"
+        status = result.status or "unknown"
+        converged = status == "success"
+        notes = result.notes[:2000]
+        failure_reason = result.failure_reason
+
+        if converged:
+            # Claim-retention backstop: an independent, LLM-judge-backed
+            # post-hoc re-check across the whole drain (see HONEST FRAMING
+            # above -- this cannot prevent the archive, only surface it as a
+            # loud failure).
+            retention_decision = enforce_retention_gate(
+                wiki_dir, retention_snapshot_dir
+            )
+            if retention_decision.action in (
+                "block_confirmed_loss",
+                "block_escalated_errors",
+            ):
+                converged = False
+                failure_reason = retention_decision.message
+            elif retention_decision.message:
+                notes = f"{notes}\n{retention_decision.message}"[:2000]
+
+            # Duplicate-page backstop: cheap, deterministic, always-on (no
+            # fail-open/fail-closed escalation needed -- see
+            # wiki_weaver/grading.py's no_duplicate_pages()).
+            from wiki_weaver.grading import no_duplicate_pages
+
+            dup_pages = no_duplicate_pages(wiki_dir)
+            if dup_pages:
+                converged = False
+                dup_message = (
+                    "duplicate-page gate: merge-fragment duplicate(s) "
+                    f"detected: {', '.join(dup_pages)}"
+                )
+                failure_reason = (
+                    f"{failure_reason}; {dup_message}"
+                    if failure_reason
+                    else dup_message
+                )
+    finally:
+        # Belt-and-suspenders: enforce_retention_gate() already removes
+        # retention_snapshot_dir on every path it runs; this covers the
+        # never-converged path above where it is never invoked.
+        shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
+
+    # Overview re-weave: runs ONCE HERE, after the full drain -- unconditional
+    # w.r.t. per-source outcomes (mirrors wiki_weaver/lib.py's drain path
+    # placement exactly; this protection is NOT weakened by ingest.dot's
+    # per-source archiving, since overview.md is rewritten wholesale after
+    # the fact either way). See wiki_weaver/reweave.py for the mechanism.
+    #
+    # Gated on inbox_count > 0 -- matching lib.py's drain path, which returns
+    # early ("no sources to ingest") and never reaches reweave_overview_if_needed
+    # at all when _inbox/ was empty. Without this gate, an ingest call on an
+    # empty/uninitialized wiki (no index.md yet -- e.g. `init` never ran)
+    # would crash inside reweave_overview() instead of being the harmless
+    # no-op it is on the CLI path.
+    if inbox_count > 0:
+        from wiki_weaver.reweave import reweave_overview_if_needed
+
+        reweave_result = reweave_overview_if_needed(wiki_dir)
+        if reweave_result.attempts and not reweave_result.final_passed:
+            converged = False
+            reweave_message = (
+                f"overview.md still fails grade_overview() after "
+                f"{reweave_result.attempts} re-weave attempt(s): {reweave_result.final_report}"
+            )
+            failure_reason = (
+                f"{failure_reason}; {reweave_message}"
+                if failure_reason
+                else reweave_message
+            )
+
     return InnerResult(
         status=status,
-        converged=status == "success",
+        converged=converged,
         logs_dir=logs_dir,
-        notes=result.notes[:2000],
-        failure_reason=result.failure_reason,
+        notes=notes,
+        failure_reason=failure_reason,
     )
 
 

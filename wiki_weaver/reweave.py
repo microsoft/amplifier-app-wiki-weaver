@@ -25,9 +25,12 @@ COST-BOUNDED DESIGN:
     complete no-op.
   - Only on FAILURE does a re-weave LLM call happen -- exactly ONE call per
     invocation of the gate, wired ONCE PER FULL INGEST RUN (after the entire
-    _inbox/ drain completes), never once per source. See wiki_weaver/lib.py's
-    ``ingest()`` drain loop and wiki_weaver/engine_runner.py's ``run_ingest()``
-    for the two wiring points (CLI drain path and engine-driven drain path).
+    _inbox/ drain completes), never once per source. Wired into BOTH real
+    drain paths: wiki_weaver/lib.py's ``ingest()`` drain loop (CLI/scheduled
+    ingestion) and wiki_weaver/engine_runner.py's ``run_ingest()`` (the
+    agent-tool-module path, ``wiki_weaver_ingest``) -- each calls
+    ``reweave_overview_if_needed()`` exactly once, after its own full drain
+    completes.
   - Retries are bounded (``max_retries``, default 2). If the gate is still
     failing after the budget, this FAILS LOUD -- it never silently leaves a
     degraded overview.md and reports success.
