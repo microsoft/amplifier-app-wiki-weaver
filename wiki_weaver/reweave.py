@@ -34,22 +34,32 @@ COST-BOUNDED DESIGN:
 
 MECHANISM REUSE: this follows the exact pattern already established by
 ``run_init`` / ``build_init_dot`` in engine_runner.py -- a single-node DOT
-pipeline built as a Python string, run through the same
-``engine_runner._run_pipeline`` proper-path runner (no new provider-calling
-mechanism introduced). The agent is instructed to read index.md and write
-overview.md directly via its filesystem tools, exactly as build_init_dot has
-the schema-design agent write schema.md directly.
+pipeline built as a Python string, run through the same shared
+``run_pipeline`` (amplifier_module_pipeline_runner) runner every other
+engine_runner entrypoint uses (no new provider-calling mechanism
+introduced). The agent is instructed to read index.md and write overview.md
+directly via its filesystem tools, exactly as build_init_dot has the
+schema-design agent write schema.md directly.
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .engine_runner import MODEL, PROVIDER, _dot_escape_prompt, _run_coro, _run_pipeline
+from amplifier_module_pipeline_runner import run_pipeline
+
+from .engine_runner import (
+    MODEL,
+    PROVIDER,
+    SPAWN_TIMEOUT_SECONDS,
+    _ci_overlay,
+    _dot_escape_prompt,
+    _fs_child_constraint,
+    _run_coro,
+)
 from .grading import GradeResult, grade_overview
 from .lib import wiki_runs
 from .model_resolver import resolve_model
@@ -137,26 +147,6 @@ def build_reweave_dot(
     return "\n".join(lines)
 
 
-async def _run_reweave_pipeline(
-    dot_source: str,
-    logs_dir: Path,
-    wiki_dir: Path,
-) -> tuple[str, dict]:
-    """Run the reweave DOT through the shared proper-path runner.
-
-    Uses the plain ``_run_pipeline`` (not the read-only ``_run_ask_pipeline``
-    variant) because this node MUST be able to write ``overview.md`` --
-    identical wiring to ``run_init`` / ``run_inner``.
-    """
-    return await _run_pipeline(
-        dot_source,
-        logs_dir,
-        wiki_dir,
-        execute_prompt="Run the pipeline",
-        wiki_dir=wiki_dir,
-    )
-
-
 def reweave_overview(wiki_dir: str | Path) -> None:
     """Synthesize a fresh overview.md from index.md via one LLM completion.
 
@@ -191,8 +181,21 @@ def reweave_overview(wiki_dir: str | Path) -> None:
 
     # Runs on the shared ingest loop when driven from ingest()'s
     # shared_engine_loop() context (single-loop drain); otherwise a private
-    # one-shot loop. Either way the load-once _BASE_BUNDLE stays loop-consistent.
-    _run_coro(_run_reweave_pipeline(dot_source, logs_dir, wiki_dir))
+    # one-shot loop -- identical wiring to run_init / run_inner in
+    # engine_runner.py (this node MUST be able to write overview.md, so it
+    # gets the same fs child_constraint, not the read-only ask one).
+    _run_coro(
+        run_pipeline(
+            dot_source,
+            cwd=wiki_dir,
+            logs_root=logs_dir,
+            provider=policy.provider,
+            profiles=None,
+            extra_overlays=[_ci_overlay()],
+            child_constraint=_fs_child_constraint(wiki_dir),
+            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+        )
+    )
 
     overview_path = wiki_dir / "overview.md"
     if (

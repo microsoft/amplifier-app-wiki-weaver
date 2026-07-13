@@ -20,6 +20,10 @@ authors = [{name = "Microsoft Corporation"}]
 dependencies = [
     "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
     "amplifier-unified-llm-client @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/unified-llm-client",
+    # Shared engine-driving library (drive_engine/run_pipeline + spawn wiring)
+    # that engine_runner.py delegates to -- see wiki_weaver/engine_runner.py's
+    # module docstring for the split of responsibilities.
+    "amplifier-module-pipeline-runner @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/pipeline-runner",
     "tinycss2>=1.0",
     "markdown>=3.0",
 ]

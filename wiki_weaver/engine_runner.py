@@ -2,21 +2,24 @@
 #!/usr/bin/env python3
 """Run the wiki-weaver INNER convergence pipeline through the attractor engine.
 
-PROPER PreparedBundle path (no sys.path hacks, no raw mount-plan):
+Delegates the generic engine-driving mechanics (compose the attractor-pipeline
+base bundle, create the session, wire ``session.spawn``, drive the engine
+directly) to the shared ``amplifier_module_pipeline_runner.run_pipeline``
+library (see the ``pipeline-runner`` module in amplifier-bundle-attractor).
+This module keeps only the wiki-weaver PRODUCT: building each ``.dot``
+pipeline (with concrete paths/prompts substituted in), and the two
+wiki-weaver-specific spawn constraints applied via ``run_pipeline``'s
+``child_constraint`` seam:
 
-    base     = await load_bundle(<attractor-pipeline bundle>)
-    dot_ovl  = Bundle(session={"orchestrator": {"module": "loop-pipeline",
-                                                 "config": {"dot_source": <inner.dot>}}})
-    ci_ovl   = Bundle(hooks=[{"module": "hook-context-intelligence", ...}])
-    prepared = await base.compose(dot_ovl).compose(ci_ovl).prepare()
-    session  = await prepared.create_session(session_cwd=<wiki_dir>)
-    session.coordinator.register_capability("session.spawn", make_spawn_fn(prepared))
-    async with session: raw = await session.execute("Run the pipeline")
+  - ``_fs_child_constraint``  -- denies the ledger/_sources/ paths (Fix 1)
+  - ``_ask_child_constraint`` -- read-only wiki access for the ask pipeline
 
-``prepared.spawn`` composes parent -> child by default, so the context-intelligence
-hook is inherited by every per-node sub-session automatically.
+Every ``run_pipeline`` call also gets the context-intelligence hook overlay
+(``_ci_overlay()``) via the ``extra_overlays`` seam, and
+``spawn_timeout=SPAWN_TIMEOUT_SECONDS`` so a stalled child agent still fails
+loud instead of hanging (see the comment on ``SPAWN_TIMEOUT_SECONDS`` below).
 
-The OUTER corpus sweep is a plain Python loop in the CLI (see wiki_weaver/cli.py).
+The OUTER corpus sweep is a plain Python loop in the CLI (see wiki_weaver/lib.py).
 """
 
 from __future__ import annotations
@@ -25,12 +28,14 @@ import asyncio
 import os
 import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from amplifier_module_pipeline_runner import run_pipeline
 
 from ._assets import pipeline_dir
 from .lib import wiki_ledger, wiki_policy_dir, wiki_registry, wiki_runs, wiki_sources
@@ -84,13 +89,22 @@ CONVERGENCE_RUBRIC_PATH = PIPELINE_DIR / "CONVERGENCE_RUBRIC.md"
 # the user registry. Falls back to the canonical git URL.
 # Set WIKI_WEAVER_ATTRACTOR_PIPELINE to point at a local checkout of the
 # attractor-pipeline bundle (e.g. the bundles/attractor-pipeline.yaml inside a
-# local clone of amplifier-bundle-attractor). When the env var is absent the
-# loader falls through to ATTRACTOR_PIPELINE_GIT below.
+# local clone of amplifier-bundle-attractor). When the env var is absent,
+# run_pipeline's own local-sibling-then-git-URL fallback applies (see the
+# bridge below).
 ATTRACTOR_PIPELINE_LOCAL = os.environ.get("WIKI_WEAVER_ATTRACTOR_PIPELINE")
-ATTRACTOR_PIPELINE_GIT = (
-    "git+https://github.com/microsoft/amplifier-bundle-attractor@main"
-    "#subdirectory=bundles/attractor-pipeline.yaml"
-)
+
+# Bridge to pipeline-runner's OWN local-bundle override env var. run_pipeline
+# (amplifier_module_pipeline_runner.runner) resolves its base bundle via a
+# local sibling path or the ``ATTRACTOR_PIPELINE_BUNDLE`` env var -- a
+# DIFFERENT name than wiki-weaver's own ``WIKI_WEAVER_ATTRACTOR_PIPELINE``.
+# Forward it here (setdefault -- never override an explicit
+# ATTRACTOR_PIPELINE_BUNDLE the caller already set) so existing wiki-weaver
+# dev workflows that point WIKI_WEAVER_ATTRACTOR_PIPELINE at a local checkout
+# keep working unchanged. doctor() still reports on ATTRACTOR_PIPELINE_LOCAL
+# directly (see lib.py).
+if ATTRACTOR_PIPELINE_LOCAL:
+    os.environ.setdefault("ATTRACTOR_PIPELINE_BUNDLE", ATTRACTOR_PIPELINE_LOCAL)
 
 # Context-intelligence hook module source (already installed in the amplifier
 # venv; prepare() resolves it from cache).
@@ -363,90 +377,28 @@ def build_dot(
 
 
 # --------------------------------------------------------------------------
-# spawn capability (canonical impl, resolves from prepared.bundle.agents)
+# spawn capability
 # --------------------------------------------------------------------------
-
-
-async def _resolve_agent_bundle(
-    agent_name: str,
-    config: dict[str, Any],
-    base_path: Path | None = None,
-) -> Any:
-    """Resolve a per-node agent into a full, self-contained child Bundle.
-
-    The recursion-avoidance mechanism: every child agent must carry an inline
-    ``session.orchestrator`` set to a NON-pipeline orchestrator (``loop-agent``).
-    Without it the spawned child inherits the parent's ``loop-pipeline``
-    orchestrator and re-runs the whole DOT (infinite recursion; loop-pipeline's
-    spawn guard now fails loud on this). On spawn the child's inline orchestrator
-    deep-merges over the parent's session and the child wins, so it runs a normal
-    single-agent loop; the parent's context-intelligence hook is still inherited
-    through the same merge.
-
-    Only ONE ``config`` shape is accepted:
-
-    * Inline definition -- a full agent dict carrying its own ``session``
-      (with the inline ``loop-agent`` orchestrator), ``providers``, ``tools``,
-      ``hooks``, ``instruction``. This is what attractor-pipeline's ``agents:``
-      block declares today, and it is materialised directly into a ``Bundle``
-      below.
-
-    A legacy ``{"bundle": "attractor:agents/<name>"}`` reference shape (resolved
-    via ``load_bundle``) was removed here (see CHANGELOG). It was superseded by
-    the inline ``session.orchestrator`` declarations added in attractor commit
-    ``fd777ed`` (#74, which also added the identity-based recursion guard), and
-    a repo-wide consumer search across wiki-weaver, amplifier-bundle-attractor,
-    and the local ecosystem (amplifier, amplifier-core, amplifier-foundation,
-    medium-tools, amplifier-bundle-llm-wiki) found no remaining users of the
-    per-agent bundle-ref shape. Configs still using it now fail loud below with
-    a migration message instead of being silently resolved.
-    """
-    if isinstance(config, dict) and config.get("bundle") is not None:
-        legacy_ref = config["bundle"]
-        raise ValueError(
-            f"Agent '{agent_name}' uses the unsupported legacy "
-            f'{{"bundle": {legacy_ref!r}}} config shape. This per-agent '
-            "bundle-reference form is no longer supported (removed -- no "
-            "remaining consumers found in a repo-wide search). It was "
-            "superseded by inline agent config since attractor commit "
-            "fd777ed (#74). To fix: declare this agent inline instead -- "
-            "give it its own 'session.orchestrator' set to a NON-pipeline "
-            "orchestrator (module: loop-agent), plus 'providers' / 'tools' / "
-            "'hooks' / 'instruction' / 'context' as needed. See the 'Inline "
-            "definition' section of _resolve_agent_bundle's docstring "
-            "(wiki_weaver/engine_runner.py) for the exact expected structure, "
-            "or bundles/attractor-pipeline.yaml's 'agents:' block in "
-            "amplifier-bundle-attractor for a working example."
-        )
-
-    # Inline config form (already a full agent definition).
-    #
-    # The ``context`` block (e.g. ``{include: ["../context/system-anthropic.md"]}``)
-    # must be processed into ``dict[str, Path]`` before passing to Bundle — raw YAML
-    # is not the right type for ``Bundle.context``.  foundation's ``_parse_context``
-    # handles the include-list->resolved-path conversion given a ``base_path``.
-    #
-    # Without this, ``Bundle.context`` defaults to ``{}`` and the system-prompt
-    # factory guard (``if effective_bundle.instruction or effective_bundle.context:``)
-    # never fires, leaving all spawned node agents on a stub Layer-1 prompt.
-    from amplifier_foundation import Bundle
-    from amplifier_foundation.bundle._dataclass import _parse_context
-
-    context_config = config.get("context") or {}
-    resolved_context, pending_context = _parse_context(context_config, base_path)
-
-    return Bundle(
-        name=agent_name,
-        version="1.0.0",
-        session=config.get("session", {}),
-        providers=config.get("providers", []),
-        tools=config.get("tools", []),
-        hooks=config.get("hooks", []),
-        instruction=config.get("instruction")
-        or config.get("system", {}).get("instruction"),
-        context=resolved_context,
-        _pending_context=pending_context,
-    )
+#
+# Agent resolution (per-node config -> a self-contained child Bundle),
+# recursion-avoidance, and Layer-1 (system prompt) delivery are now owned
+# entirely by amplifier_module_pipeline_runner.run_pipeline's own
+# make_spawn_fn / _resolve_agent_bundle (see that module's docstrings).
+#
+# LAYER-1 DECISION (do not re-introduce context.include processing here):
+# wiki-weaver has no tuned Layer-1 of its own -- its authoring instructions
+# live in each .dot node's ``prompt=`` text (additive), and its agents are
+# the bare attractor-pipeline agents (no per-agent context/system_prompt
+# override). run_pipeline's agent resolution deliberately does NOT process
+# an agent's ``context.include`` block as Layer-1 -- it relies on
+# loop-agent's provider-default selection (``context/system-<provider>.md``),
+# which is fail-loud on an empty Layer-1. A successful spawn is therefore
+# proof the real provider system prompt was read.
+#
+# What THIS module still owns: the two wiki-weaver-specific constraints
+# applied to a spawned child via run_pipeline's ``child_constraint`` seam
+# (filesystem isolation for ingest agents; read-only scoping for the ask
+# agent) -- see _fs_child_constraint / _ask_child_constraint below.
 
 
 # --------------------------------------------------------------------------
@@ -495,120 +447,21 @@ def _constrain_agent_fs(child_bundle: Any, wiki_dir: Path) -> None:
         cfg["denied_write_paths"] = merged
 
 
-async def _spawn_with_timeout(
-    prepared: Any,
-    *,
-    agent_name: str,
-    instruction: str,
-    child_bundle: Any,
-    session_id: str | None,
-    parent_session: Any,
-    orchestrator_config: dict[str, Any] | None,
-    parent_messages: list[dict[str, Any]] | None,
-    provider_preferences: list | None,
-    self_delegation_depth: int,
-) -> dict[str, Any]:
-    """Call ``prepared.spawn(...)`` bounded by ``SPAWN_TIMEOUT_SECONDS``.
+def _fs_child_constraint(wiki_dir: Path) -> Callable[[Any], Any]:
+    """Build a ``run_pipeline(child_constraint=...)`` callable for Fix 1.
 
-    ``prepared.spawn`` has no timeout of its own, and neither does anything
-    beneath it (see the comment on ``SPAWN_TIMEOUT_SECONDS`` above): a single
-    child-agent execution can legitimately run for minutes (multiple LLM
-    calls interleaved with many tool-call rounds) with zero errors, so a
-    stalled call is otherwise indistinguishable from a slow-but-working one.
-    ``asyncio.wait_for`` makes that structurally impossible to hang forever --
-    on expiry the child task is cancelled and a clear, actionable
-    ``TimeoutError`` is raised (fail loud; never silently swallowed). The
-    loop-pipeline backend that calls this capability already wraps it in a
-    ``try/except Exception`` that converts any raise into a FAIL Outcome, so
-    this routes through the pipeline's existing goal-gate/retry_target
-    machinery exactly like any other node failure -- no new failure path.
+    Wraps ``_constrain_agent_fs`` (which mutates the child bundle in place
+    and returns ``None``) into the ``Callable[[Bundle], Bundle]`` shape
+    ``run_pipeline``'s ``child_constraint`` seam expects. Applied to every
+    spawned child of an ingest/init pipeline so it physically cannot write
+    the ledger or _sources/ (DENY beats ALLOW in the filesystem tool).
     """
-    try:
-        return await asyncio.wait_for(
-            prepared.spawn(
-                child_bundle=child_bundle,
-                instruction=instruction,
-                session_id=session_id,
-                parent_session=parent_session,
-                orchestrator_config=orchestrator_config,
-                parent_messages=parent_messages,
-                provider_preferences=provider_preferences,
-                self_delegation_depth=self_delegation_depth,
-            ),
-            timeout=SPAWN_TIMEOUT_SECONDS,
-        )
-    except TimeoutError as exc:
-        raise TimeoutError(
-            f"Child agent '{agent_name}' did not complete within "
-            f"{SPAWN_TIMEOUT_SECONDS:.0f}s (WIKI_WEAVER_SPAWN_TIMEOUT). "
-            f"instruction preview: {instruction[:200]!r}. "
-            "This bounds what would otherwise be an unbounded wait on the "
-            "LLM provider / tool-call loop; increase WIKI_WEAVER_SPAWN_TIMEOUT "
-            "if this node is legitimately slower than normal, or investigate "
-            "provider connectivity if it recurs."
-        ) from exc
 
+    def _constrain(child_bundle: Any) -> Any:
+        _constrain_agent_fs(child_bundle, wiki_dir)
+        return child_bundle
 
-def make_spawn_fn(prepared: Any, wiki_dir: Path | None = None):
-    """Build the ``session.spawn`` capability for a prepared bundle.
-
-    Each pipeline node spawns a full child sub-session built from one of the
-    bundle's per-provider agents (resolved to its own ``loop-agent``
-    orchestrator + tools). ``prepared.spawn`` composes parent -> child by
-    default, so the context-intelligence hook is inherited by every child.
-
-    When ``wiki_dir`` is provided, every spawned child agent's filesystem tool
-    is constrained so it cannot write the ledger or _sources/ (Fix 1).
-    """
-    # Cache resolved agent bundles across spawns within one process.
-    _agent_cache: dict[str, Any] = {}
-
-    async def spawn_capability(
-        agent_name: str,
-        instruction: str,
-        parent_session: Any,
-        agent_configs: dict[str, dict[str, Any]],
-        sub_session_id: str | None = None,
-        orchestrator_config: dict[str, Any] | None = None,
-        parent_messages: list[dict[str, Any]] | None = None,
-        provider_preferences: list | None = None,
-        self_delegation_depth: int = 0,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        if agent_name in agent_configs:
-            config = agent_configs[agent_name]
-        elif agent_name in prepared.bundle.agents:
-            config = prepared.bundle.agents[agent_name]
-        else:
-            available = list(agent_configs.keys()) + list(prepared.bundle.agents.keys())
-            raise ValueError(f"Agent '{agent_name}' not found. Available: {available}")
-
-        if agent_name not in _agent_cache:
-            _agent_cache[agent_name] = await _resolve_agent_bundle(
-                agent_name, config, base_path=prepared.bundle.base_path
-            )
-        child_bundle = _agent_cache[agent_name]
-
-        # Fix 1: physically deny the spawned node write access to the ledger and
-        # _sources/. DENY beats ALLOW in the filesystem tool, so write_file /
-        # edit_file targeting those paths are rejected at the tool boundary.
-        if wiki_dir is not None:
-            _constrain_agent_fs(child_bundle, wiki_dir)
-
-        return await _spawn_with_timeout(
-            prepared,
-            agent_name=agent_name,
-            instruction=instruction,
-            child_bundle=child_bundle,
-            session_id=sub_session_id,
-            parent_session=parent_session,
-            orchestrator_config=orchestrator_config,
-            parent_messages=parent_messages,
-            provider_preferences=provider_preferences,
-            self_delegation_depth=self_delegation_depth,
-        )
-
-    return spawn_capability
+    return _constrain
 
 
 # --------------------------------------------------------------------------
@@ -703,59 +556,22 @@ def _constrain_ask_agent(child_bundle: Any, wiki_dir: Path, answer_file: Path) -
         cfg["allowed_read_paths"] = [wiki_dir_s]
 
 
-def make_ask_spawn_fn(prepared: Any, wiki_dir: Path, answer_file: Path):
-    """Like make_spawn_fn but constrains each child to read-only wiki access.
+def _ask_child_constraint(wiki_dir: Path, answer_file: Path) -> Callable[[Any], Any]:
+    """Build a ``run_pipeline(child_constraint=...)`` callable for the ask pipeline.
 
-    Registered as ``session.spawn`` for the ask pipeline so every sub-session
-    (the single "answer" node) structurally cannot modify wiki content, shell,
-    or fetch from the web. It can read within ``wiki_dir`` and write the answer
-    to ``answer_file`` (a temp path outside wiki_dir).
+    Wraps ``_constrain_ask_agent`` (mutates in place, returns ``None``) into
+    the ``Callable[[Bundle], Bundle]`` shape ``run_pipeline``'s
+    ``child_constraint`` seam expects. Applied to the single spawned "answer"
+    child so it structurally cannot modify wiki content, shell, or fetch from
+    the web -- it can read within ``wiki_dir`` and write the answer to
+    ``answer_file`` (a temp path outside wiki_dir).
     """
-    _agent_cache: dict[str, Any] = {}
 
-    async def spawn_capability(
-        agent_name: str,
-        instruction: str,
-        parent_session: Any,
-        agent_configs: dict[str, dict[str, Any]],
-        sub_session_id: str | None = None,
-        orchestrator_config: dict[str, Any] | None = None,
-        parent_messages: list[dict[str, Any]] | None = None,
-        provider_preferences: list | None = None,
-        self_delegation_depth: int = 0,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        if agent_name in agent_configs:
-            config = agent_configs[agent_name]
-        elif agent_name in prepared.bundle.agents:
-            config = prepared.bundle.agents[agent_name]
-        else:
-            available = list(agent_configs.keys()) + list(prepared.bundle.agents.keys())
-            raise ValueError(f"Agent '{agent_name}' not found. Available: {available}")
-
-        if agent_name not in _agent_cache:
-            _agent_cache[agent_name] = await _resolve_agent_bundle(
-                agent_name, config, base_path=prepared.bundle.base_path
-            )
-        child_bundle = _agent_cache[agent_name]
-
-        # THE MECHANISM: constrain this child to read-only wiki access.
+    def _constrain(child_bundle: Any) -> Any:
         _constrain_ask_agent(child_bundle, wiki_dir, answer_file)
+        return child_bundle
 
-        return await _spawn_with_timeout(
-            prepared,
-            agent_name=agent_name,
-            instruction=instruction,
-            child_bundle=child_bundle,
-            session_id=sub_session_id,
-            parent_session=parent_session,
-            orchestrator_config=orchestrator_config,
-            parent_messages=parent_messages,
-            provider_preferences=provider_preferences,
-            self_delegation_depth=self_delegation_depth,
-        )
-
-    return spawn_capability
+    return _constrain
 
 
 def _parse_ask_output(text: str) -> tuple[str, list[str], bool]:
@@ -856,7 +672,7 @@ def build_ask_dot(
 
     The agent writes its full answer to ``answer_file`` to bypass the
     loop-pipeline's notes-field truncation. The spawned agent's tools are
-    constrained by make_ask_spawn_fn (wiki writes denied, bash/web removed).
+    constrained by _ask_child_constraint (wiki writes denied, bash/web removed).
     """
     wiki_abs = str(wiki_dir.resolve())
     sources_json = str(wiki_registry(wiki_dir))
@@ -967,36 +783,6 @@ def build_ask_dot_from_file(
     return dot
 
 
-async def _run_ask_pipeline(
-    dot_source: str,
-    logs_dir: Path,
-    wiki_dir: Path,
-    answer_file: Path,
-) -> tuple[str, dict[str, Any]]:
-    """Run the ask pipeline with the read-only spawn capability wired in."""
-    import json
-
-    prepared = await _build_prepared(dot_source, logs_dir)
-    session = await prepared.create_session(session_cwd=wiki_dir)
-    # THE MECHANISM: register the ask-specific spawn so every child is
-    # constrained (wiki writes denied, bash/web removed).
-    session.coordinator.register_capability(
-        "session.spawn", make_ask_spawn_fn(prepared, wiki_dir, answer_file)
-    )
-
-    async with session:
-        raw = await session.execute("Run the pipeline")
-
-    text = str(raw)
-    try:
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            data = {"notes": text}
-    except (json.JSONDecodeError, TypeError):
-        data = {"notes": text}
-    return text, data
-
-
 def run_ask(
     wiki_dir: str | Path,
     question: str,
@@ -1045,9 +831,21 @@ def run_ask(
     )
     (logs_dir / "ask.dot").write_text(dot_source, encoding="utf-8")
 
-    raw_text, _data = _run_coro(
-        _run_ask_pipeline(dot_source, logs_dir, wiki_dir, answer_file)
+    result = _run_coro(
+        run_pipeline(
+            dot_source,
+            cwd=wiki_dir,
+            logs_root=logs_dir,
+            provider=_ask_policy.provider,
+            profiles=None,
+            extra_overlays=[_ci_overlay()],
+            # THE MECHANISM: constrain the spawned "answer" child to
+            # read-only wiki access (wiki writes denied, bash/web removed).
+            child_constraint=_ask_child_constraint(wiki_dir, answer_file),
+            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+        )
     )
+    raw_text = result.raw
 
     # Primary: read from answer_file (full response; bypasses notes truncation).
     if answer_file.exists():
@@ -1079,19 +877,40 @@ def run_ask(
 
 
 # --------------------------------------------------------------------------
-# PreparedBundle build + run
+# Context-intelligence hook overlay
 # --------------------------------------------------------------------------
 
-# In-process cache: load the base bundle once; install deps once, then reuse the
-# offline path for subsequent sources in the same sweep.
-#
-# The cached bundle carries the LLM provider's httpx AsyncClient (+ connection
-# pool), which binds to whichever event loop first used it. We therefore also
-# remember WHICH loop the cache was built on: reuse is valid only while that loop
-# is still the live one. See _load_base() and shared_engine_loop() below.
-_BASE_BUNDLE: Any = None
-_BASE_BUNDLE_LOOP: asyncio.AbstractEventLoop | None = None
-_DEPS_INSTALLED = False
+
+def _ci_overlay() -> Any:
+    """Build the context-intelligence hook overlay Bundle.
+
+    Passed to every ``run_pipeline`` call via ``extra_overlays`` so it is
+    composed onto the session (and inherited by every spawned child) exactly
+    as ``_build_prepared`` used to compose it directly. The hook's
+    ``LoggingHandler`` is always-on (writes per-session events.jsonl locally
+    regardless of config), so this overlay is unconditional -- an empty
+    ``load_ci_config()`` result ({} -- no remote destinations) still yields a
+    valid overlay that enables local-only logging, matching prior behavior.
+    """
+    from amplifier_foundation import Bundle
+
+    ci_cfg = load_ci_config()
+    return Bundle(
+        name="wiki-weaver-ci",
+        version="1.0.0",
+        hooks=[
+            {
+                "module": "hook-context-intelligence",
+                "source": CI_HOOK_SOURCE,
+                "config": ci_cfg,
+            }
+        ],
+    )
+
+
+# --------------------------------------------------------------------------
+# Single shared event loop for one ingest drive
+# --------------------------------------------------------------------------
 
 # Single shared event loop for one ingest DRIVE (Option A). While a runner is
 # installed here, every engine pipeline run (run_inner per source, the overview
@@ -1141,154 +960,18 @@ def shared_engine_loop() -> Iterator[asyncio.Runner]:
         runner.close()
 
 
-async def _load_base() -> Any:
-    global _BASE_BUNDLE, _BASE_BUNDLE_LOOP
-    running = asyncio.get_running_loop()
-    # Reuse the cached bundle ONLY while its provider client is still bound to
-    # the live loop. If the loop that built it is gone (a *new* ingest drive in
-    # the same process -- e.g. the agent-tool path invoking ingest twice), the
-    # cached client would reference a closed loop: reload under the current loop
-    # instead. This closes the cross-invocation sibling of the _BASE_BUNDLE bug
-    # while preserving load-once WITHIN a single drive (same loop -> cache hit).
-    if _BASE_BUNDLE is not None and _BASE_BUNDLE_LOOP is running:
-        return _BASE_BUNDLE
-    from amplifier_foundation import load_bundle
-
-    last_err: Exception | None = None
-    candidates = [s for s in (ATTRACTOR_PIPELINE_LOCAL, ATTRACTOR_PIPELINE_GIT) if s]
-    for src in candidates:
-        try:
-            _BASE_BUNDLE = await load_bundle(src)
-            _BASE_BUNDLE_LOOP = running
-            return _BASE_BUNDLE
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-    raise RuntimeError(f"Could not load attractor-pipeline bundle: {last_err}")
-
-
-async def _build_prepared(dot_source: str, logs_dir: Path) -> Any:
-    """Compose base + DOT overlay + CI hook overlay and prepare."""
-    global _DEPS_INSTALLED
-    from amplifier_foundation import Bundle
-
-    base = await _load_base()
-
-    dot_ovl = Bundle(
-        name="wiki-weaver-runtime",
-        version="1.0.0",
-        session={
-            "orchestrator": {
-                "module": "loop-pipeline",
-                "config": {
-                    "dot_source": dot_source,
-                    "logs_root": str(logs_dir),
-                },
-            },
-        },
-    )
-
-    ci_cfg = load_ci_config()
-    ci_ovl = Bundle(
-        name="wiki-weaver-ci",
-        version="1.0.0",
-        hooks=[
-            {
-                "module": "hook-context-intelligence",
-                "source": CI_HOOK_SOURCE,
-                "config": ci_cfg,
-            }
-        ],
-    )
-
-    composed = base.compose(dot_ovl).compose(ci_ovl)
-
-    # First prepare in this process resolves/installs modules; subsequent ones
-    # take the offline path. Override with WIKI_WEAVER_INSTALL_DEPS=0/1.
-    env = os.environ.get("WIKI_WEAVER_INSTALL_DEPS")
-    if env is not None:
-        install_deps = env not in ("0", "false", "False", "")
-    else:
-        install_deps = not _DEPS_INSTALLED
-
-    prepared = await composed.prepare(install_deps=install_deps)
-    _DEPS_INSTALLED = True
-    return prepared
-
-
-async def _drain_session_tasks(tasks_before: set[asyncio.Task[Any]]) -> None:
-    """Cancel + await tasks a single pipeline run spawned but left pending.
-
-    Under the single-loop ingest drive the per-run ``loop.close()`` that used to
-    reap dangling child-agent spawn tasks is gone, so debris from source N must
-    be drained before source N+1 begins. We touch ONLY tasks created after
-    ``tasks_before`` was captured (this run's own tasks), leaving the shared
-    provider client + bundle infrastructure untouched. Called on every exit
-    path (see ``_run_pipeline``'s ``finally``).
-    """
-    current = asyncio.current_task()
-    leaked = [
-        t
-        for t in asyncio.all_tasks()
-        if t is not current and t not in tasks_before and not t.done()
-    ]
-    if not leaked:
-        return
-    for t in leaked:
-        t.cancel()
-    # Await cancellation so no half-cancelled task survives into the next source.
-    await asyncio.gather(*leaked, return_exceptions=True)
-
-
-async def _run_pipeline(
-    dot_source: str,
-    logs_dir: Path,
-    cwd: Path,
-    execute_prompt: str = "Run the wiki-weaver inner pipeline",
-    wiki_dir: Path | None = None,
-) -> tuple[str, dict[str, Any]]:
-    """Core proper-path runner shared by the inner pipeline and the thin slice.
-
-    Returns ``(raw_text, parsed_json_or_fallback)``.
-
-    ``wiki_dir`` (when set) is forwarded to the spawn capability so each
-    per-node child agent's filesystem tool is denied write access to the
-    ledger and _sources/ (Fix 1).
-    """
-    import json
-
-    prepared = await _build_prepared(dot_source, logs_dir)
-    session = await prepared.create_session(session_cwd=cwd)
-    session.coordinator.register_capability(
-        "session.spawn", make_spawn_fn(prepared, wiki_dir=wiki_dir)
-    )
-
-    # Per-source cleanup (single-loop drain): capture the task set AFTER session
-    # setup so the sweep targets only THIS run's execution/spawn debris -- not
-    # the shared provider client's or bundle's tasks. Previously each source's
-    # loop.close() reaped dangling child-agent tasks for free; under one shared
-    # loop that boundary is gone, so we cancel + await them explicitly on ALL
-    # exit paths (success, refine/retry, validator-fail/fail-route, exception)
-    # so debris from source N cannot leak into source N+1.
-    tasks_before = set(asyncio.all_tasks())
-    try:
-        async with session:
-            raw = await session.execute(execute_prompt)
-    finally:
-        await _drain_session_tasks(tasks_before)
-
-    text = str(raw)
-    try:
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            data = {"status": "unknown", "notes": text}
-    except (json.JSONDecodeError, TypeError):
-        data = {"status": "unknown", "notes": text}
-    return text, data
-
-
 # --------------------------------------------------------------------------
 # Public entrypoints
 # --------------------------------------------------------------------------
+#
+# Each entrypoint below builds its .dot pipeline (product logic, unchanged)
+# and calls run_pipeline (amplifier_module_pipeline_runner) to drive it. Every
+# call uniformly gets: extra_overlays=[_ci_overlay()] (parity with the old
+# _build_prepared, which always composed the CI hook), profiles=None (the
+# runner's DEFAULT_PROFILES already maps anthropic/openai/gemini -> the
+# matching attractor-agent-* child, same routing wiki-weaver relied on), and
+# spawn_timeout=SPAWN_TIMEOUT_SECONDS (parity with the old _spawn_with_timeout,
+# now enforced inside the runner's own make_spawn_fn).
 
 
 def run_inner(
@@ -1323,16 +1006,25 @@ def run_inner(
     dot_source = build_dot(source_path, wiki_dir, policy, source_id=source_id)
     (logs_dir / "inner.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, data = _run_coro(
-        _run_pipeline(dot_source, logs_dir, wiki_dir, wiki_dir=wiki_dir)
+    result = _run_coro(
+        run_pipeline(
+            dot_source,
+            cwd=wiki_dir,
+            logs_root=logs_dir,
+            provider=policy.provider,
+            profiles=None,
+            extra_overlays=[_ci_overlay()],
+            child_constraint=_fs_child_constraint(wiki_dir),
+            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+        )
     )
-    status = data.get("status", "unknown")
+    status = result.status or "unknown"
     return InnerResult(
         status=status,
         converged=status == "success",
         logs_dir=logs_dir,
-        notes=str(data.get("notes", ""))[:2000],
-        failure_reason=data.get("failure_reason"),
+        notes=result.notes[:2000],
+        failure_reason=result.failure_reason,
     )
 
 
@@ -1416,16 +1108,25 @@ def run_ingest(
 
     (logs_dir / "ingest.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, data = _run_coro(
-        _run_pipeline(dot_source, logs_dir, wiki_dir, wiki_dir=wiki_dir)
+    result = _run_coro(
+        run_pipeline(
+            dot_source,
+            cwd=wiki_dir,
+            logs_root=logs_dir,
+            provider=policy.provider,
+            profiles=None,
+            extra_overlays=[_ci_overlay()],
+            child_constraint=_fs_child_constraint(wiki_dir),
+            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+        )
     )
-    status = data.get("status", "unknown")
+    status = result.status or "unknown"
     return InnerResult(
         status=status,
         converged=status == "success",
         logs_dir=logs_dir,
-        notes=str(data.get("notes", ""))[:2000],
-        failure_reason=data.get("failure_reason"),
+        notes=result.notes[:2000],
+        failure_reason=result.failure_reason,
     )
 
 
@@ -1465,15 +1166,23 @@ def run_thin_slice(
     dot_source = THIN_SLICE_DOT.format(provider=PROVIDER, out_path=str(out_path))
     (logs_dir / "thin.dot").write_text(dot_source, encoding="utf-8")
 
-    text, _data = _run_coro(
-        _run_pipeline(dot_source, logs_dir, cwd, execute_prompt="Run the pipeline")
+    result = _run_coro(
+        run_pipeline(
+            dot_source,
+            cwd=cwd,
+            logs_root=logs_dir,
+            provider=PROVIDER,
+            profiles=None,
+            extra_overlays=[_ci_overlay()],
+            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+        )
     )
     return {
         "out_path": str(out_path),
         "exists": out_path.is_file(),
         "content": out_path.read_text(encoding="utf-8") if out_path.is_file() else None,
         "logs_dir": str(logs_dir),
-        "raw": text[:2000],
+        "raw": result.raw[:2000],
     }
 
 
@@ -1585,8 +1294,16 @@ def run_lint(wiki_dir: str | Path) -> int:
     dot_source = build_lint_dot_from_file(wiki_dir, lint_result_file)
     (logs_dir / "lint.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, _data = _run_coro(
-        _run_pipeline(dot_source, logs_dir, wiki_dir, execute_prompt="Run the pipeline")
+    _run_coro(
+        run_pipeline(
+            dot_source,
+            cwd=wiki_dir,
+            logs_root=logs_dir,
+            provider=PROVIDER,
+            profiles=None,
+            extra_overlays=[_ci_overlay()],
+            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
+        )
     )
 
     # Primary: read from the result file (written by validate_wiki.py --out).
@@ -1855,13 +1572,16 @@ def run_init(
     )
     (logs_dir / "init.dot").write_text(dot_source, encoding="utf-8")
 
-    _text, _data = _run_coro(
-        _run_pipeline(
+    _run_coro(
+        run_pipeline(
             dot_source,
-            logs_dir,
-            wiki_dir,
-            execute_prompt="Run the pipeline",
-            wiki_dir=wiki_dir,
+            cwd=wiki_dir,
+            logs_root=logs_dir,
+            provider=_init_policy.provider,
+            profiles=None,
+            extra_overlays=[_ci_overlay()],
+            child_constraint=_fs_child_constraint(wiki_dir),
+            spawn_timeout=SPAWN_TIMEOUT_SECONDS,
         )
     )
 

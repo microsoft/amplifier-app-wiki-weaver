@@ -10,4 +10,4 @@ build hook (see hatch_build.py at the repo root) -- it is the commit date
 date. Do not hand-edit; it is overwritten on the next build.
 """
 
-__version__ = "2026.07.08-7c54cf4"
+__version__ = "2026.07.08-18df48b"
