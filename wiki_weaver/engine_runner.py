@@ -113,6 +113,11 @@ CI_HOOK_SOURCE = (
     "#subdirectory=modules/hook-context-intelligence"
 )
 
+# Wiki-weaver-owned run-events sink hook module source: a local module living
+# in THIS repo (mirrors modules/tool-wiki-weaver's own local-path pattern).
+# See _ci_overlay() and modules/hook-run-events for what it does and why.
+RUN_EVENTS_HOOK_SOURCE = WIKI_WEAVER_ROOT / "modules" / "hook-run-events"
+
 SETTINGS_PATH = Path(
     os.environ.get(
         "AMPLIFIER_SETTINGS", str(Path.home() / ".amplifier" / "settings.yaml")
@@ -838,7 +843,7 @@ def run_ask(
             logs_root=logs_dir,
             provider=_ask_policy.provider,
             profiles=None,
-            extra_overlays=[_ci_overlay()],
+            extra_overlays=[_ci_overlay(logs_dir)],
             # THE MECHANISM: constrain the spawned "answer" child to
             # read-only wiki access (wiki writes denied, bash/web removed).
             child_constraint=_ask_child_constraint(wiki_dir, answer_file),
@@ -881,16 +886,37 @@ def run_ask(
 # --------------------------------------------------------------------------
 
 
-def _ci_overlay() -> Any:
-    """Build the context-intelligence hook overlay Bundle.
+def _ci_overlay(logs_dir: Path) -> Any:
+    """Build the observability hook overlay Bundle: CI hook + run-events sink.
 
     Passed to every ``run_pipeline`` call via ``extra_overlays`` so it is
     composed onto the session (and inherited by every spawned child) exactly
-    as ``_build_prepared`` used to compose it directly. The hook's
-    ``LoggingHandler`` is always-on (writes per-session events.jsonl locally
-    regardless of config), so this overlay is unconditional -- an empty
-    ``load_ci_config()`` result ({} -- no remote destinations) still yields a
-    valid overlay that enables local-only logging, matching prior behavior.
+    as ``_build_prepared`` used to compose it directly.
+
+    Two hooks are mounted here, side by side:
+
+    1. ``hook-context-intelligence`` -- UNCHANGED from before this function
+       gained a ``logs_dir`` parameter. Same module, same ``CI_HOOK_SOURCE``,
+       same ``load_ci_config()`` config (``base_path`` unset, defaulting to
+       ``~/.amplifier/projects``). Its own ``LoggingHandler`` is always-on
+       (writes per-session events.jsonl locally regardless of config), so
+       this half of the overlay stays unconditional -- an empty
+       ``load_ci_config()`` result ({} -- no remote destinations) still
+       yields a valid overlay that enables local-only logging, matching
+       prior behavior exactly. DO NOT alter this entry's config, source, or
+       module id -- CI's own disk-side ingestion tools (upload/reconstruct)
+       resolve their root from ``AMPLIFIER_CONTEXT_INTELLIGENCE_BASE_PATH``
+       (or the same default) independently of this writer's config, so
+       relocating the writer here would silently orphan its captures from
+       CI's own tooling.
+
+    2. ``hook-run-events`` -- NEW, wiki-weaver-owned, additive. Appends every
+       event (parent session + every spawned child, since this overlay is
+       inherited the same way the CI hook is) to a single run-scoped
+       ``<logs_dir>/events.jsonl`` file, giving downstream consumers (e.g.
+       Team Pulse) one predictable file to poll for real-time progress
+       instead of reverse-engineering internal checkpoint files. See
+       ``modules/hook-run-events`` for the implementation.
     """
     from amplifier_foundation import Bundle
 
@@ -903,7 +929,12 @@ def _ci_overlay() -> Any:
                 "module": "hook-context-intelligence",
                 "source": CI_HOOK_SOURCE,
                 "config": ci_cfg,
-            }
+            },
+            {
+                "module": "hook-run-events",
+                "source": str(RUN_EVENTS_HOOK_SOURCE),
+                "config": {"events_path": str(logs_dir / "events.jsonl")},
+            },
         ],
     )
 
@@ -1013,7 +1044,7 @@ def run_inner(
             logs_root=logs_dir,
             provider=policy.provider,
             profiles=None,
-            extra_overlays=[_ci_overlay()],
+            extra_overlays=[_ci_overlay(logs_dir)],
             child_constraint=_fs_child_constraint(wiki_dir),
             spawn_timeout=SPAWN_TIMEOUT_SECONDS,
         )
@@ -1158,7 +1189,7 @@ def run_ingest(
                 logs_root=logs_dir,
                 provider=policy.provider,
                 profiles=None,
-                extra_overlays=[_ci_overlay()],
+                extra_overlays=[_ci_overlay(logs_dir)],
                 child_constraint=_fs_child_constraint(wiki_dir),
                 spawn_timeout=SPAWN_TIMEOUT_SECONDS,
             )
@@ -1288,7 +1319,7 @@ def run_thin_slice(
             logs_root=logs_dir,
             provider=PROVIDER,
             profiles=None,
-            extra_overlays=[_ci_overlay()],
+            extra_overlays=[_ci_overlay(logs_dir)],
             spawn_timeout=SPAWN_TIMEOUT_SECONDS,
         )
     )
@@ -1416,7 +1447,7 @@ def run_lint(wiki_dir: str | Path) -> int:
             logs_root=logs_dir,
             provider=PROVIDER,
             profiles=None,
-            extra_overlays=[_ci_overlay()],
+            extra_overlays=[_ci_overlay(logs_dir)],
             spawn_timeout=SPAWN_TIMEOUT_SECONDS,
         )
     )
@@ -1694,7 +1725,7 @@ def run_init(
             logs_root=logs_dir,
             provider=_init_policy.provider,
             profiles=None,
-            extra_overlays=[_ci_overlay()],
+            extra_overlays=[_ci_overlay(logs_dir)],
             child_constraint=_fs_child_constraint(wiki_dir),
             spawn_timeout=SPAWN_TIMEOUT_SECONDS,
         )

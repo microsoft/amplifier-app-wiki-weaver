@@ -194,7 +194,7 @@ def reweave_overview(wiki_dir: str | Path) -> None:
             logs_root=logs_dir,
             provider=policy.provider,
             profiles=None,
-            extra_overlays=[_ci_overlay()],
+            extra_overlays=[_ci_overlay(logs_dir)],
             child_constraint=_fs_child_constraint(wiki_dir),
             spawn_timeout=SPAWN_TIMEOUT_SECONDS,
         )
