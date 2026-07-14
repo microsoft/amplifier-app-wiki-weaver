@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amplifier-module-hook-run-events"
+version = "0.1.0"
+description = "Amplifier hook module: appends every session event (including spawned children's) to a single run-scoped events.jsonl file."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# amplifier-core is a peer dependency provided by the host amplifier install --
+# do NOT declare it here (mirrors modules/tool-wiki-weaver/pyproject.toml).
+dependencies = []
+
+[project.entry-points."amplifier.modules"]
+hook-run-events = "amplifier_module_hook_run_events:mount"
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_module_hook_run_events"]
