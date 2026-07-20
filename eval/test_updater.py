@@ -24,9 +24,11 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from wiki_weaver.updater import (  # noqa: E402
+    ATTRACTOR_ROUTING_FLOOR_SHA,
     Layer1Result,
     SourceRecord,
     _installed_commit,
+    check_attractor_routing_floor,
     update_layer1,
 )
 
@@ -407,3 +409,114 @@ class TestLayer1ResultCommitMoved:
             remote={"pkg": sha},
         )
         assert res.before["pkg"] == res.after["pkg"]
+
+
+# ---------------------------------------------------------------------------
+# check_attractor_routing_floor: compatibility-floor diagnostic
+# ---------------------------------------------------------------------------
+
+
+class TestCheckAttractorRoutingFloor:
+    """check_attractor_routing_floor verifies the resolved attractor-bundle
+    commit against ATTRACTOR_ROUTING_FLOOR_SHA via GitHub's compare API
+    (mocked in every test \u2014 no real network calls). The local Layer-2 cache
+    is always a shallow clone, so this can never be answered via local git;
+    only ``local_layer2_commits()`` (mocked here) and the compare API matter.
+    """
+
+    def _mock_local_commits(self, monkeypatch, local_sha: Optional[str]):
+        rec = SourceRecord(
+            label="attractor-bundle",
+            uri="git+https://github.com/microsoft/amplifier-bundle-attractor@main",
+            local_sha=local_sha,
+        )
+        other = SourceRecord(
+            label="context-intelligence",
+            uri="git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main",
+            local_sha="c" * 40,
+        )
+        monkeypatch.setattr(
+            "wiki_weaver.updater.local_layer2_commits", lambda: [rec, other]
+        )
+
+    async def test_identical_to_floor_is_ok(self, monkeypatch):
+        """Local SHA == floor SHA short-circuits to ok=True without a network call."""
+        self._mock_local_commits(monkeypatch, ATTRACTOR_ROUTING_FLOOR_SHA)
+
+        def _should_not_be_called(floor_sha: str, resolved_sha: str) -> str:
+            raise AssertionError("compare API should not be called when SHAs match")
+
+        monkeypatch.setattr(
+            "wiki_weaver.updater._compare_commits_status", _should_not_be_called
+        )
+
+        result = await check_attractor_routing_floor()
+        assert result.ok is True
+        assert "floor commit" in result.message
+
+    async def test_ahead_of_floor_is_ok(self, monkeypatch):
+        """A mocked 'ahead' compare status means the routing contract is satisfied."""
+        local_sha = "1" * 40
+        self._mock_local_commits(monkeypatch, local_sha)
+        monkeypatch.setattr(
+            "wiki_weaver.updater._compare_commits_status",
+            lambda floor_sha, resolved_sha: "ahead",
+        )
+
+        result = await check_attractor_routing_floor()
+        assert result.ok is True
+        assert "ahead" in result.message
+
+    async def test_behind_floor_is_real_defect(self, monkeypatch):
+        """A mocked 'behind' compare status is the real defect condition \u2014 ok=False."""
+        local_sha = "2" * 40
+        self._mock_local_commits(monkeypatch, local_sha)
+        monkeypatch.setattr(
+            "wiki_weaver.updater._compare_commits_status",
+            lambda floor_sha, resolved_sha: "behind",
+        )
+
+        result = await check_attractor_routing_floor()
+        assert result.ok is False
+        assert "BEHIND" in result.message
+
+    async def test_diverged_is_inconclusive(self, monkeypatch):
+        """A 'diverged' compare status can't be interpreted as ancestry \u2014 ok=None."""
+        local_sha = "3" * 40
+        self._mock_local_commits(monkeypatch, local_sha)
+        monkeypatch.setattr(
+            "wiki_weaver.updater._compare_commits_status",
+            lambda floor_sha, resolved_sha: "diverged",
+        )
+
+        result = await check_attractor_routing_floor()
+        assert result.ok is None
+
+    async def test_network_error_is_inconclusive_not_an_exception(self, monkeypatch):
+        """Any network/HTTP/parsing failure degrades to ok=None \u2014 never raises."""
+        local_sha = "4" * 40
+        self._mock_local_commits(monkeypatch, local_sha)
+
+        def _raise(floor_sha: str, resolved_sha: str) -> str:
+            raise OSError("connection refused")
+
+        monkeypatch.setattr("wiki_weaver.updater._compare_commits_status", _raise)
+
+        result = await check_attractor_routing_floor()  # must not raise
+        assert result.ok is None
+        assert "could not verify" in result.message
+
+    async def test_not_yet_cloned_is_inconclusive(self, monkeypatch):
+        """No local SHA (attractor-bundle not yet cloned) \u2014 skip, ok=None, no crash."""
+        self._mock_local_commits(monkeypatch, None)
+
+        def _should_not_be_called(floor_sha: str, resolved_sha: str) -> str:
+            raise AssertionError("compare API should not be called with no local SHA")
+
+        monkeypatch.setattr(
+            "wiki_weaver.updater._compare_commits_status", _should_not_be_called
+        )
+
+        result = await check_attractor_routing_floor()
+        assert result.ok is None
+        assert "not yet cloned" in result.message

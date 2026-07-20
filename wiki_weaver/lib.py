@@ -1855,6 +1855,43 @@ def doctor(*, wiki: str | Path | None = None) -> int:
     except Exception as e:  # noqa: BLE001
         _warn(f"could not read resolved @main commits: {e}")
 
+    # Attractor engine routing-contract floor: pipeline/synthesize.dot's assess
+    # node routes convergence via the report_outcome tool, which requires the
+    # resolved attractor-bundle commit to be at or beyond
+    # ATTRACTOR_ROUTING_FLOOR_SHA (older commits let trailing model prose
+    # silently override an explicit report_outcome call). Read-only diagnostic;
+    # degrades to WARN (never blocks doctor) when inconclusive — e.g. offline,
+    # not yet cloned, or the GitHub compare API is unreachable.
+    try:
+        import asyncio
+
+        from wiki_weaver.updater import (
+            ATTRACTOR_ROUTING_FLOOR_SHA,
+            check_attractor_routing_floor,
+        )
+
+        floor_result = asyncio.run(check_attractor_routing_floor())
+        floor_short = ATTRACTOR_ROUTING_FLOOR_SHA[:8]
+        if floor_result.ok is True:
+            _ok(
+                f"attractor routing-contract floor: {floor_result.message}"
+                f" (>= {floor_short})"
+            )
+        elif floor_result.ok is False:
+            _fail(
+                f"attractor routing-contract floor: {floor_result.message}"
+                f" (>= {floor_short})"
+            )
+            _warn("  run `wiki-weaver update` to refresh the attractor engine bundle")
+            ok = False
+        else:
+            _warn(
+                f"attractor routing-contract floor: {floor_result.message}"
+                f" (>= {floor_short})"
+            )
+    except Exception as e:  # noqa: BLE001
+        _warn(f"could not check attractor routing-contract floor: {e}")
+
     print()
     if ok:
         _ok("doctor: all required checks passed")
