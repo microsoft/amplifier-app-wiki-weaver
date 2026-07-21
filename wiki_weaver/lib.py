@@ -727,6 +727,37 @@ def _print_summary(summary: list[tuple[str, str]]) -> None:
         print(f"  total={len(summary)}  converged={converged_n}  failed={failed_n}")
 
 
+def _finish_ingest_run(
+    run_dir: Path,
+    run_id: str,
+    summary: list[tuple[str, str]],
+    advisories: list[str],
+    blocked: list[dict],
+    errored: list[dict],
+) -> int:
+    """End-of-run contract for BOTH ingest paths (single-file + drain).
+
+    Builds the machine-readable run result from the per-source summary plus
+    the structured gate-block / engine-error records collected along the way,
+    writes ``<run_dir>/result.json`` (fail-soft), prints the honest headline,
+    and returns the documented exit code -- see ``wiki_weaver/run_result.py``
+    for the full contract (verdict rules, exit codes, the 0-converged
+    invariant).
+    """
+    from wiki_weaver.run_result import build_result, counts_from_statuses, finish_run
+
+    counts = counts_from_statuses(s for _, s in summary)
+    result = build_result(
+        run_id,
+        counts,
+        advisories=advisories,
+        blocked=blocked,
+        errored=errored,
+        sources=[{"name": n, "status": s} for n, s in summary],
+    )
+    return finish_run(run_dir, result)
+
+
 @dataclass
 class DrainReport:
     """Opt-in out-channel for the drain's ``--limit`` cap-hit signal.
@@ -786,6 +817,29 @@ def ingest(
         (see ``DrainReport`` above).  The loud cap-hit signal (a ``WARN`` log
         line) does not depend on this -- it fires regardless of whether a
         report was passed.
+
+    Returns -- THE EXIT-CODE CONTRACT (see wiki_weaver/run_result.py)
+    -----------------------------------------------------------------
+    Every run also writes ``<wiki>/.wiki/runs/ingest-<ts>/result.json``
+    (machine-readable verdict + counts + gate blocks + errors; fail-soft)
+    and prints an honest one-line headline. The returned int follows the
+    documented contract, propagated verbatim by ``wiki-weaver ingest`` and
+    ``schedule run-now``::
+
+        0  -- >=1 source converged AND no gate-blocked AND no errored
+              (verdicts: converged, partial; advisories allowed)
+        1  -- engine/infrastructure error (verdict: errored) -- also
+              returned for a missing wiki dir (pre-run validation)
+        3  -- nothing to do: empty inbox, or only already-ingested
+              duplicates (verdict: empty)
+        4  -- gate-blocked under WIKI_WEAVER_ENFORCE_GATES=1
+              (verdict: blocked)
+        5  -- attempted > 0 but 0 converged, no gate/infra cause
+              (verdict: failed)
+
+    THE INVARIANT: converged == 0 with attempted > 0 can NEVER return 0
+    (the incident this contract exists to prevent: a fully-blocked run
+    that looked healthy for a week).
     """
     wiki = Path(wiki).resolve()
     if not wiki.is_dir():
@@ -796,6 +850,13 @@ def ingest(
     sources_dir = wiki_sources(wiki)
     inbox.mkdir(exist_ok=True)
     sources_dir.mkdir(exist_ok=True)
+
+    # Run-result contract (see wiki_weaver/run_result.py): every ingest run --
+    # single-file, drain, even a nothing-to-do tick -- ends with one
+    # <run_dir>/result.json + an honest headline + a documented exit code.
+    # Microsecond suffix so back-to-back runs never share a dir.
+    run_id = f"ingest-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+    run_dir = wiki_runs(wiki) / run_id
 
     if source:
         # ------------------------------------------------------------------ #
@@ -819,6 +880,11 @@ def ingest(
         # WIKI_WEAVER_ENFORCE_GATES=1 restores the old hard-blocking behavior
         # for both gates -- see wiki_weaver.grading.gates_enforced().
         advisories: list[str] = []
+        # Structured run-result records (see wiki_weaver/run_result.py):
+        # enforce-mode gate blocks name the GATE (never a generic error line);
+        # errored carries engine/infra reasons.
+        blocked_records: list[dict] = []
+        errored_records: list[dict] = []
 
         for src in sources:
             name = src.name
@@ -828,7 +894,14 @@ def ingest(
                 _fail(f"{name}: unsupported binary source (no text handler)")
                 summary.append((name, "binary"))
                 _print_summary(summary)
-                return 1
+                return _finish_ingest_run(
+                    run_dir,
+                    run_id,
+                    summary,
+                    advisories,
+                    blocked_records,
+                    errored_records,
+                )
 
             # Fix 3: assign/look up a STABLE id by content hash BEFORE ingest
             # and dedupe an already-ingested source (same bytes) regardless of
@@ -875,9 +948,19 @@ def ingest(
                 except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
                     _fail(f"engine error on {name}: {type(e).__name__}: {e}")
                     summary.append((name, "error"))
+                    errored_records.append(
+                        {"reason": f"engine error on {name}: {type(e).__name__}: {e}"}
+                    )
                     if not keep_going:
                         _print_summary(summary)
-                        return 1
+                        return _finish_ingest_run(
+                            run_dir,
+                            run_id,
+                            summary,
+                            advisories,
+                            blocked_records,
+                            errored_records,
+                        )
                     continue
 
                 # Fix 1b: never trust agent-written process state. Undo + fail loud.
@@ -893,7 +976,14 @@ def ingest(
                     summary.append((name, "tampered"))
                     if not keep_going:
                         _print_summary(summary)
-                        return 1
+                        return _finish_ingest_run(
+                            run_dir,
+                            run_id,
+                            summary,
+                            advisories,
+                            blocked_records,
+                            errored_records,
+                        )
                     continue
 
                 if result.converged:
@@ -912,9 +1002,26 @@ def ingest(
                         if gates_enforced():
                             _fail(f"{name}: {retention_decision.message}")
                             summary.append((name, "retention-blocked"))
+                            # Structured record: the GATE is named (mislabel fix
+                            # -- never a generic error line).
+                            blocked_records.append(
+                                {
+                                    "gate": "claim-retention",
+                                    "scope": "source",
+                                    "reason": retention_decision.message,
+                                    "offending_items": [name],
+                                }
+                            )
                             if not keep_going:
                                 _print_summary(summary)
-                                return 1
+                                return _finish_ingest_run(
+                                    run_dir,
+                                    run_id,
+                                    summary,
+                                    advisories,
+                                    blocked_records,
+                                    errored_records,
+                                )
                             continue
                         advisory = (
                             "claim-retention gate (ADVISORY -- did NOT block) "
@@ -940,9 +1047,29 @@ def ingest(
                                 f"duplicate(s) detected: {', '.join(dup_pages)}"
                             )
                             summary.append((name, "duplicate-blocked"))
+                            # Structured record: the GATE is named (mislabel fix
+                            # -- never a generic error line).
+                            blocked_records.append(
+                                {
+                                    "gate": "duplicate-page",
+                                    "scope": "wiki",
+                                    "reason": (
+                                        "duplicate-page gate: merge-fragment "
+                                        f"duplicate(s) detected: {', '.join(dup_pages)}"
+                                    ),
+                                    "offending_items": list(dup_pages),
+                                }
+                            )
                             if not keep_going:
                                 _print_summary(summary)
-                                return 1
+                                return _finish_ingest_run(
+                                    run_dir,
+                                    run_id,
+                                    summary,
+                                    advisories,
+                                    blocked_records,
+                                    errored_records,
+                                )
                             continue
                         # Wiki-STRUCTURAL observation, not a verdict on this
                         # source: the pairs may pre-date this run entirely.
@@ -982,7 +1109,14 @@ def ingest(
                     summary.append((name, "not-converged"))
                     if not keep_going:
                         _print_summary(summary)
-                        return 1
+                        return _finish_ingest_run(
+                            run_dir,
+                            run_id,
+                            summary,
+                            advisories,
+                            blocked_records,
+                            errored_records,
+                        )
             finally:
                 # Belt-and-suspenders: enforce_retention_gate() already removes
                 # retention_snapshot_dir on every path it runs; this covers the
@@ -994,7 +1128,9 @@ def ingest(
         _print_advisories(advisories)
         if report is not None:
             report.advisories.extend(advisories)
-        return 0
+        return _finish_ingest_run(
+            run_dir, run_id, summary, advisories, blocked_records, errored_records
+        )
 
     # ---------------------------------------------------------------------- #
     # INBOX DRAIN PATH — re-globs _inbox on every pass so files added mid-run #
@@ -1019,7 +1155,9 @@ def ingest(
         p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
     ):
         _warn(f"no sources to ingest (inbox empty: {inbox})")
-        return 0
+        # Distinct nothing-to-do outcome (verdict "empty", exit 3): a headless
+        # caller must be able to tell "no work" from "work succeeded".
+        return _finish_ingest_run(run_dir, run_id, [], [], [], [])
 
     # Import the engine runner lazily so `doctor`/`init`/`lint` never pay the
     # cost of pulling in the attractor engine.
@@ -1034,6 +1172,11 @@ def ingest(
     # WIKI_WEAVER_ENFORCE_GATES=1 restores the old hard-blocking behavior
     # for both gates -- see wiki_weaver.grading.gates_enforced().
     advisories_drain: list[str] = []
+    # Structured run-result records (see wiki_weaver/run_result.py):
+    # enforce-mode gate blocks name the GATE (never a generic error line);
+    # errored carries engine/infra reasons.
+    blocked_drain: list[dict] = []
+    errored_drain: list[dict] = []
 
     failed_dir = wiki_failed(wiki)
     failed_dir.mkdir(parents=True, exist_ok=True)
@@ -1169,6 +1312,9 @@ def ingest(
                     if src.is_file() and src.parent == inbox:
                         _collision_safe_move(src, failed_dir)
                     summary_drain.append((name, "error"))
+                    errored_drain.append(
+                        {"reason": f"engine error on {name}: {type(e).__name__}: {e}"}
+                    )
                     continue  # drain always continues; exit code is set after drain
 
                 # Fix 1b: never trust agent-written process state. Undo + fail loud.
@@ -1205,6 +1351,16 @@ def ingest(
                             if src.is_file() and src.parent == inbox:
                                 _collision_safe_move(src, failed_dir)
                             summary_drain.append((name, "retention-blocked"))
+                            # Structured record: the GATE is named (mislabel fix
+                            # -- never a generic error line).
+                            blocked_drain.append(
+                                {
+                                    "gate": "claim-retention",
+                                    "scope": "source",
+                                    "reason": retention_decision.message,
+                                    "offending_items": [name],
+                                }
+                            )
                             continue
                         advisory = (
                             "claim-retention gate (ADVISORY -- did NOT block) "
@@ -1228,6 +1384,19 @@ def ingest(
                             if src.is_file() and src.parent == inbox:
                                 _collision_safe_move(src, failed_dir)
                             summary_drain.append((name, "duplicate-blocked"))
+                            # Structured record: the GATE is named (mislabel fix
+                            # -- never a generic error line).
+                            blocked_drain.append(
+                                {
+                                    "gate": "duplicate-page",
+                                    "scope": "wiki",
+                                    "reason": (
+                                        "duplicate-page gate: merge-fragment "
+                                        f"duplicate(s) detected: {', '.join(dup_pages)}"
+                                    ),
+                                    "offending_items": list(dup_pages),
+                                }
+                            )
                             continue
                         # Wiki-STRUCTURAL observation, not a verdict on this
                         # source: the pairs may pre-date this run entirely.
@@ -1322,8 +1491,30 @@ def ingest(
                     f"{reweave_result.attempts} re-weave attempt(s):\n"
                     f"{reweave_result.final_report}"
                 )
+                errored_drain.append(
+                    {
+                        "reason": (
+                            f"overview re-weave failed after "
+                            f"{reweave_result.attempts} attempt(s): "
+                            f"{reweave_result.final_report}"
+                        )
+                    }
+                )
 
-        return 1 if failed_items or not reweave_result.final_passed else 0
+        # Run-result contract: result.json + honest headline + documented exit
+        # code (see wiki_weaver/run_result.py). Replaces the old binary
+        # `1 if failed_items or reweave-failure else 0` -- which exited 0 even
+        # when EVERY source was gate-blocked in enforce mode (the incident's
+        # "looked healthy for a week" hole: retention-/duplicate-blocked
+        # statuses were not in the failed_items set).
+        return _finish_ingest_run(
+            run_dir,
+            run_id,
+            summary_drain,
+            advisories_drain,
+            blocked_drain,
+            errored_drain,
+        )
 
 
 # ---------------------------------------------------------------------------

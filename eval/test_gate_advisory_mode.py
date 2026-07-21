@@ -336,7 +336,10 @@ def test_enforce_env_restores_duplicate_blocking(tmp_path: Path, monkeypatch) ->
     with patch("wiki_weaver.engine_runner.run_inner", side_effect=_mock_run_inner):
         rc = lib.ingest(wiki, source=src)
 
-    assert rc == 1, "enforce mode must restore the old hard block (exit 1)"
+    # Run-result contract (wiki_weaver/run_result.py): an enforce-mode gate
+    # block now returns the DISTINCT exit code 4 (verdict "blocked"), not a
+    # generic 1, so headless callers can tell a gate block from an engine error.
+    assert rc == 4, "enforce mode must hard-block with the distinct exit code 4"
     assert not (wiki / SOURCES / "unrelated.md").exists(), (
         "enforce mode must NOT archive a duplicate-blocked source"
     )
@@ -359,7 +362,9 @@ def test_enforce_env_restores_retention_blocking(tmp_path: Path, monkeypatch) ->
     with patch("wiki_weaver.engine_runner.run_inner", side_effect=_mock_run_inner):
         rc = lib.ingest(wiki, source=src)
 
-    assert rc == 1, "enforce mode must restore the old hard block (exit 1)"
+    # Run-result contract (wiki_weaver/run_result.py): gate blocks return the
+    # distinct exit code 4 (verdict "blocked"), not a generic 1.
+    assert rc == 4, "enforce mode must hard-block with the distinct exit code 4"
     assert not (wiki / SOURCES / "unrelated.md").exists(), (
         "enforce mode must NOT archive a retention-blocked source"
     )

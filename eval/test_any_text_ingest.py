@@ -300,5 +300,9 @@ def test_c_mixed_inbox_md_rs_binary_ds_store(tmp_path: Path) -> None:
         f"no non-hidden files should remain in inbox; found: {[p.name for p in remaining]}"
     )
 
-    # Exit code nonzero: one binary failure.
-    assert rc != 0, "binary failure → exit code must be nonzero"
+    # Run-result contract (wiki_weaver/run_result.py): 2 of 3 converged with
+    # one plain failure and no gate blocks / engine errors -> verdict
+    # "partial" -> exit 0. The binary failure is still surfaced loudly (red
+    # end-of-run block + result.json counts.failed == 1); only the exit-code
+    # semantics changed with the documented contract.
+    assert rc == 0, "partial (>=1 converged, no blocked/errored) exits 0"

@@ -281,7 +281,10 @@ def test_c_duplicate_cleared_from_inbox_no_spin(tmp_path: Path) -> None:
     # run_inner must NOT be called for a duplicate.
     mock_run.assert_not_called()
 
-    assert rc == 0, "no engine errors — exit code should be 0"
+    # Run-result contract (wiki_weaver/run_result.py): an all-duplicate drain
+    # attempted nothing -> verdict "empty" -> distinct exit 3, so headless
+    # callers can tell "nothing to do" from "work succeeded".
+    assert rc == 3, "all-duplicate drain = nothing attempted -> exit 3 (empty)"
 
     # Inbox must be empty — dup cleared out.
     remaining = list(inbox.glob("*.md"))

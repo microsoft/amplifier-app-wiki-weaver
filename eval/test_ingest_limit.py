@@ -197,7 +197,9 @@ def test_all_duplicates_report_complete_not_capped(tmp_path: Path) -> None:
     assert report.hit_limit is False, (
         "a tick full of duplicates must report complete, not capped"
     )
-    assert rc == 0
+    # Run-result contract (wiki_weaver/run_result.py): nothing attempted ->
+    # verdict "empty" -> distinct exit 3 (nothing-to-do, not a failure).
+    assert rc == 3
     remaining = [p.name for p in inbox.glob("*") if p.is_file()]
     assert remaining == []
 

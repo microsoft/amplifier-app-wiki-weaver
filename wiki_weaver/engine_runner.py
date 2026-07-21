@@ -38,7 +38,14 @@ from typing import Any
 from amplifier_module_pipeline_runner import run_pipeline
 
 from ._assets import pipeline_dir
-from .lib import wiki_ledger, wiki_policy_dir, wiki_registry, wiki_runs, wiki_sources
+from .lib import (
+    wiki_failed,
+    wiki_ledger,
+    wiki_policy_dir,
+    wiki_registry,
+    wiki_runs,
+    wiki_sources,
+)
 from .model_resolver import resolve_model
 from .policy import WikiPolicy, load_policy
 
@@ -113,10 +120,41 @@ CI_HOOK_SOURCE = (
     "#subdirectory=modules/hook-context-intelligence"
 )
 
-# Wiki-weaver-owned run-events sink hook module source: a local module living
-# in THIS repo (mirrors modules/tool-wiki-weaver's own local-path pattern).
-# See _ci_overlay() and modules/hook-run-events for what it does and why.
-RUN_EVENTS_HOOK_SOURCE = WIKI_WEAVER_ROOT / "modules" / "hook-run-events"
+# Wiki-weaver-owned run-events sink hook module source. Resolution is DYNAMIC
+# (see resolve_run_events_hook_source below) because the module lives inside
+# THIS repo: in a dev checkout it sits at <repo>/modules/hook-run-events, but
+# when wiki-weaver is INSTALLED as a package, WIKI_WEAVER_ROOT resolves to
+# site-packages/ and site-packages/modules/hook-run-events DOES NOT EXIST --
+# a bare local-path source silently killed the events.jsonl sink for every
+# installed consumer (foundation's activator logs "Failed to activate
+# hook-run-events: File not found: ..." and continues). The git-URL fallback
+# mirrors CI_HOOK_SOURCE's pattern so installed consumers get the sink too.
+_RUN_EVENTS_HOOK_LOCAL = WIKI_WEAVER_ROOT / "modules" / "hook-run-events"
+RUN_EVENTS_HOOK_GIT_SOURCE = (
+    "git+https://github.com/microsoft/amplifier-app-wiki-weaver@main"
+    "#subdirectory=modules/hook-run-events"
+)
+
+
+def resolve_run_events_hook_source() -> str:
+    """Resolve the hook-run-events module source for the active install layout.
+
+    Dev checkout (local module dir exists) -> the local path, so dev workflows
+    and existing tests stay offline and byte-identical to before. Installed
+    package (dir absent under site-packages) -> the canonical git URL, same
+    pattern as ``CI_HOOK_SOURCE``.
+
+    FAIL-SOFT NOTE: even if the resolved source cannot be loaded at prepare
+    time (e.g. no network for the git URL), foundation's module activator
+    logs an ERROR ("Failed to activate hook-run-events: ...") and prepare()
+    CONTINUES -- an observability-hook load failure never breaks synthesis.
+    Wiki-weaver additionally surfaces a loud post-run WARNING when the sink
+    produced no events.jsonl (see ``_warn_if_events_sink_missing``).
+    """
+    if _RUN_EVENTS_HOOK_LOCAL.is_dir():
+        return str(_RUN_EVENTS_HOOK_LOCAL)
+    return RUN_EVENTS_HOOK_GIT_SOURCE
+
 
 SETTINGS_PATH = Path(
     os.environ.get(
@@ -937,7 +975,9 @@ def _ci_overlay(logs_dir: Path) -> Any:
             },
             {
                 "module": "hook-run-events",
-                "source": str(RUN_EVENTS_HOOK_SOURCE),
+                # Dynamic: local module dir in a dev checkout, git URL when
+                # installed as a package (see resolve_run_events_hook_source).
+                "source": resolve_run_events_hook_source(),
                 "config": {"events_path": str(logs_dir / "events.jsonl")},
             },
         ],
@@ -1064,6 +1104,43 @@ def run_inner(
     )
 
 
+def _count_ledger_lines(path: Path) -> int:
+    """Count non-blank ledger lines (one per archived/converged source)."""
+    if not path.is_file():
+        return 0
+    return sum(
+        1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    )
+
+
+def _count_visible_files(path: Path) -> int:
+    """Count non-hidden regular files in a directory (0 if it doesn't exist)."""
+    if not path.is_dir():
+        return 0
+    return sum(1 for p in path.iterdir() if p.is_file() and not p.name.startswith("."))
+
+
+def _warn_if_events_sink_missing(logs_dir: Path) -> None:
+    """Loud, wiki-weaver-owned WARNING when the run-events sink is dead.
+
+    The hook-run-events observability hook is FAIL-SOFT by design: if its
+    module source cannot be loaded at prepare time, foundation's activator
+    logs an ERROR and synthesis proceeds unaffected. That must never be
+    silent, though -- a headless consumer polling ``<logs_dir>/events.jsonl``
+    for progress would otherwise stare at a file that will never appear.
+    Called after a pipeline run actually executed; the check is free.
+    """
+    events = logs_dir / "events.jsonl"
+    if not events.is_file():
+        print(
+            f"! WARNING: run-events sink wrote no {events} -- the "
+            "hook-run-events observability hook likely failed to load "
+            "(synthesis is unaffected; look for 'Failed to activate "
+            "hook-run-events' in the log/stderr)",
+            flush=True,
+        )
+
+
 def run_ingest(
     wiki_dir: str | Path,
     max_cycles: int | None = None,
@@ -1186,6 +1263,58 @@ def run_ingest(
     retention_snapshot_dir = wiki_runs(wiki_dir) / f".retention-snap-ingest-{timestamp}"
     snapshot_pages(wiki_dir, retention_snapshot_dir)
 
+    # Run-result contract (see wiki_weaver/run_result.py): snapshot the two
+    # engine-written outcome channels BEFORE the drain so per-source counts can
+    # be derived afterwards. ingest.dot archives converged sources itself (one
+    # ledger line each, via ingest_archive.py) and quarantines non-converged
+    # ones to .wiki/failed/ (via ingest_fail.py) -- the deltas ARE the counts.
+    from wiki_weaver.run_result import build_result, summary_line, write_result_json
+
+    ledger_before = _count_ledger_lines(wiki_ledger(wiki_dir))
+    failed_before = _count_visible_files(wiki_failed(wiki_dir))
+    # Structured enforce-mode gate blocks / engine errors for result.json --
+    # the fix for the incident where a gate block surfaced as a generic
+    # "module/hook failed to load" line: the gate is now NAMED in a
+    # machine-readable record, never inferred from log prose.
+    blocked_records: list[dict[str, Any]] = []
+    errored_records: list[dict[str, Any]] = []
+
+    def _emit_result() -> None:
+        """Write result.json + echo the honest headline. FAIL-SOFT throughout."""
+        try:
+            converged_count = max(
+                0, _count_ledger_lines(wiki_ledger(wiki_dir)) - ledger_before
+            )
+            failed_count = max(
+                0, _count_visible_files(wiki_failed(wiki_dir)) - failed_before
+            )
+            counts = {
+                "total": converged_count + failed_count,
+                "converged": converged_count,
+                "failed": failed_count,
+                "blocked": 0,  # post-hoc gate blocks are run/wiki-scoped, not per-source
+                "errored": 0,
+                "skipped": 0,
+            }
+            run_result = build_result(
+                f"ingest-{timestamp}",
+                counts,
+                advisories=advisories,
+                blocked=blocked_records,
+                errored=errored_records,
+            )
+            path = write_result_json(logs_dir, run_result)
+            print(summary_line(run_result), flush=True)
+            if path is not None:
+                print(f"run result: {path}", flush=True)
+        except Exception as e:  # noqa: BLE001 -- observability must never break the run
+            print(
+                f"! WARNING: could not build/write result.json "
+                f"({type(e).__name__}: {e}) -- run outcome is unaffected",
+                flush=True,
+            )
+
+    advisories: list[str] = []
     try:
         result = _run_coro(
             run_pipeline(
@@ -1203,11 +1332,22 @@ def run_ingest(
         converged = status == "success"
         notes = result.notes[:2000]
         failure_reason = result.failure_reason
+        if not converged:
+            # Engine finished without success and without raising: a run-level
+            # engine outcome, recorded structurally so headless callers never
+            # have to reverse-engineer it from log prose.
+            errored_records.append(
+                {
+                    "reason": (
+                        f"engine run did not converge (status={status}"
+                        f", reason={failure_reason})"
+                    )
+                }
+            )
         # Run-level gate advisories -- see wiki_weaver.grading.gates_enforced():
         # by DEFAULT both gates below are ADVISORY (detect + surface loudly,
         # never block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
         # hard-blocking behavior.
-        advisories: list[str] = []
 
         if converged:
             from wiki_weaver.grading import gates_enforced, no_duplicate_pages
@@ -1228,6 +1368,16 @@ def run_ingest(
                 if enforce:
                     converged = False
                     failure_reason = retention_decision.message
+                    # Structured record: the GATE is named, never a generic
+                    # error line (the incident's mislabel fix).
+                    blocked_records.append(
+                        {
+                            "gate": "claim-retention",
+                            "scope": "run",
+                            "reason": retention_decision.message,
+                            "offending_items": [],
+                        }
+                    )
                 else:
                     advisory = (
                         "claim-retention gate (ADVISORY -- did NOT block): "
@@ -1254,6 +1404,16 @@ def run_ingest(
                         if failure_reason
                         else dup_message
                     )
+                    # Structured record: the GATE is named, never a generic
+                    # error line (the incident's mislabel fix).
+                    blocked_records.append(
+                        {
+                            "gate": "duplicate-page",
+                            "scope": "wiki",
+                            "reason": dup_message,
+                            "offending_items": list(dup_pages),
+                        }
+                    )
                 else:
                     # Wiki-STRUCTURAL observation, not a verdict on any one
                     # source: the pairs may pre-date this run entirely.
@@ -1264,6 +1424,14 @@ def run_ingest(
                     )
                     print(f"!! GATE ADVISORY [duplicate-page]: {advisory}", flush=True)
                     advisories.append(advisory)
+    except Exception as e:
+        # Engine/infrastructure error: record it and emit result.json so a
+        # headless caller still gets a machine-readable outcome, then
+        # RE-RAISE unchanged -- the exception contract of this function is
+        # not altered by observability.
+        errored_records.append({"reason": f"{type(e).__name__}: {e}"})
+        _emit_result()
+        raise
     finally:
         # Belt-and-suspenders: enforce_retention_gate() already removes
         # retention_snapshot_dir on every path it runs; this covers the
@@ -1297,6 +1465,13 @@ def run_ingest(
                 if failure_reason
                 else reweave_message
             )
+            errored_records.append({"reason": reweave_message})
+
+    # Run-result contract: result.json + honest headline (fail-soft), then a
+    # loud warning if the run-events observability sink never materialised
+    # (see _warn_if_events_sink_missing -- synthesis itself is unaffected).
+    _emit_result()
+    _warn_if_events_sink_missing(logs_dir)
 
     return InnerResult(
         status=status,
