@@ -56,6 +56,7 @@ change.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -69,7 +70,27 @@ __all__ = [
     "grade_claim_retention",
     "DUP_PAGE",
     "no_duplicate_pages",
+    "gates_enforced",
 ]
+
+
+def gates_enforced() -> bool:
+    """Escape hatch for the two runtime gates (duplicate-page + claim-retention).
+
+    Default (env var unset / empty / "0" / "false"): both gates are ADVISORY --
+    they still detect and surface loudly at run level, but never block a source
+    (no ``converged=False``, no ``_fail``/quarantine, no non-zero exit) on a
+    gate hit. Set ``WIKI_WEAVER_ENFORCE_GATES=1`` to restore the OLD
+    hard-blocking behavior for BOTH gates at every wiring site
+    (wiki_weaver/lib.py's ingest() single-file + drain paths, and
+    wiki_weaver/engine_runner.py's run_ingest()).
+    """
+    return os.environ.get("WIKI_WEAVER_ENFORCE_GATES", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Overview-quality constants  (grade_overview)
@@ -554,6 +575,10 @@ def grade_claim_retention(
         return result
 
     # Extract the JSON block; tolerate leading/trailing prose in the response.
+    # TODO(follow-up): this greedy regex + json.loads is fragile against
+    # truncated/oversized judge output (a known source of grader errors in
+    # production). Robust judge-JSON parsing is a separate follow-up -- do not
+    # bolt it on here.
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
         result.error = f"judge returned no JSON block; raw response (first 500 chars):\n{raw[:500]}"
@@ -582,6 +607,11 @@ def grade_claim_retention(
 # See no_duplicate_pages() -- the regex alone is not enough; we also require
 # the base slug to exist so legitimate version-named pages (gemma-4.md,
 # deepseek-v3-2.md, kimi-k2-5.md, ...) are NOT flagged as duplicates.
+# TODO(follow-up): this heuristic still false-positives on legitimately
+# COEXISTING version pages whose names collide with the pattern (e.g.
+# gpt-5.md + gpt-5-1.md, where "-1" means "GPT-5.1", not "fragment #1").
+# Smarter duplicate-vs-version-page detection is a separate follow-up -- do
+# not bolt it on here.
 DUP_PAGE = re.compile(r"-\d+\.md$")
 
 

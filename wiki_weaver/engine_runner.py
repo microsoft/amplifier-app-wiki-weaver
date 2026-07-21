@@ -30,7 +30,7 @@ import re
 import shlex
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -172,6 +172,11 @@ class InnerResult:
     logs_dir: Path
     notes: str = ""
     failure_reason: str | None = None
+    # Run-level gate advisories (duplicate-page / claim-retention). Non-empty
+    # means a gate FIRED but did NOT block (advisory mode -- the default; see
+    # wiki_weaver.grading.gates_enforced()). Lets a caller/scheduler tell an
+    # "advisory fired" run apart from a genuinely clean one.
+    advisories: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -1167,12 +1172,21 @@ def run_ingest(
         converged = status == "success"
         notes = result.notes[:2000]
         failure_reason = result.failure_reason
+        # Run-level gate advisories -- see wiki_weaver.grading.gates_enforced():
+        # by DEFAULT both gates below are ADVISORY (detect + surface loudly,
+        # never block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
+        # hard-blocking behavior.
+        advisories: list[str] = []
 
         if converged:
+            from wiki_weaver.grading import gates_enforced, no_duplicate_pages
+
+            enforce = gates_enforced()
+
             # Claim-retention backstop: an independent, LLM-judge-backed
             # post-hoc re-check across the whole drain (see HONEST FRAMING
             # above -- this cannot prevent the archive, only surface it as a
-            # loud failure).
+            # loud failure/advisory).
             retention_decision = enforce_retention_gate(
                 wiki_dir, retention_snapshot_dir
             )
@@ -1180,28 +1194,45 @@ def run_ingest(
                 "block_confirmed_loss",
                 "block_escalated_errors",
             ):
-                converged = False
-                failure_reason = retention_decision.message
+                if enforce:
+                    converged = False
+                    failure_reason = retention_decision.message
+                else:
+                    advisory = (
+                        "claim-retention gate (ADVISORY -- did NOT block): "
+                        f"{retention_decision.message}"
+                    )
+                    print(f"!! GATE ADVISORY [claim-retention]: {advisory}", flush=True)
+                    advisories.append(advisory)
             elif retention_decision.message:
                 notes = f"{notes}\n{retention_decision.message}"[:2000]
 
             # Duplicate-page backstop: cheap, deterministic, always-on (no
             # fail-open/fail-closed escalation needed -- see
             # wiki_weaver/grading.py's no_duplicate_pages()).
-            from wiki_weaver.grading import no_duplicate_pages
-
             dup_pages = no_duplicate_pages(wiki_dir)
             if dup_pages:
-                converged = False
-                dup_message = (
-                    "duplicate-page gate: merge-fragment duplicate(s) "
-                    f"detected: {', '.join(dup_pages)}"
-                )
-                failure_reason = (
-                    f"{failure_reason}; {dup_message}"
-                    if failure_reason
-                    else dup_message
-                )
+                if enforce:
+                    converged = False
+                    dup_message = (
+                        "duplicate-page gate: merge-fragment duplicate(s) "
+                        f"detected: {', '.join(dup_pages)}"
+                    )
+                    failure_reason = (
+                        f"{failure_reason}; {dup_message}"
+                        if failure_reason
+                        else dup_message
+                    )
+                else:
+                    # Wiki-STRUCTURAL observation, not a verdict on any one
+                    # source: the pairs may pre-date this run entirely.
+                    advisory = (
+                        "duplicate-page gate (ADVISORY -- did NOT block): wiki "
+                        f"contains {len(dup_pages)} version/merge-fragment page "
+                        f"pair(s): {', '.join(dup_pages)}"
+                    )
+                    print(f"!! GATE ADVISORY [duplicate-page]: {advisory}", flush=True)
+                    advisories.append(advisory)
     finally:
         # Belt-and-suspenders: enforce_retention_gate() already removes
         # retention_snapshot_dir on every path it runs; this covers the
@@ -1242,6 +1273,7 @@ def run_ingest(
         logs_dir=logs_dir,
         notes=notes,
         failure_reason=failure_reason,
+        advisories=advisories,
     )
 
 

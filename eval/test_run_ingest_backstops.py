@@ -54,6 +54,15 @@ import wiki_weaver.retention as retention  # noqa: E402
 import wiki_weaver.reweave as reweave  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _advisory_default_env(monkeypatch):
+    """Both gates are ADVISORY by default (never block); the blocking tests
+    below set WIKI_WEAVER_ENFORCE_GATES=1 explicitly (the escape hatch --
+    see wiki_weaver.grading.gates_enforced()). Clear it here so the advisory
+    tests exercise the true default regardless of the developer's shell env."""
+    monkeypatch.delenv("WIKI_WEAVER_ENFORCE_GATES", raising=False)
+
+
 def _fake_pipeline_result(status: str = "success") -> Any:
     from amplifier_module_pipeline_runner import PipelineResult
 
@@ -88,10 +97,12 @@ def _passing_retention_decision() -> "retention.RetentionGateDecision":
 
 
 def test_run_ingest_catches_confirmed_content_loss(monkeypatch, tmp_path: Path) -> None:
-    """A converged engine run that the retention gate confirms lost a claim
-    must come back from run_ingest() as converged=False, not a false
-    success -- this is the agent-tool-path gap fix.
+    """With the WIKI_WEAVER_ENFORCE_GATES=1 escape hatch set, a converged
+    engine run that the retention gate confirms lost a claim must come back
+    from run_ingest() as converged=False, not a false success -- the OLD
+    (pre-advisory) blocking behavior, now opt-in.
     """
+    monkeypatch.setenv("WIKI_WEAVER_ENFORCE_GATES", "1")
     wiki_dir = (tmp_path / "wiki").resolve()
     wiki_dir.mkdir()
     (wiki_dir / "concept.md").write_text(
@@ -154,12 +165,14 @@ def test_run_ingest_catches_confirmed_content_loss(monkeypatch, tmp_path: Path) 
 
 
 def test_run_ingest_catches_duplicate_page(monkeypatch, tmp_path: Path) -> None:
-    """A converged engine run that leaves a merge-fragment duplicate page
-    behind (concept-2.md alongside concept.md) must come back from
-    run_ingest() as converged=False -- proven with the REAL, unmocked
-    no_duplicate_pages() deterministic scan (no LLM/mock needed for this
-    half of the gate, since it has no judge-unavailability failure mode).
+    """With the WIKI_WEAVER_ENFORCE_GATES=1 escape hatch set, a converged
+    engine run that leaves a merge-fragment duplicate page behind
+    (concept-2.md alongside concept.md) must come back from run_ingest() as
+    converged=False -- proven with the REAL, unmocked no_duplicate_pages()
+    deterministic scan. This is the OLD (pre-advisory) blocking behavior,
+    now opt-in.
     """
+    monkeypatch.setenv("WIKI_WEAVER_ENFORCE_GATES", "1")
     wiki_dir = (tmp_path / "wiki").resolve()
     wiki_dir.mkdir()
     (wiki_dir / "concept.md").write_text("# Concept\n", encoding="utf-8")
@@ -251,3 +264,101 @@ def test_run_ingest_propagates_reweave_failure(monkeypatch, tmp_path: Path) -> N
     )
     assert result.converged is False
     assert "re-weave" in (result.failure_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# Tests 4+5 -- ADVISORY mode (the default): both gates detect + surface at
+# run level (InnerResult.advisories) but do NOT block convergence.
+# ---------------------------------------------------------------------------
+
+
+def test_run_ingest_retention_block_is_advisory_by_default(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """DEFAULT (no WIKI_WEAVER_ENFORCE_GATES): a retention-gate block verdict
+    must NOT flip converged=False. It must surface as a run-level advisory in
+    InnerResult.advisories, making the run distinguishable from a clean one.
+    """
+    wiki_dir = (tmp_path / "wiki").resolve()
+    wiki_dir.mkdir()
+
+    async def fake_run_pipeline(dot_source: str, **kwargs: Any) -> Any:
+        return _fake_pipeline_result(status="success")
+
+    monkeypatch.setattr(er, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        retention,
+        "enforce_retention_gate",
+        lambda wiki, snapshot_dir, **kwargs: retention.RetentionGateDecision(
+            action="block_confirmed_loss",
+            message=(
+                "claim-retention gate: SILENTLY_LOST claim(s) detected in "
+                'the re-write -- concept.md: "Original grounded claim."'
+            ),
+        ),
+    )
+    monkeypatch.setattr(grading, "no_duplicate_pages", lambda wiki: [])
+    monkeypatch.setattr(
+        reweave,
+        "reweave_overview_if_needed",
+        lambda wiki_dir: _passing_reweave_result(),
+    )
+
+    result = er.run_ingest(wiki_dir)
+
+    assert result.converged is True, (
+        "advisory mode (the default) must NOT block on a retention verdict"
+    )
+    assert result.failure_reason is None
+    assert result.advisories, (
+        "the advisory must surface at run level so an advisory-fired run is "
+        "distinguishable from a clean one"
+    )
+    assert any(
+        "claim-retention" in a and "SILENTLY_LOST" in a for a in result.advisories
+    )
+    assert any("did NOT block" in a for a in result.advisories)
+
+
+def test_run_ingest_duplicate_page_is_advisory_by_default(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """DEFAULT (no WIKI_WEAVER_ENFORCE_GATES): a duplicate-page hit (REAL,
+    unmocked scan over a coexisting version-page pair: gpt-5.md + gpt-5-1.md)
+    must NOT flip converged=False -- it surfaces as a WIKI-STRUCTURAL
+    run-level advisory instead.
+    """
+    wiki_dir = (tmp_path / "wiki").resolve()
+    wiki_dir.mkdir()
+    (wiki_dir / "gpt-5.md").write_text("# GPT-5\n", encoding="utf-8")
+    (wiki_dir / "gpt-5-1.md").write_text("# GPT-5.1\n", encoding="utf-8")
+
+    async def fake_run_pipeline(dot_source: str, **kwargs: Any) -> Any:
+        return _fake_pipeline_result(status="success")
+
+    monkeypatch.setattr(er, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        retention,
+        "enforce_retention_gate",
+        lambda wiki, snapshot_dir, **kwargs: _passing_retention_decision(),
+    )
+    monkeypatch.setattr(
+        reweave,
+        "reweave_overview_if_needed",
+        lambda wiki_dir: _passing_reweave_result(),
+    )
+
+    result = er.run_ingest(wiki_dir)
+
+    assert result.converged is True, (
+        "advisory mode (the default) must NOT block on a duplicate-page hit"
+    )
+    assert result.failure_reason is None
+    # Wiki-structural framing, naming the offending pages.
+    assert any(
+        "duplicate-page" in a and "wiki contains" in a and "gpt-5-1.md" in a
+        for a in result.advisories
+    )
+
+    # Sanity: the real, unmocked deterministic scan did fire.
+    assert grading.no_duplicate_pages(wiki_dir) == ["gpt-5-1.md"]

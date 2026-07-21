@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -127,6 +127,24 @@ def _fail(msg: str) -> None:
 
 def _warn(msg: str) -> None:
     print(f"{YELLOW}!{RESET} {msg}")
+
+
+def _gate_advisory(gate: str, msg: str) -> None:
+    """Loud, distinct, run-level gate-advisory line (the gate did NOT block)."""
+    print(f"{YELLOW}!! GATE ADVISORY [{gate}]{RESET} {msg}")
+
+
+def _print_advisories(advisories: list[str]) -> None:
+    """Distinct end-of-run advisory block so an advisory-fired run can never
+    present as byte-identical to a clean one (run-level, not buried per-source)."""
+    if not advisories:
+        return
+    print(
+        f"\n{YELLOW}!! {len(advisories)} gate advisory(ies) fired this run "
+        f"(ADVISORY -- did NOT block any source):{RESET}"
+    )
+    for a in advisories:
+        print(f"{YELLOW}   - {a}{RESET}")
 
 
 # ---------------------------------------------------------------------------
@@ -718,9 +736,17 @@ class DrainReport:
     Callers who need to know whether a drain stopped early because it ran out
     of budget (rather than because the inbox was empty) pass a ``DrainReport``
     in and read ``.hit_limit`` back out after the call.
+
+    ``advisories`` is the machine-readable run-level gate-advisory signal:
+    non-empty means a runtime gate (duplicate-page / claim-retention) FIRED
+    but did NOT block (advisory mode -- the default; see
+    ``wiki_weaver.grading.gates_enforced()``). Lets a scheduler tell an
+    "advisory fired" run apart from a genuinely clean one. Populated on both
+    the single-file and drain paths whenever a report is passed.
     """
 
     hit_limit: bool = False
+    advisories: list[str] = field(default_factory=list)
 
 
 def ingest(
@@ -783,11 +809,16 @@ def ingest(
         # Import the engine runner lazily so `doctor`/`init`/`lint` never pay
         # the cost of pulling in the attractor engine.
         from wiki_weaver.engine_runner import run_inner
-        from wiki_weaver.grading import no_duplicate_pages
+        from wiki_weaver.grading import gates_enforced, no_duplicate_pages
         from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
 
         processed = _processed_sources(wiki)
         summary: list[tuple[str, str]] = []
+        # Run-level gate advisories. By DEFAULT both runtime gates below are
+        # ADVISORY (detect + surface loudly, never block); the env hatch
+        # WIKI_WEAVER_ENFORCE_GATES=1 restores the old hard-blocking behavior
+        # for both gates -- see wiki_weaver.grading.gates_enforced().
+        advisories: list[str] = []
 
         for src in sources:
             name = src.name
@@ -868,27 +899,30 @@ def ingest(
                 if result.converged:
                     # Claim-retention backstop: an independent, LLM-judge-backed
                     # re-check of whether this re-write silently dropped prior
-                    # content. On CONFIRMED_LOSS this source is refused --
-                    # archiving/ledger-advancing does NOT happen, matching the
-                    # tamper-guard's "never trust, verify, fail loud" posture.
+                    # content. ADVISORY by default (detect + surface, never
+                    # block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
+                    # blocking behavior (refuse archive/ledger-advance).
                     retention_decision = enforce_retention_gate(
                         wiki, retention_snapshot_dir
                     )
-                    if retention_decision.action == "block_confirmed_loss":
-                        _fail(f"{name}: {retention_decision.message}")
-                        summary.append((name, "retention-blocked"))
-                        if not keep_going:
-                            _print_summary(summary)
-                            return 1
-                        continue
-                    if retention_decision.action == "block_escalated_errors":
-                        _fail(f"{name}: {retention_decision.message}")
-                        summary.append((name, "retention-blocked"))
-                        if not keep_going:
-                            _print_summary(summary)
-                            return 1
-                        continue
-                    if retention_decision.message:
+                    if retention_decision.action in (
+                        "block_confirmed_loss",
+                        "block_escalated_errors",
+                    ):
+                        if gates_enforced():
+                            _fail(f"{name}: {retention_decision.message}")
+                            summary.append((name, "retention-blocked"))
+                            if not keep_going:
+                                _print_summary(summary)
+                                return 1
+                            continue
+                        advisory = (
+                            "claim-retention gate (ADVISORY -- did NOT block) "
+                            f"[source {name}]: {retention_decision.message}"
+                        )
+                        _gate_advisory("claim-retention", advisory)
+                        advisories.append(advisory)
+                    elif retention_decision.message:
                         # Either a plain PASS note or a fail-open WARN -- both
                         # non-blocking; the source proceeds to archive below.
                         print(f"  {retention_decision.message}")
@@ -896,20 +930,30 @@ def ingest(
                     # Duplicate-page backstop: a cheap, deterministic scan for
                     # merge-fragment duplicates (e.g. concept-2.md alongside
                     # concept.md -- the "appended instead of fused" failure
-                    # signature). Free/no-LLM, so it always runs -- no
-                    # fail-open/fail-closed escalation needed (see
-                    # wiki_weaver/grading.py's no_duplicate_pages()).
+                    # signature). Free/no-LLM, so it always runs. ADVISORY by
+                    # default; WIKI_WEAVER_ENFORCE_GATES=1 restores blocking.
                     dup_pages = no_duplicate_pages(wiki)
                     if dup_pages:
-                        _fail(
-                            f"{name}: duplicate-page gate: merge-fragment "
-                            f"duplicate(s) detected: {', '.join(dup_pages)}"
+                        if gates_enforced():
+                            _fail(
+                                f"{name}: duplicate-page gate: merge-fragment "
+                                f"duplicate(s) detected: {', '.join(dup_pages)}"
+                            )
+                            summary.append((name, "duplicate-blocked"))
+                            if not keep_going:
+                                _print_summary(summary)
+                                return 1
+                            continue
+                        # Wiki-STRUCTURAL observation, not a verdict on this
+                        # source: the pairs may pre-date this run entirely.
+                        advisory = (
+                            "duplicate-page gate (ADVISORY -- did NOT block): "
+                            f"wiki contains {len(dup_pages)} version/merge-"
+                            f"fragment page pair(s): {', '.join(dup_pages)}"
                         )
-                        summary.append((name, "duplicate-blocked"))
-                        if not keep_going:
-                            _print_summary(summary)
-                            return 1
-                        continue
+                        if advisory not in advisories:
+                            _gate_advisory("duplicate-page", advisory)
+                            advisories.append(advisory)
 
                     dest = sources_dir / name
                     if src.is_file() and src.parent == inbox:
@@ -947,6 +991,9 @@ def ingest(
                 shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
 
         _print_summary(summary)
+        _print_advisories(advisories)
+        if report is not None:
+            report.advisories.extend(advisories)
         return 0
 
     # ---------------------------------------------------------------------- #
@@ -977,11 +1024,16 @@ def ingest(
     # Import the engine runner lazily so `doctor`/`init`/`lint` never pay the
     # cost of pulling in the attractor engine.
     from wiki_weaver.engine_runner import run_inner, shared_engine_loop
-    from wiki_weaver.grading import no_duplicate_pages
+    from wiki_weaver.grading import gates_enforced, no_duplicate_pages
     from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
 
     processed = _processed_sources(wiki)
     summary_drain: list[tuple[str, str]] = []
+    # Run-level gate advisories. By DEFAULT both runtime gates below are
+    # ADVISORY (detect + surface loudly, never block); the env hatch
+    # WIKI_WEAVER_ENFORCE_GATES=1 restores the old hard-blocking behavior
+    # for both gates -- see wiki_weaver.grading.gates_enforced().
+    advisories_drain: list[str] = []
 
     failed_dir = wiki_failed(wiki)
     failed_dir.mkdir(parents=True, exist_ok=True)
@@ -1137,9 +1189,10 @@ def ingest(
                 if result.converged:
                     # Claim-retention backstop: an independent, LLM-judge-backed
                     # re-check of whether this re-write silently dropped prior
-                    # content. On CONFIRMED_LOSS this source is refused --
-                    # archiving/ledger-advancing does NOT happen; it routes to
-                    # _failed/ like any other non-convergence disposition.
+                    # content. ADVISORY by default (detect + surface, never
+                    # block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
+                    # blocking behavior (route to _failed/ like any other
+                    # non-convergence disposition).
                     retention_decision = enforce_retention_gate(
                         wiki, retention_snapshot_dir
                     )
@@ -1147,27 +1200,45 @@ def ingest(
                         "block_confirmed_loss",
                         "block_escalated_errors",
                     ):
-                        _fail(f"{name}: {retention_decision.message}")
-                        if src.is_file() and src.parent == inbox:
-                            _collision_safe_move(src, failed_dir)
-                        summary_drain.append((name, "retention-blocked"))
-                        continue
-                    if retention_decision.message:
+                        if gates_enforced():
+                            _fail(f"{name}: {retention_decision.message}")
+                            if src.is_file() and src.parent == inbox:
+                                _collision_safe_move(src, failed_dir)
+                            summary_drain.append((name, "retention-blocked"))
+                            continue
+                        advisory = (
+                            "claim-retention gate (ADVISORY -- did NOT block) "
+                            f"[source {name}]: {retention_decision.message}"
+                        )
+                        _gate_advisory("claim-retention", advisory)
+                        advisories_drain.append(advisory)
+                    elif retention_decision.message:
                         print(f"  {retention_decision.message}")
 
                     # Duplicate-page backstop: cheap, deterministic, always-on
-                    # (no fail-open/fail-closed escalation needed -- see
-                    # wiki_weaver/grading.py's no_duplicate_pages()).
+                    # (no fail-open/fail-closed escalation needed). ADVISORY by
+                    # default; WIKI_WEAVER_ENFORCE_GATES=1 restores blocking.
                     dup_pages = no_duplicate_pages(wiki)
                     if dup_pages:
-                        _fail(
-                            f"{name}: duplicate-page gate: merge-fragment "
-                            f"duplicate(s) detected: {', '.join(dup_pages)}"
+                        if gates_enforced():
+                            _fail(
+                                f"{name}: duplicate-page gate: merge-fragment "
+                                f"duplicate(s) detected: {', '.join(dup_pages)}"
+                            )
+                            if src.is_file() and src.parent == inbox:
+                                _collision_safe_move(src, failed_dir)
+                            summary_drain.append((name, "duplicate-blocked"))
+                            continue
+                        # Wiki-STRUCTURAL observation, not a verdict on this
+                        # source: the pairs may pre-date this run entirely.
+                        advisory = (
+                            "duplicate-page gate (ADVISORY -- did NOT block): "
+                            f"wiki contains {len(dup_pages)} version/merge-"
+                            f"fragment page pair(s): {', '.join(dup_pages)}"
                         )
-                        if src.is_file() and src.parent == inbox:
-                            _collision_safe_move(src, failed_dir)
-                        summary_drain.append((name, "duplicate-blocked"))
-                        continue
+                        if advisory not in advisories_drain:
+                            _gate_advisory("duplicate-page", advisory)
+                            advisories_drain.append(advisory)
 
                     dest = sources_dir / name
                     if src.is_file() and src.parent == inbox:
@@ -1205,6 +1276,9 @@ def ingest(
                 shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
 
         _print_summary(summary_drain)
+        _print_advisories(advisories_drain)
+        if report is not None:
+            report.advisories.extend(advisories_drain)
         # Fail-loud after the drain: surface anything routed to _failed/ as a
         # distinct, un-missable block (not merely a yellow bullet in the summary) so
         # silently-dropped sources cannot slip past the operator.
