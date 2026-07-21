@@ -62,6 +62,23 @@ _LAYER1_WHEEL_DEPS: list[tuple[str, str]] = [
     ),
 ]
 
+# Minimum attractor-bundle commit required for fail-safe verdict routing in the
+# pipeline's assess loop. The floor is attractor PR #89 (744efe6), which
+# transitively includes PR #88:
+#   - #88: an explicit report_outcome tool call always wins over trailing
+#     JSON-shaped text on the engine's tool-loop path (was fail-unsafe).
+#   - #89: loop_restart clears a stale preferred_label from context; without it
+#     a converged verdict from one source/cycle can leak into the next and
+#     silently FALSE-CONVERGE it.
+# Note: wiki-weaver's assess node reports its verdict as a flat bare-JSON FINAL
+# MESSAGE (PR #41 in this repo) because wiki-weaver runs the engine's SPAWN
+# path, which parses final text and never reads report_outcome tool-call args.
+# If the verdict-routing contract changes again, bump this to the new required
+# attractor-bundle commit at the same time.
+ATTRACTOR_ROUTING_FLOOR_SHA = "744efe668c01993505e3be417c270aa62c9474cb"
+_ATTRACTOR_REPO = "microsoft/amplifier-bundle-attractor"
+_ATTRACTOR_COMPARE_TIMEOUT = 4  # seconds; matches doctor's other network-probe timeouts
+
 
 # ---------------------------------------------------------------------------
 # Foundation lazy helpers
@@ -220,6 +237,114 @@ def local_layer2_commits() -> list[SourceRecord]:
         for label, uri in _LAYER2_SOURCES:
             results.append(SourceRecord(label=label, uri=uri, error=str(e)))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Layer-2: attractor routing-contract compatibility floor
+# ---------------------------------------------------------------------------
+#
+# pipeline/synthesize.dot's assess node reports its verdict as a flat bare-JSON
+# final message (PR #41 in this repo; wiki-weaver runs the engine's spawn path,
+# which parses final text). For that routing to be fail-safe the engine must
+# include attractor PR #89 (transitively #88): without #89, loop_restart leaves
+# a stale preferred_label in context, so a converged verdict from one
+# cycle/source can leak into the next and silently false-converge it (or an
+# unresolved verdict degrades to a generic max_drain_iters failure with no
+# diagnostic cause). This is a READ-ONLY diagnostic: it never
+# touches resolve() or the @main clone/update mechanism, and it must degrade
+# gracefully (never crash, never block offline use of `doctor`).
+
+
+@dataclass
+class CompatFloorResult:
+    """Result of checking the locally-resolved attractor-bundle commit against
+    ATTRACTOR_ROUTING_FLOOR_SHA.
+
+    ``ok`` is a tri-state, not a bool:
+      True  = locally-resolved commit is at or beyond the floor (contract satisfied).
+      False = locally-resolved commit predates the floor \u2014 a REAL defect: verdict
+              routing is not fail-safe (a stale preferred_label can leak across
+              loop_restart cycles and silently false-converge sources).
+      None  = inconclusive (not yet cloned, or the GitHub compare API could not be
+              reached/parsed, or the comparison diverged). Never a failure \u2014 this
+              check must stay usable offline.
+    """
+
+    ok: Optional[bool]
+    message: str
+
+
+def _compare_commits_status(floor_sha: str, resolved_sha: str) -> str:
+    """Fetch GitHub's compare status for ``floor_sha...resolved_sha`` on the
+    attractor-bundle repo.  Returns the raw ``status`` field (one of
+    "identical", "ahead", "behind", "diverged").  Raises on any network/HTTP/
+    parsing failure \u2014 callers must catch.
+
+    A LOCAL ``git merge-base --is-ancestor`` check cannot work here: the
+    Layer-2 attractor-bundle cache is always a shallow ``--depth 1`` clone
+    (see amplifier_foundation/sources/git.py, universal foundation behavior),
+    so local history only ever has one commit and cannot answer ancestry
+    queries. GitHub's compare API is the only available source of truth for
+    ancestry between two arbitrary commits.
+    """
+    import urllib.request
+
+    url = (
+        f"https://api.github.com/repos/{_ATTRACTOR_REPO}/compare/"
+        f"{floor_sha}...{resolved_sha}"
+    )
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=_ATTRACTOR_COMPARE_TIMEOUT) as resp:  # noqa: S310
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["status"]
+
+
+async def check_attractor_routing_floor() -> CompatFloorResult:
+    """Verify the locally-resolved attractor-bundle commit meets
+    ATTRACTOR_ROUTING_FLOOR_SHA.
+
+    Uses GitHub's compare API (not local git) because the Layer-2 cache is
+    always a shallow (--depth 1) clone and cannot answer ancestry queries
+    locally. Degrades gracefully: any network/HTTP/parsing failure, or a
+    "diverged" compare result, yields ``ok=None`` (inconclusive) rather than a
+    hard failure \u2014 this diagnostic must never block offline use of `doctor`.
+    """
+    records = local_layer2_commits()
+    rec = next((r for r in records if r.label == "attractor-bundle"), None)
+    local_sha = rec.local_sha if rec else None
+
+    if not local_sha:
+        return CompatFloorResult(
+            None, "attractor-bundle not yet cloned; floor check skipped"
+        )
+
+    if local_sha == ATTRACTOR_ROUTING_FLOOR_SHA:
+        return CompatFloorResult(True, f"at floor commit ({local_sha[:8]})")
+
+    try:
+        status = _compare_commits_status(ATTRACTOR_ROUTING_FLOOR_SHA, local_sha)
+    except Exception as e:  # noqa: BLE001
+        return CompatFloorResult(None, f"could not verify: {e}")
+
+    if status in ("identical", "ahead"):
+        return CompatFloorResult(
+            True, f"resolved commit ({local_sha[:8]}) is {status} of floor"
+        )
+    if status == "behind":
+        return CompatFloorResult(
+            False,
+            f"resolved commit ({local_sha[:8]}) is BEHIND the required floor "
+            "\u2014 verdict routing is not fail-safe on this engine: a stale "
+            "verdict can leak across refine cycles and silently false-converge "
+            "sources; upgrade the attractor engine bundle "
+            "(amplifier-module-loop-pipeline) to a commit at or past "
+            f"{ATTRACTOR_ROUTING_FLOOR_SHA[:7]}",
+        )
+    # "diverged" or any unrecognized status: inconclusive, not a defect
+    return CompatFloorResult(
+        None,
+        f"compare status '{status}' is inconclusive (expected ancestry, not divergence)",
+    )
 
 
 # ---------------------------------------------------------------------------
