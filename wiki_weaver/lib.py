@@ -1856,10 +1856,13 @@ def doctor(*, wiki: str | Path | None = None) -> int:
         _warn(f"could not read resolved @main commits: {e}")
 
     # Attractor engine routing-contract floor: pipeline/synthesize.dot's assess
-    # node routes convergence via the report_outcome tool, which requires the
-    # resolved attractor-bundle commit to be at or beyond
-    # ATTRACTOR_ROUTING_FLOOR_SHA (older commits let trailing model prose
-    # silently override an explicit report_outcome call). Read-only diagnostic;
+    # node reports its verdict as a flat bare-JSON final message (spawn path,
+    # PR #41). Verdict routing is only fail-safe when the resolved
+    # attractor-bundle commit is at or beyond ATTRACTOR_ROUTING_FLOOR_SHA
+    # (attractor #89, transitively #88): older engines leave a stale
+    # preferred_label in context across loop_restart, so a verdict from one
+    # cycle/source can leak into the next and silently false-converge it.
+    # Read-only diagnostic;
     # degrades to WARN (never blocks doctor) when inconclusive — e.g. offline,
     # not yet cloned, or the GitHub compare API is unreachable.
     try:
@@ -1882,7 +1885,11 @@ def doctor(*, wiki: str | Path | None = None) -> int:
                 f"attractor routing-contract floor: {floor_result.message}"
                 f" (>= {floor_short})"
             )
-            _warn("  run `wiki-weaver update` to refresh the attractor engine bundle")
+            _warn(
+                "  upgrade the attractor engine (amplifier-module-loop-pipeline /"
+                f" attractor bundle) to a commit at or past {floor_short}"
+                " \u2014 run `wiki-weaver update`"
+            )
             ok = False
         else:
             _warn(

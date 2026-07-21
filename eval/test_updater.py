@@ -468,7 +468,13 @@ class TestCheckAttractorRoutingFloor:
         assert "ahead" in result.message
 
     async def test_behind_floor_is_real_defect(self, monkeypatch):
-        """A mocked 'behind' compare status is the real defect condition \u2014 ok=False."""
+        """A mocked 'behind' compare status is the real defect condition \u2014 ok=False.
+
+        The diagnostic must describe the post-#41 contract (fail-safe verdict
+        routing / stale-verdict leak, remediated by upgrading the engine) and
+        must NOT send an operator chasing report_outcome configuration \u2014 that
+        contract is dead on wiki-weaver's spawn-path execution.
+        """
         local_sha = "2" * 40
         self._mock_local_commits(monkeypatch, local_sha)
         monkeypatch.setattr(
@@ -479,6 +485,21 @@ class TestCheckAttractorRoutingFloor:
         result = await check_attractor_routing_floor()
         assert result.ok is False
         assert "BEHIND" in result.message
+        # New (post-#41) diagnostic text:
+        assert "verdict routing is not fail-safe" in result.message
+        assert "false-converge" in result.message
+        assert ATTRACTOR_ROUTING_FLOOR_SHA[:7] in result.message
+        # Stale (pre-#41) guidance must be gone:
+        assert "report_outcome" not in result.message
+        assert "trailing model prose" not in result.message
+
+    def test_floor_sha_is_attractor_pr_89(self):
+        """The floor must be attractor PR #89 (744efe6), which transitively
+        includes #88. Pinning #88 alone (74a743a) would let an engine between
+        #88 and #89 pass while still carrying the loop_restart stale-label
+        leak \u2014 the exact silent false-convergence this check exists to catch.
+        """
+        assert ATTRACTOR_ROUTING_FLOOR_SHA == "744efe668c01993505e3be417c270aa62c9474cb"
 
     async def test_diverged_is_inconclusive(self, monkeypatch):
         """A 'diverged' compare status can't be interpreted as ancestry \u2014 ok=None."""

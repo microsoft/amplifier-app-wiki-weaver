@@ -62,12 +62,20 @@ _LAYER1_WHEEL_DEPS: list[tuple[str, str]] = [
     ),
 ]
 
-# Minimum attractor-bundle commit required by pipeline/synthesize.dot's assess-node
-# report_outcome routing contract (see PR #38 in this repo + PR #88 in
-# amplifier-bundle-attractor, both 2026-07-15). If report_outcome tool-call
-# priority routing is EVER touched again in synthesize.dot/ingest.dot, bump this
-# to the new required attractor-bundle commit at the same time.
-ATTRACTOR_ROUTING_FLOOR_SHA = "74a743ad5668c7bf806cea6b88d23ae5a536c97b"
+# Minimum attractor-bundle commit required for fail-safe verdict routing in the
+# pipeline's assess loop. The floor is attractor PR #89 (744efe6), which
+# transitively includes PR #88:
+#   - #88: an explicit report_outcome tool call always wins over trailing
+#     JSON-shaped text on the engine's tool-loop path (was fail-unsafe).
+#   - #89: loop_restart clears a stale preferred_label from context; without it
+#     a converged verdict from one source/cycle can leak into the next and
+#     silently FALSE-CONVERGE it.
+# Note: wiki-weaver's assess node reports its verdict as a flat bare-JSON FINAL
+# MESSAGE (PR #41 in this repo) because wiki-weaver runs the engine's SPAWN
+# path, which parses final text and never reads report_outcome tool-call args.
+# If the verdict-routing contract changes again, bump this to the new required
+# attractor-bundle commit at the same time.
+ATTRACTOR_ROUTING_FLOOR_SHA = "744efe668c01993505e3be417c270aa62c9474cb"
 _ATTRACTOR_REPO = "microsoft/amplifier-bundle-attractor"
 _ATTRACTOR_COMPARE_TIMEOUT = 4  # seconds; matches doctor's other network-probe timeouts
 
@@ -235,11 +243,14 @@ def local_layer2_commits() -> list[SourceRecord]:
 # Layer-2: attractor routing-contract compatibility floor
 # ---------------------------------------------------------------------------
 #
-# pipeline/synthesize.dot's assess node routes convergence via the
-# report_outcome tool. Older attractor-bundle commits let trailing model prose
-# override an explicit report_outcome call, silently breaking routing (an
-# infinite refine-loop to the max_drain_iters safety bound, with a generic,
-# non-diagnostic failure reason). This is a READ-ONLY diagnostic: it never
+# pipeline/synthesize.dot's assess node reports its verdict as a flat bare-JSON
+# final message (PR #41 in this repo; wiki-weaver runs the engine's spawn path,
+# which parses final text). For that routing to be fail-safe the engine must
+# include attractor PR #89 (transitively #88): without #89, loop_restart leaves
+# a stale preferred_label in context, so a converged verdict from one
+# cycle/source can leak into the next and silently false-converge it (or an
+# unresolved verdict degrades to a generic max_drain_iters failure with no
+# diagnostic cause). This is a READ-ONLY diagnostic: it never
 # touches resolve() or the @main clone/update mechanism, and it must degrade
 # gracefully (never crash, never block offline use of `doctor`).
 
@@ -251,8 +262,9 @@ class CompatFloorResult:
 
     ``ok`` is a tri-state, not a bool:
       True  = locally-resolved commit is at or beyond the floor (contract satisfied).
-      False = locally-resolved commit predates the floor \u2014 a REAL defect: report_outcome
-              tool calls may be silently overridden by trailing model prose.
+      False = locally-resolved commit predates the floor \u2014 a REAL defect: verdict
+              routing is not fail-safe (a stale preferred_label can leak across
+              loop_restart cycles and silently false-converge sources).
       None  = inconclusive (not yet cloned, or the GitHub compare API could not be
               reached/parsed, or the comparison diverged). Never a failure \u2014 this
               check must stay usable offline.
@@ -322,8 +334,11 @@ async def check_attractor_routing_floor() -> CompatFloorResult:
         return CompatFloorResult(
             False,
             f"resolved commit ({local_sha[:8]}) is BEHIND the required floor "
-            "\u2014 report_outcome tool-call routing may be silently overridden "
-            "by trailing model prose",
+            "\u2014 verdict routing is not fail-safe on this engine: a stale "
+            "verdict can leak across refine cycles and silently false-converge "
+            "sources; upgrade the attractor engine bundle "
+            "(amplifier-module-loop-pipeline) to a commit at or past "
+            f"{ATTRACTOR_ROUTING_FLOOR_SHA[:7]}",
         )
     # "diverged" or any unrecognized status: inconclusive, not a defect
     return CompatFloorResult(
