@@ -111,13 +111,15 @@ digraph ingest {
     // The unconditional fallback is the fail-safe direction -- more drain,
     // never premature done.
     //
-    // NOTE on condition value: the assess node in synthesize.dot calls the
-    // report_outcome tool (status="success", preferred_label="converged")
-    // when it converges -- NOT a raw-JSON final message. The report_outcome
-    // tool call is authoritative over any trailing text (backend.py checks
-    // it first), so a converged verdict reaches this edge reliably even if
-    // the model also emits closing prose. The engine propagates the tool
-    // call's preferred_label as the folder node's preferred_label, and
+    // NOTE on condition value: the assess node in synthesize.dot reports its
+    // verdict as a FLAT bare-JSON final message, e.g.
+    // {"status": "success", "preferred_label": "converged"}. wiki-weaver runs
+    // exclusively on the engine's spawn execution path, where the verdict is
+    // extracted by parsing the model's final text message (_parse_outcome,
+    // with last-{...} embedded-JSON recovery) -- report_outcome tool-call
+    // arguments are never captured on this path, so the final message is the
+    // ONLY channel that routes. The engine propagates the parsed
+    // preferred_label as the folder node's preferred_label, and
     // conditions.py _resolve_key("outcome") returns preferred_label if set,
     // falling back to status.value only when preferred_label is null.
     // Therefore the condition must match "converged" (the actual resolved
