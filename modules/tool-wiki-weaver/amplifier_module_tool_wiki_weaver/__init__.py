@@ -169,6 +169,11 @@ class WikiWeaverIngestTool:
         parts = [f"status={result.status}", f"converged={result.converged}"]
         if result.failure_reason:
             parts.append(f"failure_reason={result.failure_reason}")
+        # Run-level gate advisories (duplicate-page / claim-retention): fired
+        # but did NOT block. Surfaced here so an advisory-fired run is never
+        # indistinguishable from a clean one to the calling agent.
+        for advisory in result.advisories:
+            parts.append(f"advisory={advisory}")
         if result.notes:
             parts.append(f"notes={result.notes}")
         parts.append(f"logs_dir={result.logs_dir}")
