@@ -121,6 +121,28 @@ way afterward.
 
 `ask` is the single answer interface for a wiki — there is no separate `query` command.
 
+### Ingest exit codes + result.json (headless callers)
+
+Every `ingest` run (CLI `wiki-weaver ingest`, `schedule run-now`, and the
+library `ingest()` call) writes a machine-readable
+`<wiki>/.wiki/runs/ingest-<ts>/result.json` — verdict, per-source counts,
+gate advisories, enforce-mode gate blocks (with the gate NAMED), and engine
+errors — and prints an honest one-line headline (e.g.
+`ingest FAILED: 0/17 converged -- see result.json`). The exit code follows a
+documented contract (see `wiki_weaver/run_result.py`):
+
+| Exit | Verdict | Meaning |
+|---|---|---|
+| `0` | `converged` / `partial` | ≥1 source converged, no gate blocks, no errors (advisories allowed) |
+| `1` | `errored` | engine/infrastructure error |
+| `3` | `empty` | nothing to do (empty inbox, or only already-ingested duplicates) |
+| `4` | `blocked` | gate-blocked under `WIKI_WEAVER_ENFORCE_GATES=1` |
+| `5` | `failed` | sources were attempted but 0 converged (no gate/infra cause) |
+
+The load-bearing invariant: **0 converged with >0 attempted can never exit 0**
+— a fully failed or fully gate-blocked run is no longer distinguishable-only-
+by-log-archaeology from a healthy one.
+
 ## Corpus structure
 
 A wiki corpus separates **human-facing content** (lives at the corpus root) from **machine-only
