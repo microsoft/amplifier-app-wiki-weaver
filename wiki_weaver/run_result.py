@@ -17,6 +17,7 @@ tool/agent path; ``lib.ingest()`` single-file and drain paths):
 
        {
          "run_id": "ingest-20260721-113000",
+         "status": "final",               // see STATUS below
          "verdict": "failed",             // see VERDICTS below
          "counts": {"total": 17, "converged": 0, "failed": 17,
                     "blocked": 0, "errored": 0, "skipped": 0},
@@ -26,6 +27,28 @@ tool/agent path; ``lib.ingest()`` single-file and drain paths):
          "errored":   [{"reason": ...}, ...],
          "sources":   [{"name": ..., "status": ...}, ...]   // when known
        }
+
+   **status** (additive; existing consumers keep reading verdict/counts):
+
+   - ``"in_progress"`` -- the DRAIN path rewrites result.json (atomically:
+     tmp file + os.replace in the same dir) after EVERY source completes,
+     so a crash mid-drain leaves a machine-readable snapshot of everything
+     finished so far instead of stranding hours of work invisibly. The
+     mid-run ``verdict`` is the normal verdict rules applied to
+     counts-so-far.
+   - ``"final"`` -- the end-of-run write (all three wiring sites).
+   - ``"superseded"`` -- a crashed run's snapshot that a later drain on the
+     same wiki has adopted (see RESUME below); it also carries
+     ``"resumed_by": "<run_id>"``. Never counts as final.
+
+   **RESUME (crash-safe drain):** re-running the drain on the same wiki dir
+   is the resume path -- no flag needed. On start, the drain adopts any
+   ``status: "in_progress"`` result.json left under ``.wiki/runs/`` (only a
+   crashed run can leave one: the per-wiki ingest pidlock excludes live
+   concurrent ingests), folds its per-source records into the new run's
+   accumulation, and marks the old snapshot ``superseded`` so it can never
+   be double-adopted. The new run's result.json therefore reflects the
+   COMBINED drain state across the crash.
 
 2. **Verdict rules** -- THE load-bearing invariant: ``total > 0`` (sources
    were attempted) with ``converged == 0`` must NEVER produce verdict
@@ -61,6 +84,7 @@ flow).
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -184,6 +208,13 @@ def exit_code_for(verdict: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+# result.json lifecycle states (additive "status" field -- existing consumers
+# keep reading verdict/counts; see module docstring for the full semantics).
+STATUS_IN_PROGRESS = "in_progress"
+STATUS_FINAL = "final"
+STATUS_SUPERSEDED = "superseded"
+
+
 def build_result(
     run_id: str,
     counts: dict[str, int],
@@ -192,12 +223,20 @@ def build_result(
     blocked: list[dict[str, Any]] | None = None,
     errored: list[dict[str, Any]] | None = None,
     sources: list[dict[str, Any]] | None = None,
+    status: str = STATUS_FINAL,
 ) -> dict[str, Any]:
-    """Assemble the result.json payload (verdict derived, never passed in)."""
+    """Assemble the result.json payload (verdict derived, never passed in).
+
+    ``status`` defaults to ``"final"`` so every existing end-of-run wiring
+    site gains the field without changes; the drain's mid-run checkpoints
+    pass ``"in_progress"``. The verdict is always the normal verdict rules
+    applied to whatever counts are given (counts-so-far mid-run).
+    """
     blocked = blocked or []
     errored = errored or []
     result: dict[str, Any] = {
         "run_id": run_id,
+        "status": status,
         "verdict": compute_verdict(counts, blocked, errored),
         "counts": counts,
         "advisories": list(advisories or []),
@@ -210,7 +249,12 @@ def build_result(
 
 
 def write_result_json(run_dir: Path, result: dict[str, Any]) -> Path | None:
-    """Write ``<run_dir>/result.json``. FAIL-SOFT: never raises.
+    """Write ``<run_dir>/result.json`` ATOMICALLY. FAIL-SOFT: never raises.
+
+    Atomic by tmp-file-in-same-dir + ``os.replace``: the drain rewrites this
+    file after every source, so a reader (or a SIGKILL) mid-write must never
+    be able to observe a torn/partial JSON document -- it sees either the
+    previous complete snapshot or the new one.
 
     An observability write failure logs a loud warning and returns ``None``;
     it must never break (or change the outcome of) the run itself.
@@ -218,9 +262,11 @@ def write_result_json(run_dir: Path, result: dict[str, Any]) -> Path | None:
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
         path = run_dir / "result.json"
-        path.write_text(
+        tmp = run_dir / ".result.json.tmp"
+        tmp.write_text(
             json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8"
         )
+        os.replace(tmp, path)
         return path
     except Exception as e:  # noqa: BLE001 -- fail-soft by contract (see docstring)
         print(
@@ -229,6 +275,74 @@ def write_result_json(run_dir: Path, result: dict[str, Any]) -> Path | None:
             flush=True,
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe drain resume (see RESUME in the module docstring)
+# ---------------------------------------------------------------------------
+
+
+def find_interrupted_runs(
+    runs_dir: Path, *, exclude_run_id: str | None = None
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Find crashed-run snapshots: ``ingest-*/result.json`` with status in_progress.
+
+    Only a crashed run can leave one behind -- every live ingest holds the
+    per-wiki pidlock, and every non-crash exit path finalizes its result.json
+    (status ``final``). Returned oldest-first (run dirs are timestamp-named).
+    Unreadable/unparseable files are skipped (fail-soft: resume is an
+    observability nicety, never a reason to refuse a drain).
+    """
+    found: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        candidates = sorted(runs_dir.glob("ingest-*/result.json"))
+    except OSError:
+        return found
+    for path in candidates:
+        if exclude_run_id is not None and path.parent.name == exclude_run_id:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("status") == STATUS_IN_PROGRESS:
+            found.append((path.parent, data))
+    return found
+
+
+def mark_superseded(run_dir: Path, result: dict[str, Any], resumed_by: str) -> None:
+    """Flip an adopted crashed-run snapshot to status superseded (fail-soft).
+
+    Prevents double-adoption: the NEW run's own (already-written) snapshot now
+    carries these records, so the old snapshot must never be adopted again.
+    ``resumed_by`` records the adopting run's id for the audit trail.
+    """
+    updated = dict(result)
+    updated["status"] = STATUS_SUPERSEDED
+    updated["resumed_by"] = resumed_by
+    write_result_json(run_dir, updated)
+
+
+def merge_source_records(
+    base: list[dict[str, Any]], updates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge per-source records by name -- the resume's combined-state rule.
+
+    ``base`` is the adopted pre-crash records; ``updates`` this run's own.
+    Later records for the same source name replace earlier ones (a real
+    re-attempt's disposition wins), with ONE exception: a ``skipped`` record
+    never overwrites an existing one. ``skipped`` means "the ledger already
+    has this source" -- the ledger-wins rule -- so the pre-crash record that
+    put it in the ledger (e.g. ``converged``) is the informative one.
+    Insertion order is preserved.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for rec in [*base, *updates]:
+        name = str(rec.get("name", ""))
+        if name in merged and rec.get("status") == "skipped":
+            continue
+        merged[name] = rec
+    return list(merged.values())
 
 
 def _first_reason(records: list[dict[str, Any]], limit: int = 200) -> str:
