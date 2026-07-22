@@ -222,6 +222,7 @@ def build_result(
     advisories: list[str] | None = None,
     blocked: list[dict[str, Any]] | None = None,
     errored: list[dict[str, Any]] | None = None,
+    failed: list[dict[str, Any]] | None = None,
     sources: list[dict[str, Any]] | None = None,
     status: str = STATUS_FINAL,
 ) -> dict[str, Any]:
@@ -231,6 +232,18 @@ def build_result(
     site gains the field without changes; the drain's mid-run checkpoints
     pass ``"in_progress"``. The verdict is always the normal verdict rules
     applied to whatever counts are given (counts-so-far mid-run).
+
+    ``failed`` (additive, may be empty) carries per-source detail for sources
+    quarantined to ``.wiki/failed/``: ``{"source": ..., "reason": ...,
+    "failure_kind": "no_verdict" | "judged_non_converged" | "unknown"}``.
+    ``failure_kind`` answers ONE question -- was a convergence verdict ever
+    rendered for the final cycle? ``no_verdict`` = the assess step never
+    rendered one (e.g. it exhausted its child-session tool budget
+    mid-verification -- the 2026-07 incident where 4/25 sources were
+    quarantined invisibly); ``judged_non_converged`` = assess DID render
+    refine verdicts and the cycle budget ran out; ``unknown`` = the question
+    was not (or could not be) evaluated for this record. It never affects
+    the verdict or counts -- observability only.
     """
     blocked = blocked or []
     errored = errored or []
@@ -242,6 +255,7 @@ def build_result(
         "advisories": list(advisories or []),
         "blocked": blocked,
         "errored": errored,
+        "failed": list(failed or []),
     }
     if sources is not None:
         result["sources"] = sources

@@ -117,6 +117,19 @@ def wiki_policy_dir(wiki: Path) -> Path:
     return wiki / WIKI_DIR / "policy"
 
 
+def touched_manifest_path(wiki: Path) -> Path:
+    """Return the touched-pages manifest path: ``<wiki>/.ai/touched-pages.txt``.
+
+    Written (overwritten) by the ingest node each synthesize cycle with one
+    wiki-relative page path per line for every page it created/modified; read
+    by the assess node as its bounded verification work-list. Scratch state
+    (like ``.ai/feedback/``), NOT process state. Deleted deterministically
+    before each source's synthesis (run_inner / ingest_setup) so a stale
+    manifest from a previous source can never scope-poison the next assess.
+    """
+    return wiki / ".ai" / "touched-pages.txt"
+
+
 def _ok(msg: str) -> None:
     print(f"{GREEN}\u2713{RESET} {msg}")
 
@@ -318,12 +331,103 @@ def _read_ledger(wiki: Path) -> list[dict]:
 
 
 def _processed_sources(wiki: Path) -> set[str]:
-    return {row.get("source", "") for row in _read_ledger(wiki)}
+    """Sources the wiki has SUCCESSFULLY ingested (converged ledger rows only).
+
+    The ledger now also records FAILED sources (status "failed",
+    converged false -- written when a source is quarantined to
+    ``.wiki/failed/``). Those rows must NOT mark a source as processed:
+    the documented retry path is "review, fix, and re-drop into _inbox/",
+    and a failed row counting as processed would silently skip the retry.
+    """
+    return {row.get("source", "") for row in _read_ledger(wiki) if row.get("converged")}
 
 
 def _append_ledger(wiki: Path, entry: dict) -> None:
     with wiki_ledger(wiki).open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+# Failure-kind vocabulary for quarantined sources (ledger ``failure_kind``
+# field + result.json ``failed[]`` entries). Answers ONE question -- was a
+# convergence verdict rendered for the final synthesis cycle?
+#   no_verdict           -- assess never rendered one (e.g. the child session
+#                           exhausted its tool budget mid-verification: the
+#                           2026-07 incident where 4/25 sources hit the 50-call
+#                           ceiling and were quarantined invisibly).
+#   judged_non_converged -- assess DID render verdict(s) (refine) and the
+#                           cycle budget ran out.
+#   unknown              -- the question was not / could not be evaluated.
+FAILURE_KIND_NO_VERDICT = "no_verdict"
+FAILURE_KIND_JUDGED = "judged_non_converged"
+FAILURE_KIND_UNKNOWN = "unknown"
+
+
+def classify_failure_kind(wiki: Path, started_at: float | None) -> str:
+    """Classify a non-convergence quarantine from fail-path artifacts.
+
+    PRAGMATIC HEURISTIC (wiki-weaver can only observe the filesystem; it
+    cannot see inside the engine): the assess node writes
+    ``<wiki>/.ai/assessment.md`` BEFORE rendering its verdict, so an
+    assessment file modified during THIS source's synthesis window proves a
+    verdict-rendering assess ran (=> ``judged_non_converged``); an absent or
+    stale file (mtime older than ``started_at`` -- i.e. left over from a
+    PREVIOUS source, since ``.ai/`` is shared scratch state) means no verdict
+    was ever rendered for this source (=> ``no_verdict``). Without a
+    ``started_at`` reference the question is undecidable (=> ``unknown``).
+    """
+    if started_at is None:
+        return FAILURE_KIND_UNKNOWN
+    assessment = wiki / ".ai" / "assessment.md"
+    try:
+        if not assessment.is_file():
+            return FAILURE_KIND_NO_VERDICT
+        if assessment.stat().st_mtime >= started_at:
+            return FAILURE_KIND_JUDGED
+        return FAILURE_KIND_NO_VERDICT
+    except OSError:
+        return FAILURE_KIND_UNKNOWN
+
+
+def _append_failure_ledger(
+    wiki: Path,
+    *,
+    source: str,
+    source_id: int | str,
+    file_hash: str,
+    failed_to: str,
+    reason: str,
+    failure_kind: str,
+    logs_dir: str = "",
+) -> None:
+    """Append a FAILURE record to the ledger -- symmetrical with the success
+    record -- whenever a source is quarantined to ``.wiki/failed/``.
+
+    Fixes the incident where quarantined sources were INVISIBLE in
+    ``.wiki/.processed.jsonl`` (the ledger recorded only successes).
+    FAIL-SOFT: the quarantine move is the load-bearing act; a failed
+    observability write must never break the drain.
+    """
+    entry = {
+        "source": source,
+        "source_id": source_id,
+        "hash": file_hash,
+        "status": "failed",
+        "converged": False,
+        "failed_to": failed_to,
+        "reason": reason,
+        "failure_kind": failure_kind,
+        "logs_dir": logs_dir,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        _append_ledger(wiki, entry)
+    except OSError as e:
+        print(
+            f"! WARNING: could not append failure record to ledger for "
+            f"{source} ({type(e).__name__}: {e}) -- quarantine is unaffected",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +838,7 @@ def _finish_ingest_run(
     advisories: list[str],
     blocked: list[dict],
     errored: list[dict],
+    failed: list[dict] | None = None,
 ) -> int:
     """End-of-run contract for BOTH ingest paths (single-file + drain).
 
@@ -753,6 +858,7 @@ def _finish_ingest_run(
         advisories=advisories,
         blocked=blocked,
         errored=errored,
+        failed=failed,
         sources=[{"name": n, "status": s} for n, s in summary],
     )
     return finish_run(run_dir, result)
@@ -760,7 +866,7 @@ def _finish_ingest_run(
 
 def _adopt_interrupted_runs(
     wiki: Path, run_dir: Path, run_id: str
-) -> tuple[list[tuple[str, str]], list[str], list[dict], list[dict]]:
+) -> tuple[list[tuple[str, str]], list[str], list[dict], list[dict], list[dict]]:
     """Crash-safe drain resume: adopt crashed runs' ``in_progress`` snapshots.
 
     Re-running the drain on the same wiki dir IS the resume path (no flag).
@@ -782,8 +888,8 @@ def _adopt_interrupted_runs(
     we crash between the two writes, the next resume adopts both snapshots
     and the by-name merge dedupes -- never double-counts.
 
-    Returns ``(sources, advisories, blocked, errored)`` seed lists (all
-    empty in the common no-crash case). Fail-soft throughout: resume is
+    Returns ``(sources, advisories, blocked, errored, failed)`` seed lists
+    (all empty in the common no-crash case). Fail-soft throughout: resume is
     built entirely from fail-soft run_result primitives and can never make
     a drain refuse to run.
     """
@@ -799,12 +905,13 @@ def _adopt_interrupted_runs(
 
     interrupted = find_interrupted_runs(wiki_runs(wiki), exclude_run_id=run_id)
     if not interrupted:
-        return [], [], [], []
+        return [], [], [], [], []
 
     merged: list[dict] = []
     advisories: list[str] = []
     blocked: list[dict] = []
     errored: list[dict] = []
+    failed: list[dict] = []
     for _crashed_dir, result in interrupted:
         merged = merge_source_records(merged, list(result.get("sources") or []))
         for adv in result.get("advisories") or []:
@@ -812,6 +919,7 @@ def _adopt_interrupted_runs(
                 advisories.append(adv)
         blocked.extend(result.get("blocked") or [])
         errored.extend(result.get("errored") or [])
+        failed.extend(result.get("failed") or [])
 
     sources = [(str(r.get("name", "")), str(r.get("status", ""))) for r in merged]
     _warn(
@@ -827,13 +935,14 @@ def _adopt_interrupted_runs(
             advisories=advisories,
             blocked=blocked,
             errored=errored,
+            failed=failed,
             sources=[{"name": n, "status": s} for n, s in sources],
             status=STATUS_IN_PROGRESS,
         ),
     )
     for crashed_dir, result in interrupted:
         mark_superseded(crashed_dir, result, resumed_by=run_id)
-    return sources, advisories, blocked, errored
+    return sources, advisories, blocked, errored, failed
 
 
 @dataclass
@@ -1237,6 +1346,7 @@ def ingest(
         seed_advisories,
         seed_blocked,
         seed_errored,
+        seed_failed,
     ) = _adopt_interrupted_runs(wiki, run_dir, run_id)
 
     # Warn + bail early if inbox is empty (preserves original UX; lazy import).
@@ -1254,6 +1364,7 @@ def ingest(
                 seed_advisories,
                 seed_blocked,
                 seed_errored,
+                failed=seed_failed,
             )
         _warn(f"no sources to ingest (inbox empty: {inbox})")
         # Distinct nothing-to-do outcome (verdict "empty", exit 3): a headless
@@ -1278,6 +1389,10 @@ def ingest(
     # errored carries engine/infra reasons.
     blocked_drain: list[dict] = []
     errored_drain: list[dict] = []
+    # Per-source failure detail for result.json's failed[] -- one record per
+    # source quarantined to .wiki/failed/ this run, mirroring the ledger
+    # failure records ({source, reason, failure_kind}).
+    failed_drain: list[dict] = []
 
     from wiki_weaver.run_result import (
         STATUS_IN_PROGRESS,
@@ -1288,7 +1403,7 @@ def ingest(
     )
 
     def _combined_state() -> tuple[
-        list[tuple[str, str]], list[str], list[dict], list[dict]
+        list[tuple[str, str]], list[str], list[dict], list[dict], list[dict]
     ]:
         """COMBINED drain state: adopted pre-crash seed + this run's own work.
 
@@ -1312,6 +1427,7 @@ def ingest(
             advisories_all,
             [*seed_blocked, *blocked_drain],
             [*seed_errored, *errored_drain],
+            [*seed_failed, *failed_drain],
         )
 
     def _checkpoint() -> None:
@@ -1322,7 +1438,7 @@ def ingest(
         instead of stranding hours of completed work invisibly. The mid-run
         verdict is the normal verdict rules applied to counts-so-far.
         """
-        s, a, b, e = _combined_state()
+        s, a, b, e, f = _combined_state()
         write_result_json(
             run_dir,
             build_result(
@@ -1331,6 +1447,7 @@ def ingest(
                 advisories=a,
                 blocked=b,
                 errored=e,
+                failed=f,
                 sources=[{"name": n, "status": st} for n, st in s],
                 status=STATUS_IN_PROGRESS,
             ),
@@ -1390,7 +1507,23 @@ def ingest(
                     f"{src.name}: unsupported binary source (no text handler)"
                     " — routing to _failed/"
                 )
-                _collision_safe_move(src, failed_dir)
+                dest_f = _collision_safe_move(src, failed_dir)
+                _append_failure_ledger(
+                    wiki,
+                    source=src.name,
+                    source_id="",
+                    file_hash="",
+                    failed_to=str(dest_f),
+                    reason="unsupported binary source (no text handler)",
+                    failure_kind=FAILURE_KIND_UNKNOWN,
+                )
+                failed_drain.append(
+                    {
+                        "source": src.name,
+                        "reason": "unsupported binary source (no text handler)",
+                        "failure_kind": FAILURE_KIND_UNKNOWN,
+                    }
+                )
                 summary_drain.append((src.name, "binary"))
                 _checkpoint()
                 continue
@@ -1463,6 +1596,11 @@ def ingest(
             snapshot_pages(wiki, retention_snapshot_dir)
 
             try:
+                # Synthesis start time: the failure-kind classifier compares
+                # .ai/assessment.md's mtime against this to tell "assess
+                # rendered a verdict during THIS source's synthesis" from
+                # "no verdict was ever rendered" (see classify_failure_kind).
+                synth_started = time.time()
                 try:
                     result = run_inner(
                         src, wiki, max_cycles=max_cycles, source_id=source_id
@@ -1470,7 +1608,24 @@ def ingest(
                 except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
                     _fail(f"engine error on {name}: {type(e).__name__}: {e}")
                     if src.is_file() and src.parent == inbox:
-                        _collision_safe_move(src, failed_dir)
+                        dest_f = _collision_safe_move(src, failed_dir)
+                        reason = f"engine error: {type(e).__name__}: {e}"
+                        _append_failure_ledger(
+                            wiki,
+                            source=name,
+                            source_id=source_id,
+                            file_hash=file_hash,
+                            failed_to=str(dest_f),
+                            reason=reason,
+                            failure_kind=FAILURE_KIND_UNKNOWN,
+                        )
+                        failed_drain.append(
+                            {
+                                "source": name,
+                                "reason": reason,
+                                "failure_kind": FAILURE_KIND_UNKNOWN,
+                            }
+                        )
                     summary_drain.append((name, "error"))
                     errored_drain.append(
                         {"reason": f"engine error on {name}: {type(e).__name__}: {e}"}
@@ -1488,7 +1643,28 @@ def ingest(
                     for v in violations:
                         _fail(f"    - {v}")
                     if src.is_file() and src.parent == inbox:
-                        _collision_safe_move(src, failed_dir)
+                        dest_f = _collision_safe_move(src, failed_dir)
+                        reason = (
+                            "tamper detected: the ingest agent wrote process "
+                            "state it does not own (fabricated records reverted)"
+                        )
+                        _append_failure_ledger(
+                            wiki,
+                            source=name,
+                            source_id=source_id,
+                            file_hash=file_hash,
+                            failed_to=str(dest_f),
+                            reason=reason,
+                            failure_kind=FAILURE_KIND_UNKNOWN,
+                            logs_dir=str(result.logs_dir),
+                        )
+                        failed_drain.append(
+                            {
+                                "source": name,
+                                "reason": reason,
+                                "failure_kind": FAILURE_KIND_UNKNOWN,
+                            }
+                        )
                     summary_drain.append((name, "tampered"))
                     continue
 
@@ -1509,7 +1685,25 @@ def ingest(
                         if gates_enforced():
                             _fail(f"{name}: {retention_decision.message}")
                             if src.is_file() and src.parent == inbox:
-                                _collision_safe_move(src, failed_dir)
+                                dest_f = _collision_safe_move(src, failed_dir)
+                                reason = f"claim-retention gate: {retention_decision.message}"
+                                _append_failure_ledger(
+                                    wiki,
+                                    source=name,
+                                    source_id=source_id,
+                                    file_hash=file_hash,
+                                    failed_to=str(dest_f),
+                                    reason=reason,
+                                    failure_kind=FAILURE_KIND_UNKNOWN,
+                                    logs_dir=str(result.logs_dir),
+                                )
+                                failed_drain.append(
+                                    {
+                                        "source": name,
+                                        "reason": reason,
+                                        "failure_kind": FAILURE_KIND_UNKNOWN,
+                                    }
+                                )
                             summary_drain.append((name, "retention-blocked"))
                             # Structured record: the GATE is named (mislabel fix
                             # -- never a generic error line).
@@ -1542,7 +1736,28 @@ def ingest(
                                 f"duplicate(s) detected: {', '.join(dup_pages)}"
                             )
                             if src.is_file() and src.parent == inbox:
-                                _collision_safe_move(src, failed_dir)
+                                dest_f = _collision_safe_move(src, failed_dir)
+                                reason = (
+                                    "duplicate-page gate: merge-fragment "
+                                    f"duplicate(s) detected: {', '.join(dup_pages)}"
+                                )
+                                _append_failure_ledger(
+                                    wiki,
+                                    source=name,
+                                    source_id=source_id,
+                                    file_hash=file_hash,
+                                    failed_to=str(dest_f),
+                                    reason=reason,
+                                    failure_kind=FAILURE_KIND_UNKNOWN,
+                                    logs_dir=str(result.logs_dir),
+                                )
+                                failed_drain.append(
+                                    {
+                                        "source": name,
+                                        "reason": reason,
+                                        "failure_kind": FAILURE_KIND_UNKNOWN,
+                                    }
+                                )
                             summary_drain.append((name, "duplicate-blocked"))
                             # Structured record: the GATE is named (mislabel fix
                             # -- never a generic error line).
@@ -1594,7 +1809,32 @@ def ingest(
                         f"(status={result.status}, reason={result.failure_reason})"
                     )
                     if src.is_file() and src.parent == inbox:
-                        _collision_safe_move(src, failed_dir)
+                        dest_f = _collision_safe_move(src, failed_dir)
+                        reason = (
+                            f"did not converge (status={result.status}, "
+                            f"reason={result.failure_reason})"
+                        )
+                        # Distinguish "assess never rendered a verdict" from
+                        # "assess judged it non-converged" -- see
+                        # classify_failure_kind for the heuristic.
+                        kind = classify_failure_kind(wiki, synth_started)
+                        _append_failure_ledger(
+                            wiki,
+                            source=name,
+                            source_id=source_id,
+                            file_hash=file_hash,
+                            failed_to=str(dest_f),
+                            reason=reason,
+                            failure_kind=kind,
+                            logs_dir=str(result.logs_dir),
+                        )
+                        failed_drain.append(
+                            {
+                                "source": name,
+                                "reason": reason,
+                                "failure_kind": kind,
+                            }
+                        )
                     summary_drain.append((name, "not-converged"))
                     # Drain mode: always continue (never halt on non-convergence).
             finally:

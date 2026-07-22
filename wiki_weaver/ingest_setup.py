@@ -79,6 +79,7 @@ def main() -> int:
         _looks_like_text,
         _processed_sources,
         _snapshot_process_state,
+        touched_manifest_path,
     )
     from wiki_weaver.policy import load_policy
 
@@ -117,6 +118,15 @@ def main() -> int:
     # direct-path case, so synthesize.dot sees identical context regardless
     # of whether it is invoked directly or as a folder sub-pipeline.
     validation_report = wiki_dir / ".ai" / "validation.md"
+
+    # Touched-pages manifest: assess's bounded verification work-list (one
+    # wiki-relative page path per line, OVERWRITTEN by the ingest node each
+    # cycle). Delete any stale manifest from a PREVIOUS source now -- .ai/ is
+    # shared wiki-level scratch state, so without this reset assess could
+    # scope its verification to the prior source's page list.
+    touched_manifest = touched_manifest_path(wiki_dir)
+    touched_manifest.unlink(missing_ok=True)
+
     validate_cmd = (
         f"{shlex.quote(sys.executable)} {shlex.quote(str(VALIDATE_PY))}"
         f" {shlex.quote(str(wiki_dir))} --out {shlex.quote(str(validation_report))}"
@@ -148,9 +158,22 @@ def main() -> int:
         f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_ARCHIVE_PY))}"
         f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(src))} {shlex.quote(str(source_id))}"
     )
+    # fail_cmd carries two extra args beyond wiki_dir/source_path (both
+    # optional on ingest_fail.py's side, for backward compatibility):
+    #   source_id    -- so the ledger failure record is symmetrical with the
+    #                   success record ingest_archive.py writes.
+    #   started_at   -- synthesis start time (unix seconds). ingest_fail.py
+    #                   compares .ai/assessment.md's mtime against it to
+    #                   classify the failure kind: assessment written DURING
+    #                   this source's synthesis => judged_non_converged;
+    #                   absent/stale => no_verdict (the assess step never
+    #                   rendered a verdict -- e.g. it exhausted its child-
+    #                   session tool budget mid-verification).
+    started_at = time.time()
     fail_cmd = (
         f"{shlex.quote(sys.executable)} {shlex.quote(str(INGEST_FAIL_PY))}"
         f" {shlex.quote(str(wiki_dir))} {shlex.quote(str(src))}"
+        f" {shlex.quote(str(source_id))} {shlex.quote(f'{started_at:.3f}')}"
     )
 
     # Snapshot process state BEFORE synthesis so the tamper-check node can
@@ -188,6 +211,7 @@ def main() -> int:
         "footnotes_cmd": footnotes_cmd,
         "normalize_unicode_cmd": normalize_unicode_cmd,
         "validate_cmd": validate_cmd,
+        "touched_manifest": str(touched_manifest),
         "archive_cmd": archive_cmd,
         "fail_cmd": fail_cmd,
         "tamper_check_cmd": tamper_check_cmd,

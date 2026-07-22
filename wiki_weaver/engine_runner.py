@@ -39,6 +39,7 @@ from amplifier_module_pipeline_runner import run_pipeline
 
 from ._assets import pipeline_dir
 from .lib import (
+    touched_manifest_path,
     wiki_failed,
     wiki_ledger,
     wiki_policy_dir,
@@ -376,6 +377,14 @@ def build_dot(
     # (PIPELINE_DESIGN.md §4). Dotted context keys are silently dropped in
     # box-node prompts, so a file is the reliable hand-off channel.
     validation_report = wiki_dir / ".ai" / "validation.md"
+    # Touched-pages manifest: ingest OVERWRITES it each cycle with the pages it
+    # created/modified; assess verifies EXACTLY those pages (bounded work-list)
+    # instead of open-ended wiki-wide re-verification. Root-cost fix for the
+    # 2026-07 incident where assess burned its whole child-session tool budget
+    # (max_tool_rounds_per_input=50, set in attractor-pipeline.yaml's agents
+    # block -- NOT settable per-node from wiki-weaver) re-verifying a 48-page
+    # wiki and never rendered a verdict, falsely quarantining 4/25 sources.
+    touched_manifest = touched_manifest_path(wiki_dir)
     validate_cmd = (
         f"{sys.executable} {VALIDATE_PY} {wiki_dir} --out {validation_report}"
     )
@@ -405,6 +414,7 @@ def build_dot(
         "$footnotes_cmd": footnotes_cmd,
         "$normalize_unicode_cmd": normalize_unicode_cmd,
         "$validate_cmd": validate_cmd,
+        "$touched_manifest": str(touched_manifest),
         "$max_cycles": str(policy.max_cycles),
         "$source_id": str(source_id),
     }
@@ -1082,6 +1092,12 @@ def run_inner(
     dot_source = build_dot(source_path, wiki_dir, policy, source_id=source_id)
     (logs_dir / "inner.dot").write_text(dot_source, encoding="utf-8")
 
+    # Delete any stale touched-pages manifest from a PREVIOUS source before
+    # this source's synthesis starts. .ai/ is shared wiki-level scratch state,
+    # so without this reset the assess node could scope its verification to
+    # the prior source's page list (scope poisoning). Missing file is fine.
+    touched_manifest_path(wiki_dir).unlink(missing_ok=True)
+
     result = _run_coro(
         run_pipeline(
             dot_source,
@@ -1268,9 +1284,15 @@ def run_ingest(
     # be derived afterwards. ingest.dot archives converged sources itself (one
     # ledger line each, via ingest_archive.py) and quarantines non-converged
     # ones to .wiki/failed/ (via ingest_fail.py) -- the deltas ARE the counts.
+    from wiki_weaver.lib import _read_ledger
     from wiki_weaver.run_result import build_result, summary_line, write_result_json
 
-    ledger_before = _count_ledger_lines(wiki_ledger(wiki_dir))
+    # Row-count snapshot (not raw line count): the ledger now records FAILED
+    # sources too (status "failed", converged false -- appended by
+    # ingest_fail.py when it quarantines a source to .wiki/failed/), so the
+    # per-status delta must be derived from parsed rows, never from a blind
+    # line-count that would read a failure record as a convergence.
+    ledger_rows_before = len(_read_ledger(wiki_dir))
     failed_before = _count_visible_files(wiki_failed(wiki_dir))
     # Structured enforce-mode gate blocks / engine errors for result.json --
     # the fix for the incident where a gate block surfaced as a generic
@@ -1282,12 +1304,27 @@ def run_ingest(
     def _emit_result() -> None:
         """Write result.json + echo the honest headline. FAIL-SOFT throughout."""
         try:
-            converged_count = max(
-                0, _count_ledger_lines(wiki_ledger(wiki_dir)) - ledger_before
-            )
+            # Parse the ledger rows appended during THIS run. Converged rows
+            # (converged truthy) are the convergence count; failed rows carry
+            # the per-source reason + failure_kind for result.json's failed[].
+            new_rows = _read_ledger(wiki_dir)[ledger_rows_before:]
+            converged_count = sum(1 for r in new_rows if r.get("converged"))
+            # The failed COUNT stays anchored on the quarantine dir delta (the
+            # file move is the ground truth; the ledger append is fail-soft
+            # and could be missing), while the failed DETAIL records come from
+            # the ledger rows, which carry reason + failure_kind.
             failed_count = max(
                 0, _count_visible_files(wiki_failed(wiki_dir)) - failed_before
             )
+            failed_records = [
+                {
+                    "source": r.get("source", ""),
+                    "reason": r.get("reason", ""),
+                    "failure_kind": r.get("failure_kind", "unknown"),
+                }
+                for r in new_rows
+                if not r.get("converged")
+            ]
             counts = {
                 "total": converged_count + failed_count,
                 "converged": converged_count,
@@ -1302,6 +1339,7 @@ def run_ingest(
                 advisories=advisories,
                 blocked=blocked_records,
                 errored=errored_records,
+                failed=failed_records,
             )
             path = write_result_json(logs_dir, run_result)
             print(summary_line(run_result), flush=True)
