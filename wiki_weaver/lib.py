@@ -758,6 +758,84 @@ def _finish_ingest_run(
     return finish_run(run_dir, result)
 
 
+def _adopt_interrupted_runs(
+    wiki: Path, run_dir: Path, run_id: str
+) -> tuple[list[tuple[str, str]], list[str], list[dict], list[dict]]:
+    """Crash-safe drain resume: adopt crashed runs' ``in_progress`` snapshots.
+
+    Re-running the drain on the same wiki dir IS the resume path (no flag).
+    A crashed drain leaves ``<run>/result.json`` with ``status: in_progress``
+    (the drain rewrites it after every source); nothing else can -- every
+    live ingest holds the per-wiki pidlock and every non-crash exit
+    finalizes its result. So at drain start we fold those snapshots'
+    per-source records into this run's accumulation, making this run's
+    result.json reflect the COMBINED drain state across the crash.
+
+    WHY the snapshot and not the ledger: the ledger records only CONVERGED
+    sources and spans the wiki's whole history, so it cannot distinguish
+    "this interrupted drain's completions" from years of prior ingests, and
+    it forgets failed/blocked dispositions entirely. The in_progress
+    snapshot is exactly the durable per-drain state we need.
+
+    Durability ordering: persist OUR seeded ``in_progress`` snapshot FIRST,
+    then flip the crashed ones to ``superseded`` (never double-adopted). If
+    we crash between the two writes, the next resume adopts both snapshots
+    and the by-name merge dedupes -- never double-counts.
+
+    Returns ``(sources, advisories, blocked, errored)`` seed lists (all
+    empty in the common no-crash case). Fail-soft throughout: resume is
+    built entirely from fail-soft run_result primitives and can never make
+    a drain refuse to run.
+    """
+    from wiki_weaver.run_result import (
+        STATUS_IN_PROGRESS,
+        build_result,
+        counts_from_statuses,
+        find_interrupted_runs,
+        mark_superseded,
+        merge_source_records,
+        write_result_json,
+    )
+
+    interrupted = find_interrupted_runs(wiki_runs(wiki), exclude_run_id=run_id)
+    if not interrupted:
+        return [], [], [], []
+
+    merged: list[dict] = []
+    advisories: list[str] = []
+    blocked: list[dict] = []
+    errored: list[dict] = []
+    for _crashed_dir, result in interrupted:
+        merged = merge_source_records(merged, list(result.get("sources") or []))
+        for adv in result.get("advisories") or []:
+            if adv not in advisories:
+                advisories.append(adv)
+        blocked.extend(result.get("blocked") or [])
+        errored.extend(result.get("errored") or [])
+
+    sources = [(str(r.get("name", "")), str(r.get("status", ""))) for r in merged]
+    _warn(
+        f"resuming after interrupted drain: adopted {len(sources)} completed "
+        f"source record(s) from crashed run(s): "
+        + ", ".join(d.name for d, _ in interrupted)
+    )
+    write_result_json(
+        run_dir,
+        build_result(
+            run_id,
+            counts_from_statuses(s for _, s in sources),
+            advisories=advisories,
+            blocked=blocked,
+            errored=errored,
+            sources=[{"name": n, "status": s} for n, s in sources],
+            status=STATUS_IN_PROGRESS,
+        ),
+    )
+    for crashed_dir, result in interrupted:
+        mark_superseded(crashed_dir, result, resumed_by=run_id)
+    return sources, advisories, blocked, errored
+
+
 @dataclass
 class DrainReport:
     """Opt-in out-channel for the drain's ``--limit`` cap-hit signal.
@@ -1150,10 +1228,33 @@ def ingest(
     # no longer controls early-exit here; exit code is set after the drain.   #
     # ---------------------------------------------------------------------- #
 
+    # Crash-safe resume (drain path only): adopt any crashed drain's
+    # in_progress result.json so this run's result reflects the COMBINED
+    # state. Re-running the same ingest command IS the resume -- no flag.
+    # All-empty in the common no-crash case. See _adopt_interrupted_runs.
+    (
+        seed_sources,
+        seed_advisories,
+        seed_blocked,
+        seed_errored,
+    ) = _adopt_interrupted_runs(wiki, run_dir, run_id)
+
     # Warn + bail early if inbox is empty (preserves original UX; lazy import).
     if not any(
         p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
     ):
+        if seed_sources:
+            # A crashed drain completed every inbox source before dying
+            # (e.g. during the final re-weave): finalize the adopted
+            # combined state instead of forgetting it behind "empty".
+            return _finish_ingest_run(
+                run_dir,
+                run_id,
+                seed_sources,
+                seed_advisories,
+                seed_blocked,
+                seed_errored,
+            )
         _warn(f"no sources to ingest (inbox empty: {inbox})")
         # Distinct nothing-to-do outcome (verdict "empty", exit 3): a headless
         # caller must be able to tell "no work" from "work succeeded".
@@ -1177,6 +1278,63 @@ def ingest(
     # errored carries engine/infra reasons.
     blocked_drain: list[dict] = []
     errored_drain: list[dict] = []
+
+    from wiki_weaver.run_result import (
+        STATUS_IN_PROGRESS,
+        build_result,
+        counts_from_statuses,
+        merge_source_records,
+        write_result_json,
+    )
+
+    def _combined_state() -> tuple[
+        list[tuple[str, str]], list[str], list[dict], list[dict]
+    ]:
+        """COMBINED drain state: adopted pre-crash seed + this run's own work.
+
+        Per-source records merge by name (see merge_source_records for the
+        ledger-wins "skipped never overwrites" rule); advisories dedupe
+        preserving order; blocked/errored records concatenate. All seed
+        lists are empty in the common no-crash case, so this reduces to
+        exactly the pre-resume behavior.
+        """
+        merged = merge_source_records(
+            [{"name": n, "status": s} for n, s in seed_sources],
+            [{"name": n, "status": s} for n, s in summary_drain],
+        )
+        merged_tuples = [(str(r["name"]), str(r["status"])) for r in merged]
+        advisories_all = list(seed_advisories)
+        for adv in advisories_drain:
+            if adv not in advisories_all:
+                advisories_all.append(adv)
+        return (
+            merged_tuples,
+            advisories_all,
+            [*seed_blocked, *blocked_drain],
+            [*seed_errored, *errored_drain],
+        )
+
+    def _checkpoint() -> None:
+        """Durability contract: rewrite result.json after EVERY source.
+
+        Atomic (tmp + os.replace inside write_result_json) and fail-soft --
+        a crash mid-drain now leaves ``status: in_progress`` counts-so-far
+        instead of stranding hours of completed work invisibly. The mid-run
+        verdict is the normal verdict rules applied to counts-so-far.
+        """
+        s, a, b, e = _combined_state()
+        write_result_json(
+            run_dir,
+            build_result(
+                run_id,
+                counts_from_statuses(st for _, st in s),
+                advisories=a,
+                blocked=b,
+                errored=e,
+                sources=[{"name": n, "status": st} for n, st in s],
+                status=STATUS_IN_PROGRESS,
+            ),
+        )
 
     failed_dir = wiki_failed(wiki)
     failed_dir.mkdir(parents=True, exist_ok=True)
@@ -1234,6 +1392,7 @@ def ingest(
                 )
                 _collision_safe_move(src, failed_dir)
                 summary_drain.append((src.name, "binary"))
+                _checkpoint()
                 continue
 
             # Fix 3: assign/look up a STABLE id by content hash BEFORE ingest and
@@ -1250,6 +1409,7 @@ def ingest(
                 # Drain mode: move dup out of inbox to clear it (prevents spin).
                 _collision_safe_move(src, sources_dir)
                 summary_drain.append((name, "skipped"))
+                _checkpoint()
                 continue
             if is_new:
                 print(f"  assigned stable source id [{source_id}] for {name}")
@@ -1443,6 +1603,10 @@ def ingest(
                 # error/tamper/not-converged paths above where it is never
                 # invoked. ignore_errors=True tolerates an already-removed dir.
                 shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
+                # Durability contract: persist counts-so-far after every real
+                # attempt's disposition (error/tamper/blocked/converged/
+                # not-converged all funnel through here). Fail-soft.
+                _checkpoint()
 
         _print_summary(summary_drain)
         _print_advisories(advisories_drain)
@@ -1507,14 +1671,11 @@ def ingest(
         # when EVERY source was gate-blocked in enforce mode (the incident's
         # "looked healthy for a week" hole: retention-/duplicate-blocked
         # statuses were not in the failed_items set).
-        return _finish_ingest_run(
-            run_dir,
-            run_id,
-            summary_drain,
-            advisories_drain,
-            blocked_drain,
-            errored_drain,
-        )
+        #
+        # A RESUMED drain finalizes the COMBINED state (adopted pre-crash
+        # records + this run's own) so counts never forget pre-crash
+        # completions; the exit code follows the combined verdict.
+        return _finish_ingest_run(run_dir, run_id, *_combined_state())
 
 
 # ---------------------------------------------------------------------------
