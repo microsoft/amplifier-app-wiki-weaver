@@ -13,6 +13,7 @@ Subcommands:
     ask    <question> [--wiki] answer a question by reading the compiled wiki
     build-dashboard <corpus>   build a self-contained HTML dashboard
     migrate <corpus>           relocate an old-layout corpus to the .wiki/ layout
+    supervise <wiki_dir>       observe-only health monitor for a live ingest run
 """
 
 from __future__ import annotations
@@ -179,6 +180,33 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
     corpus = Path(args.corpus).expanduser().resolve()
     return migrate(corpus, dry_run=args.dry_run, force=args.force)
+
+
+def cmd_supervise(args: argparse.Namespace) -> int:
+    """Observe-only health monitor for a live ingest run.
+
+    Deterministic -- no LLM, no Amplifier runtime required (like migrate),
+    and read-only against the run except the two supervisor files it owns
+    inside the run dir.
+    """
+    from pathlib import Path
+
+    from wiki_weaver.supervisor import SupervisorConfig, run_supervise
+
+    wiki = Path(args.wiki_dir).expanduser().resolve()
+    if not wiki.is_dir():
+        _fail(f"wiki directory not found: {wiki}")
+        return 2
+    run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else None
+    config = SupervisorConfig(
+        interval_s=args.interval,
+        stall_after_s=args.stall_after,
+        pace_factor=args.pace_factor,
+        llm_call_ceiling=args.llm_call_ceiling,
+        context_limit_tokens=args.context_limit,
+        budget_usd=args.budget,
+    )
+    return run_supervise(wiki, run_dir=run_dir, config=config, once=args.once)
 
 
 def cmd_schedule(args: argparse.Namespace) -> int:
@@ -450,6 +478,68 @@ def main() -> None:
         help="re-run even if the migration sentinel already exists",
     )
 
+    p_supervise = sub.add_parser(
+        "supervise",
+        help=(
+            "observe-only health monitor for a live ingest run "
+            "(deterministic; reports to <run-dir>/supervisor.jsonl + "
+            "supervisor-status.md)"
+        ),
+    )
+    p_supervise.add_argument("wiki_dir", help="wiki directory to watch")
+    p_supervise.add_argument(
+        "--run-dir",
+        default=None,
+        metavar="PATH",
+        dest="run_dir",
+        help="specific .wiki/runs/ingest-* dir (default: newest)",
+    )
+    p_supervise.add_argument(
+        "--interval",
+        type=float,
+        default=60.0,
+        help="seconds between ticks (default: 60)",
+    )
+    p_supervise.add_argument(
+        "--stall-after",
+        type=float,
+        default=600.0,
+        dest="stall_after",
+        help="seconds without an events.jsonl append before stalled (default: 600)",
+    )
+    p_supervise.add_argument(
+        "--pace-factor",
+        type=float,
+        default=3.0,
+        dest="pace_factor",
+        help="current source elapsed > FACTOR x rolling mean => slow (default: 3)",
+    )
+    p_supervise.add_argument(
+        "--llm-call-ceiling",
+        type=int,
+        default=50,
+        dest="llm_call_ceiling",
+        help="orchestrator per-child-session LLM-call budget (default: 50)",
+    )
+    p_supervise.add_argument(
+        "--context-limit",
+        type=int,
+        default=1_000_000,
+        dest="context_limit",
+        help="provider context-token limit to warn against (default: 1000000)",
+    )
+    p_supervise.add_argument(
+        "--budget",
+        type=float,
+        default=None,
+        help="optional run cost budget in USD (concern when exceeded)",
+    )
+    p_supervise.add_argument(
+        "--once",
+        action="store_true",
+        help="run a single tick and exit (scripting-friendly)",
+    )
+
     p_sched = sub.add_parser(
         "schedule", help="manage unattended, cron-scheduled ingestion"
     )
@@ -525,6 +615,7 @@ def main() -> None:
         "ask": cmd_ask,
         "build-dashboard": cmd_build_dashboard,
         "migrate": cmd_migrate,
+        "supervise": cmd_supervise,
         "schedule": cmd_schedule,
     }
     if args.command is None:
