@@ -15,6 +15,69 @@ Phase 1 ships a read-only `/wiki`. The design deliberately leaves clean seams
 for a later **Phase 2 self-learning / admin-steering** layer, without building
 any of it now.
 
+## Implementation Status — as built (2026-07-23)
+
+Phase 1 shipped by **reusing existing app rails** rather than building a new stack:
+
+- **`-made` PR #79** — commits the durable `data/team-wiki/` artifact (73 pages) +
+  a durable/ephemeral `.gitignore` (tracks `*.md`, `.wiki/index/`,
+  `.processed.jsonl`, `.sources.json`, `policy/`, `_archive/`; ignores `_inbox/`,
+  `_failed/`, `.runs/`, logs, and the 2.6 MB `site.html` — the app renders natively).
+  Retires the empty `data/briefings/` tier.
+- **app PR #298** — the native `/wiki` surface (below).
+- **wiki-weaver** — (pending) the `wiki-weaver run` resilient batch subcommand for CI.
+
+### What the app got
+- **Backend (reuse + 1 endpoint):** registered a `wiki` content collection →
+  `data/team-wiki` (pages servable at `/api/content/markdown?path=wiki/<slug>` and
+  `tp://doc/wiki/<slug>`-addressable; the hidden `.wiki/` subtree auto-excluded).
+  Added `GET /api/team-wiki/index` → per-page `{id,title,type,level,parent}` + a
+  `backlinks` map (from `.wiki/index/backlinks.json`). No other new APIs — bodies
+  reuse the existing `/api/team-wiki` loader; deep-links reuse `tp://doc`.
+- **Frontend — a data-derived information architecture** (computed at request time
+  from frontmatter + the link-index, so newly-woven pages auto-slot in):
+  - **v1 (default):** pages bucketed into ordered **type sections** (Overview,
+    Workstreams, Projects, People, Concepts, Open Threads) + client-side search; the
+    reading page gains a **"Linked from" backlinks** panel. Type is the spine because
+    the hierarchy is sparse (54 of 72 pages are unparented — a pure tree orphans them).
+  - **v2 (opt-in, `?ia=v2`):** a **3-pane** layout — left nav rail (search + type
+    sections, Workstreams folded into a `group→workstream→sub-workstream` tree) /
+    center reading column / right context rail (type badge, breadcrumb, Backlinks,
+    Related).
+  - `[[slug|Display]]` → clickable in-wiki nav; `[^N]` → `remark-gfm` footnotes.
+    Graceful fallback to the flat reader when the index endpoint isn't deployed.
+- **Consolidation:** the **"Team Briefings" tab is removed** (nav item + `/team-wiki`
+  route + `TeamWiki.tsx`); the woven wiki is the single surface at `/wiki`.
+
+### Design review (IA)
+Convened three lenses (IA / presentation / critique). Verdict that shaped v1/v2:
+**type-faceted sections are the spine, hierarchy is a local sub-organizer, the
+wikilink graph is the connective tissue** (backlinks per page). Fix **trust before
+polish** — the next priority is real **citation → source-doc deep-links** (today
+`[^N]` resolves to the in-page Sources list, not the corpus doc; source files live in
+`_archive/`, and the naive `_inbox/…` path in the footnote defs does NOT map 1:1 to
+`data/corpus/conversations/`, so this needs the `.sources.json` ordinal→file map
+surfaced — deliberately deferred, not faked). Also deferred: tag cloud, local graph
+view, and a **human staleness signal**.
+
+### Auto-pickup on re-ingest
+Confirmed: the loader globs `data/team-wiki/*.md` at request time and the IA is
+derived from frontmatter + `.wiki/index/*` (rebuilt every weave). A new page
+self-routes by `type`, slots into the tree if it has a `parent`, and wires its own
+backlinks — **zero hardcoded structure**. Prod caveat: pages must be committed to
+`-made` main and pulled (the 15-min `git_sync` loop); local (bind-mount) is immediate.
+
+### Local vs prod & force-refresh (design, not yet built)
+- **Serving:** committed `data/team-wiki` → prod container's 15-min
+  `git reset --hard origin/main` pull loop → served. Local dev bind-mounts the vault
+  (pull loop off, `AUTO_PUSH=false`) so edits show instantly.
+- **Weave isolation:** the ~30-min weave runs **off the live app** — on a GitHub
+  Actions runner (auto, on corpus push) or, for an admin **"force refresh"**, via
+  `workflow_dispatch` — never a long job inside the app container.
+- **Publish toggle** `WIKI_PUBLISH_MODE = auto` (commit to main, default; human gate
+  off) `| pr` (open a PR). A small **`pull-now`** endpoint closes the ≤15-min latency
+  gap (none exists today).
+
 ## Background
 
 Three sibling repositories under `team-pulse-structure/` participate in this
