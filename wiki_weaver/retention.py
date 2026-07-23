@@ -49,9 +49,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from .grading import RetentionResult, grade_claim_retention
@@ -63,16 +65,24 @@ from .index import (
     build_indexes,
     query_graph_neighbors,
 )
-from .lib import wiki_retention_state
+from .lib import removals_manifest_path, wiki_retention_state, wiki_snapshots
 
 __all__ = [
     "PageRetentionOutcome",
     "RetentionGateResult",
     "RetentionGateDecision",
+    "RetentionChecksOutcome",
+    "ShrinkageFlag",
     "DEFAULT_ESCALATION_THRESHOLD",
+    "DEFAULT_SHRINK_THRESHOLD",
+    "DEFAULT_SNAPSHOTS_KEEP",
     "snapshot_pages",
     "check_retention",
+    "detect_shrinkage",
+    "read_removals_manifest",
+    "preserve_snapshot",
     "enforce_retention_gate",
+    "run_retention_checks",
     "load_failure_counter",
     "record_grader_error",
     "record_grader_success",
@@ -371,6 +381,193 @@ def check_retention(
 
 
 # ---------------------------------------------------------------------------
+# Deterministic page-shrinkage heuristic (free, no LLM) -- R3a
+# ---------------------------------------------------------------------------
+#
+# The LLM judge above measures TOPIC ERASURE ("subject completely absent from
+# all pages"); the production symptom that motivated this module's follow-up
+# (weekly ingests with net -581 lines) is CONTENT SHRINKAGE -- a page can lose
+# 40+ lines of operational history and still PASS the judge because one
+# surviving sentence "addresses the subject". This heuristic measures the
+# quantity that actually matches that symptom: per-page body-line deltas and
+# lost '## ' section headings, computed deterministically from the same
+# pre-ingest snapshot the judge uses. It is ADVISORY-ONLY by design (a
+# heuristic, never a blocker -- even under WIKI_WEAVER_ENFORCE_GATES=1).
+
+# A page must lose STRICTLY MORE than this fraction of its non-empty body
+# lines to be flagged (0.20 => a 100 -> 80 line page is NOT flagged; 100 -> 79 is).
+DEFAULT_SHRINK_THRESHOLD = 0.20
+
+
+@dataclass
+class ShrinkageFlag:
+    """One page flagged by detect_shrinkage()."""
+
+    page: str  # filename, e.g. "team-pulse.md"
+    before_lines: int  # non-empty BODY lines before ingest
+    after_lines: int  # non-empty BODY lines after ingest (0 = page deleted)
+    lost_headings: list[str] = field(default_factory=list)  # '## ' headings gone
+
+    def describe(self) -> str:
+        parts = [f"{self.page} ({self.before_lines} -> {self.after_lines} body lines"]
+        if self.lost_headings:
+            parts.append(f"lost heading(s): {', '.join(self.lost_headings)}")
+        return "; ".join(parts) + ")"
+
+
+def _nonempty_body_lines(text: str) -> list[str]:
+    return [ln for ln in _body(text).splitlines() if ln.strip()]
+
+
+_H2_RE = re.compile(r"^##\s+(.+?)\s*$")
+
+
+def _h2_headings(text: str) -> list[str]:
+    """Level-2 ('## ') headings in *text*'s body, in order."""
+    return [m.group(1) for ln in _body(text).splitlines() if (m := _H2_RE.match(ln))]
+
+
+def _read_text_or_empty(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def detect_shrinkage(
+    before_dir: str | Path,
+    after_wiki: str | Path,
+    *,
+    shrink_threshold: float = DEFAULT_SHRINK_THRESHOLD,
+) -> list[ShrinkageFlag]:
+    """Deterministic, free (no LLM) shrinkage scan: before-snapshot vs after-wiki.
+
+    Flags every before-page whose after-counterpart:
+      - shrank by STRICTLY MORE than ``shrink_threshold`` in non-empty BODY
+        line count (frontmatter excluded, same ``_body()`` scope the judge's
+        skip-hash uses), OR
+      - lost one or more level-2 (``## ``) section headings (a whole-section
+        removal is the signature of the observed loss class), OR
+      - was deleted outright (both of the above degenerate to this).
+
+    Independent of the LLM judge: runs even when the judge is unavailable.
+    """
+    flags: list[ShrinkageFlag] = []
+    for before_page in sorted(Path(before_dir).glob("*.md")):
+        before_text = _read_text_or_empty(before_page)
+        after_text = _read_text_or_empty(Path(after_wiki) / before_page.name)
+        n_before = len(_nonempty_body_lines(before_text))
+        n_after = len(_nonempty_body_lines(after_text))
+        after_headings = set(_h2_headings(after_text))
+        lost = [h for h in _h2_headings(before_text) if h not in after_headings]
+        shrank = n_before > 0 and n_after < n_before * (1.0 - shrink_threshold)
+        if shrank or lost:
+            flags.append(
+                ShrinkageFlag(
+                    page=before_page.name,
+                    before_lines=n_before,
+                    after_lines=n_after,
+                    lost_headings=lost,
+                )
+            )
+    return flags
+
+
+# ---------------------------------------------------------------------------
+# Self-declared removal manifest (written by the ingest agent) -- R2
+# ---------------------------------------------------------------------------
+
+
+def read_removals_manifest(wiki: str | Path) -> list[dict]:
+    """Parse ``<wiki>/.ai/removals.jsonl`` (the ingest agent's self-declared
+    removal manifest -- see pipeline/synthesize.dot's REMOVAL MANIFEST
+    instruction). Fail-soft: missing file -> [], malformed lines skipped.
+
+    Each well-formed entry is a dict with (by contract) ``page``, ``removed``,
+    ``action`` (superseded|condensed|moved), and ``reason`` keys -- but this
+    reader does not enforce the shape (the manifest is agent-written scratch
+    state; the advisory it feeds must surface whatever was declared, not
+    silently drop an imperfect declaration).
+    """
+    path = removals_manifest_path(Path(wiki))
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    entries: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            entries.append(obj)
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Snapshot preservation (bounded) -- R3b
+# ---------------------------------------------------------------------------
+
+# Keep at most this many preserved snapshots under <wiki>/.wiki/snapshots/
+# (newest win; oldest pruned) so growth stays bounded.
+DEFAULT_SNAPSHOTS_KEEP = 10
+
+
+def _prune_snapshots(root: Path, keep: int) -> None:
+    dirs = [d for d in root.iterdir() if d.is_dir()]
+    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for old in dirs[keep:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def preserve_snapshot(
+    wiki: str | Path,
+    snapshot_dir: str | Path,
+    source_name: str,
+    *,
+    keep: int = DEFAULT_SNAPSHOTS_KEEP,
+) -> Path | None:
+    """MOVE the pre-ingest snapshot to ``<wiki>/.wiki/snapshots/<source>-<ts>/``
+    so a human can diff/restore, instead of deleting it.
+
+    Also copies the removal manifest (``.ai/removals.jsonl``) into the
+    preserved dir when present, so the declaration travels with the snapshot
+    it explains. Prunes to the ``keep`` newest preserved snapshots (by dir
+    mtime). Fail-soft: returns the preserved path, or None if the move could
+    not be performed (observability must never break the run).
+    """
+    wiki = Path(wiki)
+    snapshot_dir = Path(snapshot_dir)
+    if not snapshot_dir.is_dir():
+        return None
+    root = wiki_snapshots(wiki)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(source_name).stem).strip("-.")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        dest = root / f"{safe or 'source'}-{stamp}"
+        shutil.move(str(snapshot_dir), str(dest))
+    except OSError:
+        return None
+    manifest = removals_manifest_path(wiki)
+    if manifest.is_file():
+        try:
+            shutil.copy2(manifest, dest / "removals.jsonl")
+        except OSError:
+            pass
+    _prune_snapshots(root, keep)
+    return dest
+
+
+# ---------------------------------------------------------------------------
 # Persistent consecutive-grader-failure counter (fail-open/fail-closed escalation)
 # ---------------------------------------------------------------------------
 
@@ -467,15 +664,24 @@ def enforce_retention_gate(
     *,
     escalation_threshold: int = DEFAULT_ESCALATION_THRESHOLD,
     judge_fn=None,
+    cleanup_snapshot: bool = True,
 ) -> RetentionGateDecision:
     """Run the claim-retention backstop after a converged synthesis run.
 
     ``snapshot_dir`` must be a BEFORE-page snapshot written by
-    ``snapshot_pages()`` prior to the synthesis run. Always removes
+    ``snapshot_pages()`` prior to the synthesis run. By default removes
     ``snapshot_dir`` before returning, on both the happy path and any
     internal error (mirrors the cleanup discipline in
     ``wiki_weaver/ingest_tamper_check.py``, which unlinks its own before-run
     snapshot on every exit path -- clean or malformed).
+
+    ``cleanup_snapshot=False`` transfers snapshot ownership to the caller:
+    the snapshot is left in place on EVERY exit path so the caller can
+    preserve it for human diff/restore when a retention signal fired (see
+    ``run_retention_checks()``, which deletes it only on a clean pass).
+    Historically even a fail-CLOSED block deleted the snapshot, so nothing
+    could ever be restored -- this parameter is what makes restoration
+    possible.
 
     HONEST FRAMING: this is an independent, LLM-judge-backed re-check backed
     by a fail-open/fail-closed escalation policy -- not a deterministic gate.
@@ -490,7 +696,8 @@ def enforce_retention_gate(
             wiki, escalation_threshold, f"{type(exc).__name__}: {exc}"
         )
     finally:
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        if cleanup_snapshot:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
 
     if result.errored:
         errored_reasons = "; ".join(
@@ -516,3 +723,136 @@ def enforce_retention_gate(
         )
 
     return RetentionGateDecision(action="proceed", message="claim-retention gate: PASS")
+
+
+# ---------------------------------------------------------------------------
+# run_retention_checks -- the R1-R3 orchestration callers use per converged run
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RetentionChecksOutcome:
+    """Everything a caller needs after the full post-convergence retention pass.
+
+    ``decision`` is the LLM-judge gate's verdict (unchanged semantics --
+    callers keep their existing advisory/enforce routing on it).
+    ``advisory_signals`` are the NEW deterministic signals, as
+    ``(gate_name, message)`` pairs ready for the advisories channel:
+    page-shrinkage and removal-manifest. Both are ADVISORY-ONLY by design --
+    they never block, even under WIKI_WEAVER_ENFORCE_GATES=1 (the shrinkage
+    check is a heuristic; the removal manifest is the agent DOING what the
+    prompt asked -- declared removals are reviewable, not punishable).
+    ``snapshot_preserved_to`` is the preserved snapshot dir (None when the
+    pass was clean and the snapshot was deleted).
+    """
+
+    decision: RetentionGateDecision
+    advisory_signals: list[tuple[str, str]] = field(default_factory=list)
+    shrinkage: list[ShrinkageFlag] = field(default_factory=list)
+    removals: list[dict] = field(default_factory=list)
+    snapshot_preserved_to: Path | None = None
+
+
+def run_retention_checks(
+    wiki: str | Path,
+    snapshot_dir: str | Path,
+    source_name: str,
+    *,
+    escalation_threshold: int = DEFAULT_ESCALATION_THRESHOLD,
+    judge_fn=None,
+    snapshots_keep: int = DEFAULT_SNAPSHOTS_KEEP,
+) -> RetentionChecksOutcome:
+    """Full post-convergence retention pass for one converged synthesis run:
+
+    1. ``detect_shrinkage()`` -- free deterministic per-page body-line /
+       lost-``##``-heading scan against the pre-ingest snapshot (independent
+       of the LLM judge; runs even when the judge cannot).
+    2. ``enforce_retention_gate()`` -- the existing LLM-judge-backed re-check,
+       with ``cleanup_snapshot=False`` so the snapshot's fate is decided HERE.
+    3. ``read_removals_manifest()`` -- the ingest agent's self-declared
+       removals (``.ai/removals.jsonl``).
+    4. Snapshot fate: when ANY retention signal fired (judge-detected loss or
+       escalated grader errors, a shrinkage flag, or a non-empty removal
+       manifest) the snapshot is PRESERVED to ``.wiki/snapshots/<source>-<ts>/``
+       (pruned to the ``snapshots_keep`` newest) so a human can diff/restore;
+       it is deleted only on a clean pass.
+
+    Callers own the routing of ``decision`` (advisory vs enforce) exactly as
+    before; the new signals are surfaced via ``advisory_signals`` and are
+    advisory-only.
+    """
+    wiki = Path(wiki)
+    snapshot_dir = Path(snapshot_dir)
+
+    shrinkage: list[ShrinkageFlag] = []
+    try:
+        shrinkage = detect_shrinkage(snapshot_dir, wiki)
+    except Exception as exc:  # noqa: BLE001 -- observability must never break the run
+        print(f"WARN: page-shrinkage heuristic could not run: {exc}")
+
+    decision = enforce_retention_gate(
+        wiki,
+        snapshot_dir,
+        escalation_threshold=escalation_threshold,
+        judge_fn=judge_fn,
+        cleanup_snapshot=False,
+    )
+
+    removals = read_removals_manifest(wiki)
+
+    fired = (
+        bool(shrinkage)
+        or bool(removals)
+        or decision.action in ("block_confirmed_loss", "block_escalated_errors")
+    )
+    preserved: Path | None = None
+    if fired:
+        preserved = preserve_snapshot(
+            wiki, snapshot_dir, source_name, keep=snapshots_keep
+        )
+        if preserved is not None:
+            print(f"  retention snapshot preserved for diff/restore: {preserved}")
+    else:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+    signals: list[tuple[str, str]] = []
+    if shrinkage:
+        detail = "; ".join(f.describe() for f in shrinkage)
+        signals.append(
+            (
+                "page-shrinkage",
+                (
+                    "page-shrinkage heuristic (ADVISORY -- never blocks) "
+                    f"[source {source_name}]: {len(shrinkage)} page(s) shrank "
+                    f">{int(DEFAULT_SHRINK_THRESHOLD * 100)}% in body lines or "
+                    f"lost a '##' section: {detail}"
+                ),
+            )
+        )
+    if removals:
+        pages = sorted({str(e.get("page", "?")) for e in removals})
+        signals.append(
+            (
+                "removal-manifest",
+                (
+                    "removal-manifest (ADVISORY -- never blocks) "
+                    f"[source {source_name}]: ingest agent declared "
+                    f"{len(removals)} removed/condensed claim(s) across "
+                    f"{len(pages)} page(s): {', '.join(pages)}"
+                ),
+            )
+        )
+    if preserved is not None and signals:
+        # Make the preserved snapshot findable from the advisory itself
+        # (result.json is often the only artifact a headless operator reads).
+        signals = [
+            (gate, f"{msg} -- snapshot preserved: {preserved}") for gate, msg in signals
+        ]
+
+    return RetentionChecksOutcome(
+        decision=decision,
+        advisory_signals=signals,
+        shrinkage=shrinkage,
+        removals=removals,
+        snapshot_preserved_to=preserved,
+    )

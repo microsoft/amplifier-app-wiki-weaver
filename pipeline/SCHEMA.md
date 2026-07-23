@@ -54,6 +54,24 @@ On the relevant page, add a section:
 A factual discrepancy (e.g. two different numbers for the same event) must be
 flagged with both values and their sources — never collapsed to one or averaged.
 
+## Content retention during re-writes
+
+Integration re-writes existing prose; it must never silently delete it. Every
+claim already present on a page being re-written must end the edit in exactly
+one of three states (the same taxonomy the claim-retention grader uses):
+
+- **RETAINED** — still present, possibly reworded, meaning preserved.
+- **SUPERSEDED** — replaced by newer information **with a visible trace**:
+  the new text names what it replaces (e.g. "500, up from 100",
+  "superseded by [N]"), or the old claim moves to a dated `## History` note.
+- **MOVED** — relocated to another page with a `[[wikilink]]`.
+
+Absence of mention in a new source is **NOT** evidence of staleness — content
+is never removed merely because a new source does not repeat it. Dated /
+operational history is content, not clutter: when it no longer fits the
+narrative flow, compact it into a `## History` subsection on the same page —
+never silently drop it.
+
 ## Required navigation pages
 
 - `index.md` (type: index) — catalog of all pages, grouped by type.

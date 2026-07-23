@@ -39,6 +39,7 @@ from amplifier_module_pipeline_runner import run_pipeline
 
 from ._assets import pipeline_dir
 from .lib import (
+    removals_manifest_path,
     touched_manifest_path,
     wiki_failed,
     wiki_ledger,
@@ -1098,6 +1099,12 @@ def run_inner(
     # the prior source's page list (scope poisoning). Missing file is fine.
     touched_manifest_path(wiki_dir).unlink(missing_ok=True)
 
+    # Same reset for the self-declared removal manifest (.ai/removals.jsonl):
+    # run_inner is per-source, so declarations from a previous source must
+    # never be attributed to this one (the post-convergence retention checks
+    # read it per source). Missing file is fine.
+    removals_manifest_path(wiki_dir).unlink(missing_ok=True)
+
     result = _run_coro(
         run_pipeline(
             dot_source,
@@ -1274,10 +1281,18 @@ def run_ingest(
     # the WHOLE drain (every source in _inbox/), not per-source like
     # lib.py's Python drain loop, because ingest.dot archives each source
     # internally before this function regains control.
-    from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
+    from wiki_weaver.retention import run_retention_checks, snapshot_pages
 
     retention_snapshot_dir = wiki_runs(wiki_dir) / f".retention-snap-ingest-{timestamp}"
     snapshot_pages(wiki_dir, retention_snapshot_dir)
+
+    # Reset the self-declared removal manifest ONCE for the whole drain (this
+    # path's retention check is whole-drain scoped -- see HONEST FRAMING
+    # above): declarations from every source in THIS drain accumulate and are
+    # read together after the engine returns; stale lines from a PREVIOUS run
+    # must never be attributed to this one. (run_inner, the per-source CLI
+    # path, resets it per source instead.)
+    removals_manifest_path(wiki_dir).unlink(missing_ok=True)
 
     # Run-result contract (see wiki_weaver/run_result.py): snapshot the two
     # engine-written outcome channels BEFORE the drain so per-source counts can
@@ -1395,10 +1410,19 @@ def run_ingest(
             # Claim-retention backstop: an independent, LLM-judge-backed
             # post-hoc re-check across the whole drain (see HONEST FRAMING
             # above -- this cannot prevent the archive, only surface it as a
-            # loud failure/advisory).
-            retention_decision = enforce_retention_gate(
-                wiki_dir, retention_snapshot_dir
+            # loud failure/advisory). run_retention_checks additionally runs
+            # the deterministic page-shrinkage heuristic + reads the agents'
+            # self-declared removal manifest (both ADVISORY-ONLY, never
+            # blocking), and decides the snapshot's fate: preserved to
+            # .wiki/snapshots/ when any retention signal fired, deleted on a
+            # clean pass.
+            retention_checks = run_retention_checks(
+                wiki_dir, retention_snapshot_dir, "drain"
             )
+            retention_decision = retention_checks.decision
+            for gate_name, adv in retention_checks.advisory_signals:
+                print(f"!! GATE ADVISORY [{gate_name}]: {adv}", flush=True)
+                advisories.append(adv)
             if retention_decision.action in (
                 "block_confirmed_loss",
                 "block_escalated_errors",

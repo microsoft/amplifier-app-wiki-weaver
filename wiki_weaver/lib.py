@@ -117,6 +117,36 @@ def wiki_policy_dir(wiki: Path) -> Path:
     return wiki / WIKI_DIR / "policy"
 
 
+def wiki_snapshots(wiki: Path) -> Path:
+    """Return the preserved retention-snapshot root: ``<wiki>/.wiki/snapshots``.
+
+    When a retention signal fires for a source (judge-detected loss, the
+    deterministic page-shrinkage heuristic, or a non-empty removal manifest),
+    the pre-ingest page snapshot is MOVED here (instead of deleted) so a human
+    can diff/restore the damaged page(s). Bounded: only the newest
+    ``DEFAULT_SNAPSHOTS_KEEP`` preserved snapshots are kept -- see
+    ``wiki_weaver/retention.py``'s ``preserve_snapshot()``.
+    """
+    return wiki / WIKI_DIR / "snapshots"
+
+
+def removals_manifest_path(wiki: Path) -> Path:
+    """Return the ingest agent's self-declared removal manifest path:
+    ``<wiki>/.ai/removals.jsonl``.
+
+    APPENDED to by the ingest node whenever it removes, condenses, supersedes,
+    or moves a prior claim (one JSON line per claim: page / removed / action /
+    reason -- see pipeline/synthesize.dot's REMOVAL MANIFEST instruction).
+    Read post-convergence and surfaced as a run-level advisory so removals are
+    always LOUD and reviewable. Scratch state (like ``.ai/feedback/``), NOT
+    process state. Deleted deterministically before each source's synthesis on
+    the ``run_inner`` path (and once per drain on the ``run_ingest`` path,
+    whose retention check is whole-drain scoped) so stale declarations from a
+    previous run are never attributed to the current one.
+    """
+    return wiki / ".ai" / "removals.jsonl"
+
+
 def touched_manifest_path(wiki: Path) -> Path:
     """Return the touched-pages manifest path: ``<wiki>/.ai/touched-pages.txt``.
 
@@ -1058,7 +1088,7 @@ def ingest(
         # the cost of pulling in the attractor engine.
         from wiki_weaver.engine_runner import run_inner
         from wiki_weaver.grading import gates_enforced, no_duplicate_pages
-        from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
+        from wiki_weaver.retention import run_retention_checks, snapshot_pages
 
         processed = _processed_sources(wiki)
         summary: list[tuple[str, str]] = []
@@ -1179,9 +1209,19 @@ def ingest(
                     # content. ADVISORY by default (detect + surface, never
                     # block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
                     # blocking behavior (refuse archive/ledger-advance).
-                    retention_decision = enforce_retention_gate(
-                        wiki, retention_snapshot_dir
+                    # run_retention_checks additionally runs the deterministic
+                    # page-shrinkage heuristic + reads the agent's self-declared
+                    # removal manifest (both ADVISORY-ONLY, never blocking), and
+                    # decides the snapshot's fate: preserved to .wiki/snapshots/
+                    # when any retention signal fired, deleted on a clean pass.
+                    retention_checks = run_retention_checks(
+                        wiki, retention_snapshot_dir, name
                     )
+                    retention_decision = retention_checks.decision
+                    for gate_name, adv in retention_checks.advisory_signals:
+                        if adv not in advisories:
+                            _gate_advisory(gate_name, adv)
+                            advisories.append(adv)
                     if retention_decision.action in (
                         "block_confirmed_loss",
                         "block_escalated_errors",
@@ -1375,7 +1415,7 @@ def ingest(
     # cost of pulling in the attractor engine.
     from wiki_weaver.engine_runner import run_inner, shared_engine_loop
     from wiki_weaver.grading import gates_enforced, no_duplicate_pages
-    from wiki_weaver.retention import enforce_retention_gate, snapshot_pages
+    from wiki_weaver.retention import run_retention_checks, snapshot_pages
 
     processed = _processed_sources(wiki)
     summary_drain: list[tuple[str, str]] = []
@@ -1674,10 +1714,21 @@ def ingest(
                     # content. ADVISORY by default (detect + surface, never
                     # block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
                     # blocking behavior (route to _failed/ like any other
-                    # non-convergence disposition).
-                    retention_decision = enforce_retention_gate(
-                        wiki, retention_snapshot_dir
+                    # non-convergence disposition). run_retention_checks
+                    # additionally runs the deterministic page-shrinkage
+                    # heuristic + reads the agent's self-declared removal
+                    # manifest (both ADVISORY-ONLY, never blocking), and
+                    # decides the snapshot's fate: preserved to
+                    # .wiki/snapshots/ when any retention signal fired,
+                    # deleted on a clean pass.
+                    retention_checks = run_retention_checks(
+                        wiki, retention_snapshot_dir, name
                     )
+                    retention_decision = retention_checks.decision
+                    for gate_name, adv in retention_checks.advisory_signals:
+                        if adv not in advisories_drain:
+                            _gate_advisory(gate_name, adv)
+                            advisories_drain.append(adv)
                     if retention_decision.action in (
                         "block_confirmed_loss",
                         "block_escalated_errors",
