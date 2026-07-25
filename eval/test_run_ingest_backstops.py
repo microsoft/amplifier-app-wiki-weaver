@@ -362,3 +362,60 @@ def test_run_ingest_duplicate_page_is_advisory_by_default(
 
     # Sanity: the real, unmocked deterministic scan did fire.
     assert grading.no_duplicate_pages(wiki_dir) == ["gpt-5-1.md"]
+
+
+# ---------------------------------------------------------------------------
+# Test 6 -- fresh-wiki first sync: run_ingest() must COMPLETE, not crash.
+# Production regression: 11 first-time repo syncs (fresh wikis, non-empty
+# _inbox/, drains that converged zero sources -> no index.md ever created)
+# died with reweave_overview()'s FileNotFoundError at the post-drain reweave
+# gate (engine_runner.py run_ingest -> reweave_overview_if_needed), killing
+# the whole run AFTER synthesis and permanently blocking their first sync.
+# ---------------------------------------------------------------------------
+
+
+def test_run_ingest_completes_on_fresh_wiki_without_index_md(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    """A fresh wiki (no index.md) with a non-empty _inbox/ whose drain
+    produces nothing must complete run_ingest() with the reweave gate
+    SKIPPED (one WARNING) -- never an unhandled FileNotFoundError.
+
+    The reweave gate is deliberately UNMOCKED here: this exercises the real
+    ``reweave_overview_if_needed`` skip path end-to-end through run_ingest().
+    """
+    import logging
+
+    wiki_dir = (tmp_path / "wiki").resolve()
+    wiki_dir.mkdir()
+    # Non-empty inbox: inbox_count > 0, so run_ingest() reaches the reweave
+    # gate (the empty-inbox guard at the call site does NOT protect this case).
+    (wiki_dir / "_inbox").mkdir()
+    (wiki_dir / "_inbox" / "source.md").write_text("a source\n", encoding="utf-8")
+
+    async def fake_run_pipeline(dot_source: str, **kwargs: Any) -> Any:
+        # Simulate a first-sync drain that converged ZERO sources: the engine
+        # returns without ever writing index.md (or any page) to the wiki --
+        # the exact production shape of the 11 blocked repos.
+        return _fake_pipeline_result(status="success")
+
+    monkeypatch.setattr(er, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        retention,
+        "enforce_retention_gate",
+        lambda wiki, snapshot_dir, **kwargs: _passing_retention_decision(),
+    )
+    monkeypatch.setattr(grading, "no_duplicate_pages", lambda wiki: [])
+    # NOTE: reweave is NOT patched -- the real gate runs against the fresh wiki.
+
+    with caplog.at_level(logging.WARNING, logger="wiki_weaver.reweave"):
+        result = er.run_ingest(wiki_dir)  # must NOT raise FileNotFoundError
+
+    assert "re-weave" not in (result.failure_reason or ""), (
+        "a skipped reweave gate must not surface as a re-weave failure"
+    )
+    assert any(
+        "no index.md" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), "the fresh-wiki skip must log one clear WARNING"

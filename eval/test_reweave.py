@@ -102,6 +102,10 @@ def test_gate_noop_when_already_passing(tmp_path: Path) -> None:
 
 def test_gate_reweaves_once_then_passes(tmp_path: Path) -> None:
     """One failing grade, one re-weave call that fixes it -> 1 attempt, pass."""
+    # A real (non-fresh) wiki has an index.md -- required for the retry loop
+    # to run at all (a missing index.md is the fresh-wiki SKIP path, covered
+    # by test_gate_skips_when_no_index_md below).
+    (tmp_path / "index.md").write_text("# Index\n\n- [[page]]\n", encoding="utf-8")
     grade_call_count = [0]
     reweave_calls: list[Path] = []
 
@@ -135,6 +139,9 @@ def test_gate_reweaves_once_then_passes(tmp_path: Path) -> None:
 
 def test_gate_exhausts_retries_and_fails_loud(tmp_path: Path) -> None:
     """A persistently failing gate stops at max_retries and reports failure clearly."""
+    # index.md present: this is a degraded-but-real wiki, not the fresh-wiki
+    # skip path (which never reaches the retry loop at all).
+    (tmp_path / "index.md").write_text("# Index\n\n- [[page]]\n", encoding="utf-8")
     reweave_calls: list[Path] = []
 
     def grade_fn(wiki_dir: Path) -> GradeResult:
@@ -155,6 +162,80 @@ def test_gate_exhausts_retries_and_fails_loud(tmp_path: Path) -> None:
     assert len(reweave_calls) == 2
     assert "FAIL" in result.final_report, (
         "failure must be clearly reported, not swallowed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 3b -- fresh wiki (no index.md): SKIP with a warning, never crash.
+# Production regression: 11 first-time repo syncs (fresh wikis whose drains
+# converged zero sources) crashed run_ingest with reweave_overview()'s
+# fail-loud FileNotFoundError, permanently blocking their first sync.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_skips_when_no_index_md(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Failing grade + no index.md -> skipped result, one WARNING, and the
+    re-weave primitive is NEVER invoked (it would fail-loud, correctly)."""
+    import logging
+
+    def grade_fn(wiki_dir: Path) -> GradeResult:
+        return _fake_grade(False, "FAIL -- overview.md not found in wiki")
+
+    def reweave_fn(wiki_dir: Path) -> None:
+        raise FileNotFoundError(
+            "reweave_fn must NOT be called on a fresh wiki with no index.md"
+        )
+
+    with caplog.at_level(logging.WARNING, logger="wiki_weaver.reweave"):
+        result = reweave_overview_if_needed(
+            tmp_path, max_retries=2, grade_fn=grade_fn, reweave_fn=reweave_fn
+        )
+
+    assert result.skipped is True
+    assert result.attempts == 0, "a skipped gate makes zero re-weave attempts"
+    assert result.initial_passed is False
+    assert result.final_passed is False, "skip must not fabricate a passing grade"
+    assert "skipped: no index.md" in result.final_report
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "exactly one clear WARNING must be logged"
+    assert "no index.md" in warnings[0].getMessage()
+
+
+def test_gate_skip_end_to_end_with_real_defaults(tmp_path: Path) -> None:
+    """The exact production shape: a fresh/empty wiki dir, REAL default
+    grade_fn/reweave_fn. Must return a skip -- not raise FileNotFoundError.
+    (grade_overview is deterministic/offline; reweave_overview is never
+    reached because the skip fires first, so no LLM/network is touched.)
+    """
+    result = reweave_overview_if_needed(tmp_path)
+
+    assert result.skipped is True
+    assert result.attempts == 0
+    assert "skipped: no index.md" in result.final_report
+
+
+def test_gate_with_index_md_still_reweaves(tmp_path: Path) -> None:
+    """A wiki WITH index.md must take the unchanged retry path: skipped is
+    False and reweave_fn IS invoked when the grade fails."""
+    (tmp_path / "index.md").write_text("# Index\n\n- [[page]]\n", encoding="utf-8")
+    reweave_calls: list[Path] = []
+
+    def grade_fn(wiki_dir: Path) -> GradeResult:
+        return _fake_grade(False, "FAIL -- degraded overview")
+
+    def reweave_fn(wiki_dir: Path) -> None:
+        reweave_calls.append(wiki_dir)
+
+    result = reweave_overview_if_needed(
+        tmp_path, max_retries=1, grade_fn=grade_fn, reweave_fn=reweave_fn
+    )
+
+    assert result.skipped is False
+    assert result.attempts == 1
+    assert len(reweave_calls) == 1, (
+        "with index.md present, the re-weave path must be unchanged"
     )
 
 

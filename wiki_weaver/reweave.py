@@ -47,6 +47,7 @@ schema-design agent write schema.md directly.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -74,6 +75,8 @@ __all__ = [
     "reweave_overview",
     "reweave_overview_if_needed",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def build_reweave_dot(
@@ -217,6 +220,13 @@ class ReweaveGateResult:
 
     ``attempts`` is the number of re-weave LLM calls actually made (0 when
     the initial grade already passed -- the free, common-case path).
+
+    ``skipped`` is True when the gate could not run at all because the wiki
+    has no ``index.md`` to synthesize an overview from (a fresh/empty wiki,
+    e.g. a first-time sync where no source converged). A skipped result has
+    ``attempts == 0`` and ``final_passed == False``, but it is NOT a re-weave
+    failure -- there was nothing to re-weave. Callers must treat it as a
+    warned no-op, never as a run failure.
     """
 
     initial_passed: bool
@@ -224,6 +234,7 @@ class ReweaveGateResult:
     final_passed: bool
     initial_report: str
     final_report: str
+    skipped: bool = False
 
 
 def reweave_overview_if_needed(
@@ -244,6 +255,18 @@ def reweave_overview_if_needed(
     a fail-loud contract: callers must check ``final_passed`` and must NOT
     treat a non-passing result as success.
 
+    FRESH-WIKI SKIP (not a failure): when the initial grade fails but the
+    wiki has no ``index.md``, there is nothing to synthesize an overview from
+    -- that is the definition of "not needed". This happens on first-time
+    syncs whose drain converged zero sources (every source quarantined to
+    the failed dir, so the wiki never gained an index.md). Calling
+    ``reweave_overview`` would raise its (correct, fail-loud)
+    ``FileNotFoundError`` and kill the caller's whole ingest run AFTER
+    synthesis already happened. Instead this returns
+    ``ReweaveGateResult(skipped=True, attempts=0)`` with one WARNING logged,
+    so the run proceeds to completion. ``reweave_overview`` itself keeps its
+    fail-loud contract for direct callers.
+
     ``grade_fn`` / ``reweave_fn`` are injectable (default to the real
     ``grade_overview`` / ``reweave_overview``) so callers -- and tests -- can
     substitute fakes without needing a real wiki, LLM, or network access.
@@ -262,6 +285,29 @@ def reweave_overview_if_needed(
         )
 
     initial_report = result.report()
+
+    # Fresh/empty wiki: no index.md means there is nothing to re-weave FROM.
+    # Skip (warn once) rather than forwarding into reweave_overview()'s
+    # fail-loud FileNotFoundError -- an optional overview pass must never be
+    # able to kill a completed ingest run.
+    if not (wiki_dir / "index.md").is_file():
+        skip_report = (
+            f"skipped: no index.md in {wiki_dir} -- nothing to synthesize an "
+            "overview from (fresh/empty wiki); overview re-weave not needed."
+        )
+        logger.warning(
+            "reweave_overview_if_needed: %s (initial grade: %s)",
+            skip_report,
+            initial_report,
+        )
+        return ReweaveGateResult(
+            initial_passed=False,
+            attempts=0,
+            final_passed=False,
+            initial_report=initial_report,
+            final_report=skip_report,
+            skipped=True,
+        )
     attempts = 0
     while attempts < max_retries:
         attempts += 1
