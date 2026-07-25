@@ -55,6 +55,7 @@ from pathlib import Path
 
 from amplifier_module_pipeline_runner import run_pipeline
 
+from .consistency import check_overview_staleness
 from .engine_runner import (
     MODEL,
     PROVIDER,
@@ -72,6 +73,7 @@ from .policy import load_policy
 __all__ = [
     "ReweaveGateResult",
     "build_reweave_dot",
+    "grade_overview_with_consistency",
     "reweave_overview",
     "reweave_overview_if_needed",
 ]
@@ -214,6 +216,31 @@ def reweave_overview(wiki_dir: str | Path) -> None:
         )
 
 
+def grade_overview_with_consistency(wiki_dir: Path) -> GradeResult:
+    """``grade_overview()`` plus the deterministic overview-staleness signal (OV3).
+
+    The production evidence behind OV3 (see wiki_weaver/consistency.py): an
+    overview.md that passes OV1/OV2 cleanly can still assert the corpus
+    "spans ... to <date>" long after newer pages landed -- structurally fine,
+    factually stale. A stale coverage-date claim is counted as a grade
+    FAILURE here so the existing re-weave gate treats the overview as "in
+    need" and the (already bounded, already wired) LLM pass refreshes it.
+    Re-grading after a re-weave re-runs the staleness check, so a fresh
+    overview that drops or updates the claim passes normally.
+
+    Deterministic and free, exactly like grade_overview()'s own hard gates --
+    this composed grader is the DEFAULT ``grade_fn`` of
+    ``reweave_overview_if_needed`` (injectable fakes in tests are unaffected).
+    """
+    result = grade_overview(wiki_dir)
+    staleness = check_overview_staleness(wiki_dir)
+    if staleness.stale:
+        result.check(
+            False, f"OV3 FAIL: stale coverage-date claim -- {staleness.message}"
+        )
+    return result
+
+
 @dataclass
 class ReweaveGateResult:
     """Outcome of a grade-then-maybe-reweave gate pass.
@@ -241,7 +268,7 @@ def reweave_overview_if_needed(
     wiki_dir: str | Path,
     max_retries: int = 2,
     *,
-    grade_fn: Callable[[Path], GradeResult] = grade_overview,
+    grade_fn: Callable[[Path], GradeResult] = grade_overview_with_consistency,
     reweave_fn: Callable[[Path], None] = reweave_overview,
 ) -> ReweaveGateResult:
     """Grade overview.md; re-weave (bounded retries) only if it fails.

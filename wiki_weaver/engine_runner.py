@@ -1513,7 +1513,20 @@ def run_ingest(
     # would crash inside reweave_overview() instead of being the harmless
     # no-op it is on the CLI path.
     if inbox_count > 0:
+        from wiki_weaver.consistency import run_consistency_checks
         from wiki_weaver.reweave import reweave_overview_if_needed
+
+        # Deterministic index/overview consistency pass (free, no LLM) --
+        # runs BEFORE the re-weave so (a) a mechanically repaired index.md
+        # feeds the re-weave (which synthesizes overview.md FROM index.md)
+        # and (b) a stale coverage-date claim is measured against the
+        # PRE-re-weave overview.md. Advisory-only; the staleness signal also
+        # trips the re-weave gate via its default composed grader (OV3).
+        # See wiki_weaver/consistency.py.
+        consistency = run_consistency_checks(wiki_dir)
+        for gate_name, adv in consistency.advisory_signals:
+            print(f"!! GATE ADVISORY [{gate_name}]: {adv}", flush=True)
+            advisories.append(adv)
 
         reweave_result = reweave_overview_if_needed(wiki_dir)
         if reweave_result.attempts and not reweave_result.final_passed:

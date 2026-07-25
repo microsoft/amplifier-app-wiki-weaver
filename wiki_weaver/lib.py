@@ -1899,6 +1899,22 @@ def ingest(
                 # not-converged all funnel through here). Fail-soft.
                 _checkpoint()
 
+        # Deterministic index/overview consistency pass (free, no LLM) --
+        # runs after the full drain, BEFORE the advisory print + overview
+        # re-weave below, so (a) its advisories land in this run's advisory
+        # block / DrainReport / result.json and (b) a mechanically repaired
+        # index.md feeds the re-weave (which synthesizes overview.md FROM
+        # index.md). Advisory-only; the staleness signal also trips the
+        # re-weave gate via its default composed grader (OV3). See
+        # wiki_weaver/consistency.py.
+        from wiki_weaver.consistency import run_consistency_checks
+
+        consistency = run_consistency_checks(wiki)
+        for gate_name, adv in consistency.advisory_signals:
+            if adv not in advisories_drain:
+                _gate_advisory(gate_name, adv)
+                advisories_drain.append(adv)
+
         _print_summary(summary_drain)
         _print_advisories(advisories_drain)
         if report is not None:
