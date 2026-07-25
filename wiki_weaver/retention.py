@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -73,12 +74,17 @@ __all__ = [
     "RetentionGateDecision",
     "RetentionChecksOutcome",
     "ShrinkageFlag",
+    "DilutionFlag",
     "DEFAULT_ESCALATION_THRESHOLD",
     "DEFAULT_SHRINK_THRESHOLD",
     "DEFAULT_SNAPSHOTS_KEEP",
+    "DEFAULT_DENSITY_DROP_THRESHOLD",
+    "DEFAULT_DENSITY_FLOOR",
+    "DENSITY_MIN_PAGE_BYTES",
     "snapshot_pages",
     "check_retention",
     "detect_shrinkage",
+    "detect_grounding_dilution",
     "read_removals_manifest",
     "preserve_snapshot",
     "enforce_retention_gate",
@@ -476,6 +482,156 @@ def detect_shrinkage(
 
 
 # ---------------------------------------------------------------------------
+# Deterministic citation-density floor (grounding dilution) -- free, no LLM
+# ---------------------------------------------------------------------------
+#
+# THE PROBLEM (measured on a real production corpus via git-history audit of
+# 121 sync commits, not hypothesized): citation-marker density fell 25-35% in
+# EVERY repo with 4 syncs (e.g. 4.9 -> 3.2 markers/KB) -- appended/rewritten
+# prose is outpacing its grounding markers, and no gate noticed. The claim-
+# retention judge measures whether OLD claims survived; nothing measured
+# whether NEW/rewritten prose carries grounding at the same standard. This
+# heuristic measures exactly that quantity: per-touched-page marker density
+# (count of `[src: ...]` + `[YYYY-MM-DD ...]` markers per KB of body text)
+# after ingest vs the same page's PRE-ingest density, computed from the same
+# pre-ingest snapshot the other retention checks use. ADVISORY-ONLY by design
+# (a heuristic, never a blocker -- even under WIKI_WEAVER_ENFORCE_GATES=1).
+
+# A touched page is flagged when its density dropped STRICTLY MORE than this
+# fraction (0.25 => 4.0 -> 3.0 is NOT flagged; 4.0 -> 2.9 is), or when it
+# FELL BELOW the absolute floor (was at/above the floor before, below after).
+DEFAULT_DENSITY_DROP_THRESHOLD = 0.25
+DEFAULT_DENSITY_FLOOR = 1.0  # markers per KB of body text
+
+# Pages whose after-ingest BODY is smaller than this are skipped -- density
+# on tiny pages is statistical noise (one marker swings it wildly).
+DENSITY_MIN_PAGE_BYTES = 1024
+
+# Structural entry points are catalogs/maps, not grounded prose -- exempt.
+_DENSITY_EXEMPT_PAGES = frozenset({"index.md", "overview.md"})
+
+# Grounding markers as they appear in production corpora:
+#   [src: <anything>]      -- explicit source attribution marker
+#   [YYYY-MM-DD ...]       -- dated provenance marker (with optional trailer)
+_SRC_MARKER_RE = re.compile(r"\[src:[^\]]*\]", re.IGNORECASE)
+_DATE_MARKER_RE = re.compile(r"\[\d{4}-\d{2}-\d{2}[^\]]*\]")
+
+
+def _env_float(name: str, default: float) -> float:
+    """Fail-soft env-var float override (unset/empty/malformed -> default)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def density_drop_threshold() -> float:
+    """Flag threshold for relative density drops (WIKI_WEAVER_DENSITY_DROP_THRESHOLD)."""
+    return _env_float(
+        "WIKI_WEAVER_DENSITY_DROP_THRESHOLD", DEFAULT_DENSITY_DROP_THRESHOLD
+    )
+
+
+def density_floor() -> float:
+    """Absolute markers/KB floor (WIKI_WEAVER_DENSITY_FLOOR)."""
+    return _env_float("WIKI_WEAVER_DENSITY_FLOOR", DEFAULT_DENSITY_FLOOR)
+
+
+@dataclass
+class DilutionFlag:
+    """One page flagged by detect_grounding_dilution()."""
+
+    page: str  # filename, e.g. "team-pulse.md"
+    before_density: float  # markers/KB of body text before ingest
+    after_density: float  # markers/KB of body text after ingest
+
+    def describe(self) -> str:
+        return (
+            f"grounding dilution: {self.page} density "
+            f"{self.before_density:.2f} -> {self.after_density:.2f} markers/KB"
+        )
+
+
+def _marker_density(text: str) -> float:
+    """Grounding markers per KB of BODY text (frontmatter excluded -- same
+    ``_body()`` scope every other retention check uses). 0.0 for empty body."""
+    body = _body(text)
+    kb = len(body.encode("utf-8")) / 1024.0
+    if kb <= 0.0:
+        return 0.0
+    markers = len(_SRC_MARKER_RE.findall(body)) + len(_DATE_MARKER_RE.findall(body))
+    return markers / kb
+
+
+def detect_grounding_dilution(
+    before_dir: str | Path,
+    after_wiki: str | Path,
+    *,
+    drop_threshold: float | None = None,
+    floor: float | None = None,
+) -> list[DilutionFlag]:
+    """Deterministic, free (no LLM) grounding-dilution scan: snapshot vs after-wiki.
+
+    For every TOUCHED page (body changed between the pre-ingest snapshot and
+    the after-wiki), compare citation-marker density (``[src: ...]`` +
+    ``[YYYY-MM-DD ...]`` markers per KB of body text). Flag when:
+      - density dropped STRICTLY MORE than ``drop_threshold`` relative to the
+        page's own pre-ingest density, OR
+      - density FELL BELOW the absolute ``floor`` (at/above it before,
+        below it after -- a page that has always been below the floor is not
+        re-flagged every run).
+
+    Skipped (documented exemptions):
+      - ``index.md`` / ``overview.md`` (catalogs/maps, not grounded prose)
+      - pages whose after-ingest body is < ``DENSITY_MIN_PAGE_BYTES`` (tiny
+        pages -- one marker swings the ratio too wildly to be signal)
+      - deleted pages (covered by detect_shrinkage / the retention judge)
+      - pages with zero pre-ingest markers (nothing to dilute)
+
+    ``drop_threshold`` / ``floor`` default to the env-configurable values
+    (``WIKI_WEAVER_DENSITY_DROP_THRESHOLD`` / ``WIKI_WEAVER_DENSITY_FLOOR``).
+    Independent of the LLM judge: runs even when the judge is unavailable.
+    """
+    if drop_threshold is None:
+        drop_threshold = density_drop_threshold()
+    if floor is None:
+        floor = density_floor()
+
+    flags: list[DilutionFlag] = []
+    for before_page in sorted(Path(before_dir).glob("*.md")):
+        if before_page.name in _DENSITY_EXEMPT_PAGES:
+            continue
+        after_page = Path(after_wiki) / before_page.name
+        before_text = _read_text_or_empty(before_page)
+        after_text = _read_text_or_empty(after_page)
+        after_body = _body(after_text)
+        if not after_body.strip():
+            continue  # deleted/emptied page: shrinkage/judge territory
+        if len(after_body.encode("utf-8")) < DENSITY_MIN_PAGE_BYTES:
+            continue  # tiny page: density is noise
+        if _body(before_text) == after_body:
+            continue  # untouched body: nothing to check
+        before_density = _marker_density(before_text)
+        if before_density <= 0.0:
+            continue  # nothing to dilute
+        after_density = _marker_density(after_text)
+        dropped = after_density < before_density * (1.0 - drop_threshold)
+        fell_below_floor = before_density >= floor and after_density < floor
+        if dropped or fell_below_floor:
+            flags.append(
+                DilutionFlag(
+                    page=before_page.name,
+                    before_density=before_density,
+                    after_density=after_density,
+                )
+            )
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # Self-declared removal manifest (written by the ingest agent) -- R2
 # ---------------------------------------------------------------------------
 
@@ -736,12 +892,13 @@ class RetentionChecksOutcome:
 
     ``decision`` is the LLM-judge gate's verdict (unchanged semantics --
     callers keep their existing advisory/enforce routing on it).
-    ``advisory_signals`` are the NEW deterministic signals, as
+    ``advisory_signals`` are the deterministic signals, as
     ``(gate_name, message)`` pairs ready for the advisories channel:
-    page-shrinkage and removal-manifest. Both are ADVISORY-ONLY by design --
-    they never block, even under WIKI_WEAVER_ENFORCE_GATES=1 (the shrinkage
-    check is a heuristic; the removal manifest is the agent DOING what the
-    prompt asked -- declared removals are reviewable, not punishable).
+    page-shrinkage, grounding-dilution, and removal-manifest. All are
+    ADVISORY-ONLY by design -- they never block, even under
+    WIKI_WEAVER_ENFORCE_GATES=1 (shrinkage and dilution are heuristics; the
+    removal manifest is the agent DOING what the prompt asked -- declared
+    removals are reviewable, not punishable).
     ``snapshot_preserved_to`` is the preserved snapshot dir (None when the
     pass was clean and the snapshot was deleted).
     """
@@ -749,6 +906,7 @@ class RetentionChecksOutcome:
     decision: RetentionGateDecision
     advisory_signals: list[tuple[str, str]] = field(default_factory=list)
     shrinkage: list[ShrinkageFlag] = field(default_factory=list)
+    dilution: list[DilutionFlag] = field(default_factory=list)
     removals: list[dict] = field(default_factory=list)
     snapshot_preserved_to: Path | None = None
 
@@ -767,13 +925,17 @@ def run_retention_checks(
     1. ``detect_shrinkage()`` -- free deterministic per-page body-line /
        lost-``##``-heading scan against the pre-ingest snapshot (independent
        of the LLM judge; runs even when the judge cannot).
-    2. ``enforce_retention_gate()`` -- the existing LLM-judge-backed re-check,
+    2. ``detect_grounding_dilution()`` -- free deterministic per-touched-page
+       citation-marker density check against the same snapshot (relative
+       drop + absolute floor; ADVISORY-ONLY, see the module section above).
+    3. ``enforce_retention_gate()`` -- the existing LLM-judge-backed re-check,
        with ``cleanup_snapshot=False`` so the snapshot's fate is decided HERE.
-    3. ``read_removals_manifest()`` -- the ingest agent's self-declared
+    4. ``read_removals_manifest()`` -- the ingest agent's self-declared
        removals (``.ai/removals.jsonl``).
-    4. Snapshot fate: when ANY retention signal fired (judge-detected loss or
-       escalated grader errors, a shrinkage flag, or a non-empty removal
-       manifest) the snapshot is PRESERVED to ``.wiki/snapshots/<source>-<ts>/``
+    5. Snapshot fate: when ANY retention signal fired (judge-detected loss or
+       escalated grader errors, a shrinkage flag, a dilution flag, or a
+       non-empty removal manifest) the snapshot is PRESERVED to
+       ``.wiki/snapshots/<source>-<ts>/``
        (pruned to the ``snapshots_keep`` newest) so a human can diff/restore;
        it is deleted only on a clean pass.
 
@@ -790,6 +952,12 @@ def run_retention_checks(
     except Exception as exc:  # noqa: BLE001 -- observability must never break the run
         print(f"WARN: page-shrinkage heuristic could not run: {exc}")
 
+    dilution: list[DilutionFlag] = []
+    try:
+        dilution = detect_grounding_dilution(snapshot_dir, wiki)
+    except Exception as exc:  # noqa: BLE001 -- observability must never break the run
+        print(f"WARN: grounding-dilution heuristic could not run: {exc}")
+
     decision = enforce_retention_gate(
         wiki,
         snapshot_dir,
@@ -802,6 +970,7 @@ def run_retention_checks(
 
     fired = (
         bool(shrinkage)
+        or bool(dilution)
         or bool(removals)
         or decision.action in ("block_confirmed_loss", "block_escalated_errors")
     )
@@ -829,6 +998,21 @@ def run_retention_checks(
                 ),
             )
         )
+    if dilution:
+        detail = "; ".join(f.describe() for f in dilution)
+        drop_pct = int(density_drop_threshold() * 100)
+        signals.append(
+            (
+                "grounding-dilution",
+                (
+                    "grounding-dilution heuristic (ADVISORY -- never blocks) "
+                    f"[source {source_name}]: {len(dilution)} page(s) lost "
+                    f"citation-marker density (>{drop_pct}% drop vs pre-ingest, "
+                    f"or fell below the {density_floor():g} markers/KB floor): "
+                    f"{detail}"
+                ),
+            )
+        )
     if removals:
         pages = sorted({str(e.get("page", "?")) for e in removals})
         signals.append(
@@ -853,6 +1037,7 @@ def run_retention_checks(
         decision=decision,
         advisory_signals=signals,
         shrinkage=shrinkage,
+        dilution=dilution,
         removals=removals,
         snapshot_preserved_to=preserved,
     )
