@@ -390,6 +390,22 @@ def _append_ledger(wiki: Path, entry: dict) -> None:
 FAILURE_KIND_NO_VERDICT = "no_verdict"
 FAILURE_KIND_JUDGED = "judged_non_converged"
 FAILURE_KIND_UNKNOWN = "unknown"
+# spawn_timeout_no_progress -- the spawn circuit breaker tripped: the same
+# pipeline node was re-executed repeatedly (each execution killed at the
+# spawn timeout) with ZERO artifact writes between executions. See
+# wiki_weaver/spawn_breaker.py for the incident + mechanism.
+FAILURE_KIND_SPAWN_BREAKER = "spawn_timeout_no_progress"
+
+
+def spawn_breaker_marker_path(wiki: Path) -> Path:
+    """The spawn circuit breaker's trip marker (see wiki_weaver/spawn_breaker.py).
+
+    Written by the breaker when it trips; consumed (read for the ledger
+    ``failure_kind``, then deleted) by the fail path that quarantines the
+    source. Lives in ``.ai/`` scratch space -- like ``.ai/assessment.md`` it
+    is per-source state, cleared at the start of every synthesis run.
+    """
+    return wiki / ".ai" / "spawn-breaker.json"
 
 
 def classify_failure_kind(wiki: Path, started_at: float | None) -> str:
@@ -404,7 +420,22 @@ def classify_failure_kind(wiki: Path, started_at: float | None) -> str:
     PREVIOUS source, since ``.ai/`` is shared scratch state) means no verdict
     was ever rendered for this source (=> ``no_verdict``). Without a
     ``started_at`` reference the question is undecidable (=> ``unknown``).
+
+    SPAWN-BREAKER OVERRIDE (checked FIRST): a trip marker written by the
+    spawn circuit breaker during this source's synthesis window (same mtime
+    gating as the assessment file; both run paths also clear the marker at
+    run start) means the source was killed by repeated no-progress
+    re-execution -- the distinct ``spawn_timeout_no_progress`` kind, more
+    specific than either verdict-based kind.
     """
+    marker = spawn_breaker_marker_path(wiki)
+    try:
+        if marker.is_file() and (
+            started_at is None or marker.stat().st_mtime >= started_at
+        ):
+            return FAILURE_KIND_SPAWN_BREAKER
+    except OSError:
+        pass
     if started_at is None:
         return FAILURE_KIND_UNKNOWN
     assessment = wiki / ".ai" / "assessment.md"
