@@ -29,6 +29,11 @@ from pathlib import Path
 
 import pytest
 
+# Skip this test module entirely if wiki_weaver.engine_runner cannot be imported
+# (it depends on amplifier-module-pipeline-runner, which may not be installed in
+# CI test environments that use --no-deps pip install).
+pytest.importorskip("wiki_weaver.engine_runner")
+
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
