@@ -145,6 +145,14 @@ class SupervisorConfig:
     context_warn_frac: float = 0.8
     # 5. cost: optional budget; None = report-only, never a concern.
     budget_usd: float | None = None
+    # 8. node respawn: consecutive re-executions of the SAME pipeline node
+    # (back-to-back ``pipeline:node_start`` for one node_id, nothing between)
+    # with zero artifact writes since the streak began => anomaly. This is
+    # the live signal of the spawn-timeout silent-waste incident: a child
+    # killed at the spawn timeout is failure-routed straight back to the
+    # same node (attempt never increments), burning a full timeout window
+    # per lap while writing nothing (see wiki_weaver/spawn_breaker.py).
+    respawn_warn_count: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +275,16 @@ class Supervisor:
         self._pages_scanned_at = self.run_start
         self.last_verdict: str | None = None
 
+        # node-respawn streak state (check 8): consecutive
+        # ``pipeline:node_start`` events for the SAME node_id with no other
+        # node starting in between. Healthy pipelines alternate nodes
+        # (ingest -> normalize -> ... -> assess -> feedback -> ingest), so a
+        # streak >1 only occurs when the engine failure-routes a node back
+        # to itself (the spawn-timeout silent-waste incident).
+        self._respawn_node = ""
+        self._respawn_streak = 0
+        self._respawn_started = self.run_start
+
     # -- events.jsonl (tail-safe incremental reader) ------------------------
 
     def _read_new_events(self) -> list[dict[str, Any]]:
@@ -323,6 +341,19 @@ class Supervisor:
                 self._current_session = sid
             stats = self._sessions.setdefault(sid, _SessionStats())
             name = str(ev.get("event") or "")
+            if name == "pipeline:node_start":
+                data = ev.get("data") or {}
+                node_id = (
+                    str(data.get("node_id") or "") if isinstance(data, dict) else ""
+                )
+                if node_id:
+                    if node_id == self._respawn_node:
+                        self._respawn_streak += 1
+                    else:
+                        self._respawn_node = node_id
+                        self._respawn_streak = 1
+                        ts = _parse_iso_ts(str(ev.get("timestamp") or ""))
+                        self._respawn_started = ts if ts is not None else self.now_fn()
             if name == "llm:request":
                 stats.llm_requests += 1
             elif name == "llm:response":
@@ -561,6 +592,56 @@ class Supervisor:
             )
         self._pages_scanned_at = scan_started
 
+    def _newest_artifact_mtime(self) -> float:
+        """Newest mtime of any artifact under the wiki, EXCLUDING ``.wiki/``.
+
+        Pages + ``.ai/`` scratch + inbox: the same "did synthesis write
+        anything?" scope the spawn circuit breaker fingerprints.
+        ``.wiki/`` (run logs, checkpoints, the ledger) churns constantly and
+        would mask a genuinely write-free re-execution loop.
+        """
+        newest = 0.0
+        for root, dirs, files in os.walk(self.wiki):
+            dirs[:] = [d for d in dirs if d != ".wiki"]
+            for name in files:
+                try:
+                    newest = max(newest, (Path(root) / name).stat().st_mtime)
+                except OSError:
+                    continue
+        return newest
+
+    def _check_respawn(self, concerns: list[dict[str, Any]]) -> None:
+        """Check 8 (spawn-timeout silent-waste incident): the same node
+        re-executed back-to-back with zero artifact writes since the streak
+        began => ``anomaly`` naming the node.
+
+        Re-execution count = streak - 1 (the first start is the legitimate
+        execution). Healthy runs never produce consecutive same-node starts
+        -- the engine only does that when failure-routing a node back to
+        itself (e.g. every spawn killed at the spawn timeout).
+        """
+        re_executions = self._respawn_streak - 1
+        if re_executions < self.config.respawn_warn_count:
+            return
+        if self._newest_artifact_mtime() >= self._respawn_started:
+            return  # writes happened since the streak began -- progressing
+        concerns.append(
+            {
+                "check": "node-respawn",
+                "level": VERDICT_ANOMALY,
+                "node": self._respawn_node,
+                "message": (
+                    f"node '{self._respawn_node}' has been re-executed "
+                    f"{re_executions}x back-to-back with ZERO artifact "
+                    f"writes since the streak began -- the spawn-timeout "
+                    f"silent-waste pattern (each lap burns a full spawn "
+                    f"timeout in LLM calls and produces nothing; the spawn "
+                    f"circuit breaker should quarantine this source -- see "
+                    f"wiki_weaver/spawn_breaker.py)"
+                ),
+            }
+        )
+
     def _check_advisories(
         self, result: dict[str, Any] | None, concerns: list[dict[str, Any]]
     ) -> list[str]:
@@ -612,6 +693,8 @@ class Supervisor:
         session_calls = self._check_ceiling(concerns) if not terminal else 0
         session_ctx = self._check_context(concerns) if not terminal else 0
         self._check_budget(concerns)
+        if not terminal:
+            self._check_respawn(concerns)
         self._check_markers(now, concerns)
         new_advisories = self._check_advisories(result, concerns)
 
@@ -638,6 +721,8 @@ class Supervisor:
                 "current_session_context_tokens": session_ctx,
                 "sources_converged": converged,
                 "sources_failed": failed,
+                "respawn_streak_node": self._respawn_node,
+                "respawn_streak": self._respawn_streak,
                 "inbox_remaining": inbox_remaining,
                 "cost_usd": round(self._total_cost_usd, 4),
                 "events_parsed": self._events_parsed,

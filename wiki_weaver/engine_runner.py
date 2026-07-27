@@ -39,6 +39,7 @@ from amplifier_module_pipeline_runner import run_pipeline
 
 from ._assets import pipeline_dir
 from .lib import (
+    FAILURE_KIND_SPAWN_BREAKER,
     removals_manifest_path,
     touched_manifest_path,
     wiki_failed,
@@ -50,6 +51,7 @@ from .lib import (
 )
 from .model_resolver import resolve_model
 from .policy import WikiPolicy, load_policy
+from .spawn_breaker import SpawnCircuitBreaker, clear_marker, read_marker
 
 # --------------------------------------------------------------------------
 # Static asset locations (this repo).
@@ -201,11 +203,34 @@ LLM_NODE_IDS = ("ingest", "assess", "feedback")
 # a shorter window. Bounding it here makes a stalled spawn fail loud (a clear,
 # actionable TimeoutError) instead of blocking the shared event loop forever.
 #
-# Default is generous headroom above every legitimately observed duration
-# (multiples of the ~6-minute worst case seen live) so normal slow-but-working
-# runs are never falsely killed. Override via WIKI_WEAVER_SPAWN_TIMEOUT for
-# unusually large corpora / slower models.
-SPAWN_TIMEOUT_SECONDS = float(os.environ.get("WIKI_WEAVER_SPAWN_TIMEOUT", "1800"))
+# Default is generous headroom above every legitimately observed duration so
+# normal slow-but-working runs are never falsely killed. Raised 1800 -> 3600
+# after a live incident where a monster meeting-transcript source's ingest
+# node legitimately needed >30 minutes: the 1800s cap killed it mid-work and
+# the engine silently re-executed it 8 times over 3.6 hours with zero writes
+# (see wiki_weaver/spawn_breaker.py for the full mechanism + the circuit
+# breaker that makes the repeated-kill case fail LOUD instead of spinning).
+# Override via WIKI_WEAVER_SPAWN_TIMEOUT for unusually large corpora /
+# slower models.
+DEFAULT_SPAWN_TIMEOUT_SECONDS = 3600.0
+
+
+def spawn_timeout_seconds() -> float:
+    """Per-spawn wall-clock ceiling (seconds), env-overridable.
+
+    ``WIKI_WEAVER_SPAWN_TIMEOUT`` wins when set to a positive number;
+    garbage / non-positive values fall back to the default (fail-safe: a
+    zero/negative timeout would kill every spawn instantly).
+    """
+    raw = os.environ.get("WIKI_WEAVER_SPAWN_TIMEOUT", "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SPAWN_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_SPAWN_TIMEOUT_SECONDS
+
+
+SPAWN_TIMEOUT_SECONDS = spawn_timeout_seconds()
 
 
 @dataclass
@@ -519,6 +544,28 @@ def _fs_child_constraint(wiki_dir: Path) -> Callable[[Any], Any]:
     def _constrain(child_bundle: Any) -> Any:
         _constrain_agent_fs(child_bundle, wiki_dir)
         return child_bundle
+
+    return _constrain
+
+
+def _with_spawn_breaker(
+    breaker: Any, inner: Callable[[Any], Any]
+) -> Callable[[Any], Any]:
+    """Compose the spawn circuit breaker into a ``child_constraint`` callable.
+
+    ``child_constraint`` is invoked by pipeline-runner's ``make_spawn_fn``
+    in-process immediately BEFORE every child spawn -- the one wiki-weaver-
+    owned seam that runs on each node (re-)execution. ``breaker.on_spawn()``
+    raises ``SpawnBreakerTripped`` when the same node keeps re-executing
+    with zero artifact writes (the silent-waste failure mode -- see
+    wiki_weaver/spawn_breaker.py), turning what would be another full
+    spawn-timeout window of wasted LLM calls into an instant, loud failure
+    that the existing quarantine machinery routes to ``_failed/``.
+    """
+
+    def _constrain(child_bundle: Any) -> Any:
+        breaker.on_spawn()
+        return inner(child_bundle)
 
     return _constrain
 
@@ -1105,6 +1152,13 @@ def run_inner(
     # read it per source). Missing file is fine.
     removals_manifest_path(wiki_dir).unlink(missing_ok=True)
 
+    # Spawn circuit breaker (see wiki_weaver/spawn_breaker.py): clear any
+    # stale trip marker from a previous source/run, then arm a fresh breaker
+    # for this run. It rides the child_constraint seam, so every child spawn
+    # is checked for the repeated-re-execution-with-zero-writes pattern.
+    clear_marker(wiki_dir)
+    breaker = SpawnCircuitBreaker(wiki_dir, logs_dir / "events.jsonl")
+
     result = _run_coro(
         run_pipeline(
             dot_source,
@@ -1113,17 +1167,32 @@ def run_inner(
             provider=policy.provider,
             profiles=None,
             extra_overlays=[_ci_overlay(logs_dir)],
-            child_constraint=_fs_child_constraint(wiki_dir),
+            child_constraint=_with_spawn_breaker(
+                breaker, _fs_child_constraint(wiki_dir)
+            ),
             spawn_timeout=SPAWN_TIMEOUT_SECONDS,
         )
     )
     status = result.status or "unknown"
+    failure_reason = result.failure_reason
+    # If the breaker tripped during THIS run (the marker was cleared above,
+    # so its presence is unambiguous), surface the distinct failure kind
+    # loudly in the failure_reason -- the engine's own terminal reason is a
+    # generic retry-exhaustion message that hides the real cause.
+    marker = read_marker(wiki_dir)
+    if marker is not None and status != "success":
+        failure_reason = (
+            f"spawn circuit breaker tripped ({FAILURE_KIND_SPAWN_BREAKER}): "
+            f"node '{marker.get('node_id', 'unknown')}' executed "
+            f"{marker.get('executions', '?')}x with zero artifact writes "
+            f"(engine reason: {failure_reason})"
+        )
     return InnerResult(
         status=status,
         converged=status == "success",
         logs_dir=logs_dir,
         notes=result.notes[:2000],
-        failure_reason=result.failure_reason,
+        failure_reason=failure_reason,
     )
 
 
@@ -1340,6 +1409,26 @@ def run_ingest(
                 for r in new_rows
                 if not r.get("converged")
             ]
+            # Spawn-breaker advisory: a source quarantined by the circuit
+            # breaker (repeated re-execution with zero writes -- see
+            # wiki_weaver/spawn_breaker.py) is surfaced as a NAMED advisory
+            # in result.json, not just a ledger row. Computed locally (not
+            # appended to the shared `advisories` list) so a re-entrant
+            # _emit_result call can never double-record it.
+            breaker_advisories = [
+                (
+                    f"spawn-timeout circuit breaker: source "
+                    f"'{r['source']}' quarantined after repeated "
+                    f"re-execution with zero artifact writes "
+                    f"(failure_kind={FAILURE_KIND_SPAWN_BREAKER}; "
+                    f"consider raising WIKI_WEAVER_SPAWN_TIMEOUT for "
+                    f"very large sources)"
+                )
+                for r in failed_records
+                if r.get("failure_kind") == FAILURE_KIND_SPAWN_BREAKER
+            ]
+            for adv in breaker_advisories:
+                print(f"!! SPAWN-BREAKER ADVISORY: {adv}", flush=True)
             counts = {
                 "total": converged_count + failed_count,
                 "converged": converged_count,
@@ -1351,7 +1440,7 @@ def run_ingest(
             run_result = build_result(
                 f"ingest-{timestamp}",
                 counts,
-                advisories=advisories,
+                advisories=[*advisories, *breaker_advisories],
                 blocked=blocked_records,
                 errored=errored_records,
                 failed=failed_records,

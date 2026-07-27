@@ -77,8 +77,10 @@ def main() -> int:
         _collision_safe_move,
         _source_hash,
         classify_failure_kind,
+        spawn_breaker_marker_path,
         wiki_failed,
     )
+    from wiki_weaver.spawn_breaker import read_marker
 
     failed_dir = wiki_failed(wiki_dir)
     failed_dir.mkdir(parents=True, exist_ok=True)
@@ -103,16 +105,35 @@ def main() -> int:
     # docstring), then record the failure in the ledger. Fail-soft: the
     # quarantine move above is the load-bearing act.
     failure_kind = classify_failure_kind(wiki_dir, started_at)
+    reason = (
+        "synthesize.dot did not converge (or tamper was detected) -- "
+        "routed to .wiki/failed/ by the ingest.dot fail_handler"
+    )
+    # Spawn circuit breaker (see wiki_weaver/spawn_breaker.py): when the
+    # breaker's trip marker classified this quarantine, carry its specifics
+    # (node + execution count) into the ledger reason, then CONSUME the
+    # marker so it can never leak onto the NEXT source of this drain (the
+    # engine-driven drain loops back to setup without re-entering the
+    # Python code that clears the marker at run start).
+    breaker = read_marker(wiki_dir)
+    if breaker is not None:
+        reason = (
+            f"spawn circuit breaker: node '{breaker.get('node_id', 'unknown')}' "
+            f"executed {breaker.get('executions', '?')}x with zero artifact "
+            f"writes (each execution killed at the spawn timeout) -- "
+            f"quarantined by the ingest.dot fail_handler"
+        )
+        try:
+            spawn_breaker_marker_path(wiki_dir).unlink(missing_ok=True)
+        except OSError:
+            pass
     _append_failure_ledger(
         wiki_dir,
         source=source_path.name,
         source_id=source_id,
         file_hash=file_hash,
         failed_to=str(dest),
-        reason=(
-            "synthesize.dot did not converge (or tamper was detected) -- "
-            "routed to .wiki/failed/ by the ingest.dot fail_handler"
-        ),
+        reason=reason,
         failure_kind=failure_kind,
         logs_dir=_run_logs_dir(wiki_dir),
     )
