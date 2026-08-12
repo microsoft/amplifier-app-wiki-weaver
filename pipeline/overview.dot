@@ -1,0 +1,143 @@
+// =============================================================================
+// overview.dot -- wiki-weaver v2 : end-to-end lifecycle ("I get it" diagram)
+// =============================================================================
+//
+// *** DOCUMENTATION-ONLY. DO NOT INVOKE WITH `attractor run`. ***
+//
+// Per the expert rewrite review (wiki-weaver-v2-design/REWRITE-GUIDE.md
+// section on overview.dot): a top-level menu loop adds no capability that
+// invoking the six command pipelines directly does not already give you,
+// and it doubles the resume surface area for no benefit. Operators and
+// orchestrating scripts should invoke init.dot / ingest.dot / ask.dot /
+// lint.dot / correct.dot / canon.dot directly:
+//
+//   attractor run pipeline/init.dot    --param wiki_root=... --cwd ...
+//   attractor run pipeline/ingest.dot  --param wiki_root=... --cwd ...
+//   attractor run pipeline/ask.dot     --param wiki_root=... --param question=... --cwd ...
+//   attractor run pipeline/lint.dot    --param wiki_root=... --cwd ...
+//   attractor run pipeline/correct.dot --param wiki_root=... --cwd ...
+//   attractor run pipeline/canon.dot   --param wiki_root=... --cwd ...
+//
+// This file IS kept parseable and IS validated (it passes validate_or_raise
+// and renders with `dot -Tpng` exactly like the six real pipelines) because
+// keeping it structurally honest costs nothing and lets it serve as a
+// trustworthy map -- but it is intentionally excluded from any executable
+// wiring (no CI job, no wrapper script, invokes it). If you DO run it, it
+// works: it is a real (if redundant) menu loop over the six sub-pipelines.
+//
+// WHY THIS FILE STILL EARNS ITS PLACE
+//   It is the one artifact that gives a reader the whole lifecycle at a
+//   glance: init (once) -> ingest (repeatedly, over time) -> {ask | lint |
+//   correct | canon}, with canon cascading into a targeted reprocess via
+//   ingest.dot (see canon.dot's own `reprocess` folder node -- that is the
+//   ONLY real invocation of the cascade; it is not duplicated here as a
+//   second live edge, which would double-run the reprocess).
+//
+// CORE ARCHITECTURAL INSIGHT
+//   Every hexagon gate in this whole system -- including next_action below,
+//   and every review/approval gate inside the six sub-pipelines -- is
+//   answered by an Interviewer. The GRAPH is identical whether that
+//   Interviewer is a real human at a keyboard or an agent proxy acting on
+//   the human's behalf (docs/DESIGN.md section 7). Nothing in the .dot
+//   changes; only the host's Interviewer implementation differs.
+//
+// THE FIVE STORAGE LAYERS (read top to bottom = read order; docs/DESIGN.md
+// section 2 -- kept here as a COMMENT, not a subgraph/cluster: an attractor
+// .dot is an execution graph, not a diagram, and the parser flattens
+// subgraphs into the SAME node namespace as the main flow -- a legend
+// cluster becomes a second start node, a second exit node, and a pile of
+// unreachable-node ERRORs. This is the single most common defect class in
+// early drafts of these pipelines; see REWRITE-GUIDE.md section 1.2.):
+//
+//   sources/     immutable raw material            kind: article | meeting
+//                                                   | stream | repo
+//   lens/        HUMAN-AUTHORED ground truth:       canon docs + standing
+//                corrections + proxy persona.       Sources are read THROUGH
+//                                                    the lens; the lens
+//                                                    outranks ingested
+//                                                    evidence.
+//   wiki/        LLM-owned markdown (the woven output)
+//   AGENTS.md    the schema, at the wiki root (Karpathy's layer 3)
+//   cost.jsonl   per-ingest cost ledger -- makes the cost guardrail
+//                (docs/DESIGN.md section 3) enforceable
+//
+// SHAPE VOCABULARY USED IN THIS FILE
+//   Mdiamond = start (exactly one)      Msquare = exit (exactly one)
+//   box      = LLM node (prompt=...)    parallelogram = deterministic tool
+//   hexagon  = human/proxy gate         folder = sub-pipeline (dot_file=...)
+// =============================================================================
+
+digraph wiki_weaver_v2_overview {
+  graph [
+    goal="Give a reader the complete life-of-a-wiki mental model in one diagram",
+    label="wiki-weaver v2 -- end-to-end lifecycle (documentation-only)",
+    default_max_retry=1
+  ]
+  rankdir=TB
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
+
+  start [shape=Mdiamond, label="new wiki\nrequested"]
+  exit  [shape=Msquare,  label="session end"]
+
+  init_pipeline [
+    shape=folder,
+    dot_file="init.dot",
+    label="init\n(interview loop)"
+  ]
+
+  // The one recurring decision point: what does the human/proxy want to do
+  // with an already-initialized wiki? Answered by an Interviewer -- see
+  // "CORE ARCHITECTURAL INSIGHT" above.
+  next_action [
+    shape=hexagon, penwidth=2,
+    label="next_action\n(human or proxy Interviewer)"
+  ]
+
+  ingest_pipeline [
+    shape=folder,
+    dot_file="ingest.dot",
+    label="ingest\n(one source at a time)"
+  ]
+  ask_pipeline [
+    shape=folder,
+    dot_file="ask.dot",
+    label="ask\n(read-only)"
+  ]
+  lint_pipeline [
+    shape=folder,
+    dot_file="lint.dot",
+    label="lint\n(health check, reports only)"
+  ]
+  correct_pipeline [
+    shape=folder,
+    dot_file="correct.dot",
+    label="correct\n(targeted reprocess)"
+  ]
+  canon_pipeline [
+    shape=folder,
+    dot_file="canon.dot",
+    label="canon\n(update ground truth --\ncascades into its OWN\nreprocess folder call,\nnot duplicated here)"
+  ]
+
+  start -> init_pipeline
+  init_pipeline -> next_action
+
+  // Hexagon multiple-choice: choices come from these OUTGOING EDGE LABELS.
+  // Every edge below is UNCONDITIONAL by construction -- adding condition=
+  // to any of these would break routing per the engine's gate contract.
+  next_action -> ingest_pipeline  [label="[1] Ingest more sources"]
+  next_action -> ask_pipeline     [label="[2] Ask a question"]
+  next_action -> lint_pipeline    [label="[3] Run health check"]
+  next_action -> correct_pipeline [label="[4] Correct a claim"]
+  next_action -> canon_pipeline   [label="[5] Update canon"]
+  next_action -> exit             [label="[6] Done for now"]
+
+  // A wiki's life is an open-ended sequence of these commands, not a fixed
+  // pipeline -- each command always feeds back into the same decision point.
+  ingest_pipeline  -> next_action [loop_restart="true"]
+  ask_pipeline     -> next_action [loop_restart="true"]
+  lint_pipeline    -> next_action [loop_restart="true"]
+  correct_pipeline -> next_action [loop_restart="true"]
+  canon_pipeline   -> next_action [loop_restart="true"]
+}

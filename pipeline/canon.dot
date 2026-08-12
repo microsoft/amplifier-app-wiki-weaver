@@ -1,0 +1,168 @@
+// =============================================================================
+// canon.dot -- wiki-weaver v2 : human updates the ground truth
+// =============================================================================
+//
+// PURPOSE
+//   Let a human (or proxy) add or update a canon doc in lens/ -- the hand-
+//   authored ground truth (e.g. a product press release) that outranks
+//   everything ingested. Then find which wiki pages were derived under the
+//   OLD canon, get scope approval, and run a targeted reprocess restricted
+//   to the sources that fed those pages.
+//
+// DOES NOT
+//   - Does not reprocess the whole wiki on every canon change -- impact_scan
+//     narrows to exactly the pages/sources whose derivation predates this
+//     canon update. Same targeted-reprocess mechanism correct.dot uses.
+//   - Does not skip the human/proxy gate -- canon outranks ingested evidence
+//     precisely because it is human-authored; the decision to actually spend
+//     the reprocessing cost stays with a human/proxy, not automatic.
+//
+// REAL INVOCATION
+//   attractor run pipeline/canon.dot \
+//     --param wiki_root=/srv/wikis/acme \
+//     --param canon_doc_path=lens/canon/product-positioning.md \
+//     --cwd /srv/wikis/acme \
+//     --on-human-gate console
+//
+// REQUIRED CONTEXT VARS
+//   wiki_root       -- filesystem root of the wiki (REQUIRED)
+//   canon_doc_path  -- (optional, default: "lens/canon/untitled.md") which
+//                       canon doc under lens/canon/ is being added or updated
+//
+// ARTIFACTS AND GUARDS
+//   .ai/canon-content.md      -- EPHEMERAL: the author_canon freeform answer,
+//                                 captured via tool_env (never shell-
+//                                 interpolated -- this is a whole-document
+//                                 body, the same injection class as
+//                                 correct.dot's correction_text).
+//   lens/canon/<path>         -- COMMITTED. The updated ground truth.
+//
+//   THE CONTEXT-CLONE MECHANISM (confirmed against handlers/pipeline.py):
+//   impact_scan sets restrict_to_sources via parse_json="true" directly into
+//   THIS pipeline's context. The `reprocess` folder node below does NOT
+//   template that value into a context.*="${...}" attribute (folder-node
+//   context.* attrs are injected VERBATIM, unsubstituted -- see ingest.dot's
+//   header). Instead, PipelineHandler.execute() clones the FULL parent
+//   context into the child (handlers/pipeline.py, step 6), so
+//   restrict_to_sources set here is automatically visible inside the child
+//   ingest.dot run. This is confirmed engine behavior, not an assumption.
+//
+//   outputs="ingested_count" on `reprocess` must name the EXACT context key
+//   ingest.dot's commit_accept sets (see ingest.dot's header) -- the folder
+//   mechanism copies same-named keys, it does not rename them.
+//
+//   This pipeline has no resume loop of its own; its one mutating branch
+//   (reprocess) delegates entirely to ingest.dot's resume doctrine.
+// =============================================================================
+
+digraph wiki_weaver_v2_canon {
+  graph [
+    goal="Update the human-authored ground truth in lens/canon/, scope the impact, and reprocess only what was derived under the old canon",
+    label="canon.dot -- update ground truth",
+    params="wiki_root, canon_doc_path",
+    max_pipeline_duration="20m",
+    default_max_retry=1,
+    default_fidelity="full"
+  ]
+  rankdir=LR
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
+
+  start [shape=Mdiamond, label="canon update requested"]
+  exit  [shape=Msquare,  label="canon updated\n(reprocessed or deferred)"]
+
+    // FAIL-LOUD GUARD (verified defect, 2026-07-25): attractor's
+    // AutoApproveInterviewer.ask() on a FREEFORM question falls through and returns
+    // the literal string "auto-approved". This gate's text flows into a
+    // human-authored layer, so accepting that stub would poison it. The capture
+    // tool downstream MUST reject the literal "auto-approved" and exit non-zero
+    // (hard pipeline failure) rather than persist it. A gate that cannot be
+    // answered must STOP the run, never invent an answer.
+  author_canon [
+    shape=hexagon, penwidth=2,
+    mode="freeform",
+    label="author_canon\n(human or proxy:\nadd/update a canon doc)",
+    prompt="Provide the new or updated canon document content for lens/canon/ (e.g. a hand-crafted product press release, a standing policy statement, or any other ground-truth text). Indicate which canon doc this adds or replaces."
+  ]
+
+  // Whole-document free text -> env var, never inline shell substitution.
+  capture_canon [
+    shape=parallelogram,
+    label="capture_canon\n(free text -> file,\nnever shell-interpolated)",
+    tool_env="human.gate.text,py",
+    tool_command="$py -m wiki_weaver.canon.capture --out .ai/canon-content.md"
+  ]
+
+  write_canon [
+    shape=parallelogram,
+    label="write_canon\n(deterministic write to\nlens/canon/, reads file directly)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.canon.write --wiki-root \"$wiki_root\" --path \"$canon_doc_path\" --content-file .ai/canon-content.md"
+  ]
+
+  // Sets impacted_pages / restrict_to_sources directly into context via
+  // parse_json -- the tool cannot set context via a --set-context CLI flag
+  // (no such mechanism exists); the entire stdout must be the JSON object.
+  impact_scan [
+    shape=parallelogram, penwidth=2,
+    label="impact_scan\n(which wiki pages were derived\nunder the OLD canon; sets\nimpacted_pages + restrict_to_sources)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.canon.impact_scan --wiki-root \"$wiki_root\" --canon-doc \"$canon_doc_path\""
+  ]
+
+  scope_gate [
+    shape=hexagon, penwidth=2,
+    label="scope_gate\n(human or proxy:\napprove reprocess scope)",
+    description="$impacted_pages"
+  ]
+
+  // canon-update cascades into a targeted reprocess -- restricted to exactly
+  // the sources that fed the pages impact_scan identified as stale under the
+  // new canon. Reuses ingest.dot rather than duplicating its logic.
+  reprocess [
+    shape=folder, penwidth=2,
+    dot_file="ingest.dot",
+    outputs="ingested_count",
+    label="reprocess\n(ingest.dot, restricted\nto impacted sources)"
+  ]
+
+  validate [
+    shape=parallelogram,
+    label="validate\n(structural checks,\ndeterministic)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.canon.validate --wiki-root \"$wiki_root\" --out .ai/validation-report.md"
+  ]
+
+  commit_with_reprocess [
+    shape=parallelogram,
+    label="commit_with_reprocess\n(git commit canon doc\n+ reprocessing results)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.canon.commit --wiki-root \"$wiki_root\" --canon-doc \"$canon_doc_path\" --reprocessed \"$ingested_count\""
+  ]
+
+  commit_no_reprocess [
+    shape=parallelogram,
+    label="commit_no_reprocess\n(git commit canon doc alone)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.canon.commit --wiki-root \"$wiki_root\" --canon-doc \"$canon_doc_path\" --reprocessed 0"
+  ]
+
+  start -> author_canon
+  author_canon -> capture_canon
+  capture_canon -> write_canon
+  write_canon -> impact_scan
+  impact_scan -> scope_gate
+
+  // Hexagon multiple-choice: unconditional edges, DISTINCT first targets
+  // (reprocess vs. commit_no_reprocess) -- this is what makes the choice
+  // real; converging both choices onto the same node is the bug fixed
+  // structurally in ingest.dot's review_gate (see that file's header).
+  scope_gate -> reprocess           [label="[A] Approve reprocess of impacted pages"]
+  scope_gate -> commit_no_reprocess [label="[B] Skip reprocess for now (canon updated only)"]
+
+  reprocess -> validate
+  validate -> commit_with_reprocess
+  commit_with_reprocess -> exit
+  commit_no_reprocess -> exit
+}

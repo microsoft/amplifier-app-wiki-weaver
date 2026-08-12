@@ -1,209 +1,823 @@
-// synthesize.dot -- Integrate ONE source into the wiki, until coherent.
+// =============================================================================
+// synthesize.dot -- wiki-weaver v2 : the corpus-level theme-formation loop
+// =============================================================================
 //
-// The inner attractor loop: ingest -> normalize (deterministic) ->
-// footnotes (deterministic) -> validate (structural, code) ->
-// assess (quality, LLM, against the shared rubric) ->
-// converged? -> (refine) feedback -> loop_restart.
-// Specialized clone of convergence-factory.dot.
+// PURPOSE
+//   Close the loop the gist describes and this project's own measurements
+//   found severed (FINDINGS.md \u00a75, \u00a77):
 //
-// This is the THINNEST provable slice. The outer corpus-sweep (foreach source)
-// wraps this as a folder sub-pipeline once this is proven on real sources.
+//     "The wiki is a very good index of the corpus's VOCABULARY and a poor
+//     index of its ARGUMENTS. It can gather a theme a human already
+//     gathered. It cannot find one nobody named."
 //
-// Required context variables (inject via parent context.* or --context):
-//   $source_path      -- the raw source article to integrate this cycle
-//   $wiki_dir         -- the wiki directory (persistent artifact, survives loop_restart)
-//   $schema_path      -- path to SCHEMA.md (the page contract)
-//   $convergence_rubric -- path to CONVERGENCE_RUBRIC.md (assess's per-SOURCE
-//                          gate: "is THIS one source well integrated?" -- NOT the
-//                          whole-corpus eval rubric, which votes refine forever on
-//                          a single freshly-ingested article)
-//   $normalize_cmd    -- link normalizer command (normalize_links.py $wiki_dir)
-//   $footnotes_cmd    -- footnote converter command (footnotes.py $wiki_dir)
-//   $normalize_unicode_cmd -- stray \uXXXX escape-artifact repair command
-//                          (normalize_unicode.py $wiki_dir; defense-in-depth
-//                          bridge for amplifier-support #306, see module docstring)
-//   $validate_cmd     -- structural validator command (validate_wiki.py $wiki_dir)
-//   $touched_manifest -- path to the touched-pages manifest ($wiki_dir/.ai/
-//                        touched-pages.txt): ingest OVERWRITES it each cycle
-//                        with one wiki-relative page path per line for every
-//                        page created/modified; assess verifies EXACTLY those
-//                        pages (bounded work-list) instead of re-reading the
-//                        whole wiki. Missing manifest => assess falls back to
-//                        the old full-scope behavior (fail-open).
+//   Four measured wikis over the same 50-article corpus never moved the
+//   entity layer (67.5% -> 68.8% single-source, 0-1 of 3 largest themes
+//   with a real page, across every arm) because every LLM pass in
+//   ingest.dot/ask.dot is scoped to ONE source. Nothing ever holds the
+//   corpus. The gist already names the mechanism that closes this:
 //
-// State lives on the FILESYSTEM ($wiki_dir, .ai/feedback/, .ai/assessment.md,
-// .ai/touched-pages.txt) because loop_restart resets context.
+//     lint (docs/llm-wiki-pattern.md L54): "...important concepts mentioned
+//     but lacking their own page..."
+//     query   (L52, bolded): "good answers can be filed back into the wiki
+//     as new pages... your explorations compound in the knowledge base
+//     just like ingested sources do."
+//
+//   lint finds the gap -> a question is asked -> the answer becomes a page.
+//   lint.dot has zero outgoing edges (by design -- see its own header) and
+//   ask.dot's file_back has never fired on an unattended run (nothing
+//   invokes ask.dot without a human asking a question first). This
+//   pipeline is the missing wire, run unattended:
+//
+//     check_nav_pages (fail-loud precondition, CODE)
+//        -> extract_source_arguments (deterministic, CODE -- condenses
+//           every type:source wiki page's own thesis into
+//           .ai/source-arguments.md; see iteration-4 fix below)
+//        -> scan_arguments (ONE bounded LLM pass over wiki/index.md +
+//           .ai/source-arguments.md ONLY -- finds ARGUMENTS the corpus
+//           repeatedly contends but has never given a page)
+//        -> rank_gap_candidates (validates + threshold-filters, CODE) --
+//           see wiki_weaver.synthesize.rank_candidates
+//        -> select_gap (THE resume gate + wiki-scoped exit predicate, CODE)
+//        -> answer_gap (a SECOND corpus-scoped LLM pass, hybrid discipline,
+//           refuses rather than guesses)
+//        -> write_gap_page + validate + commit  (CODE)
+//        -> loop until no gap remains above threshold, or the iteration
+//           cap is hit
+//
+//   PROVENANCE (why two LLM passes, not one counting pass): the first
+//   version of this pipeline's gap-finder was a pure n-gram/document-
+//   frequency counter -- deterministic, no LLM, exactly the "no LLM in a
+//   gate a deterministic check can do" rule this project otherwise follows.
+//   It was WRONG for this specific job: a literal-text counter can only
+//   find phrases that recur as TEXT, and the entire premise of an "unnamed"
+//   theme is that nobody has settled on shared vocabulary for it yet --
+//   that is precisely what a counter cannot see. Measured against the real
+//   restore-arm corpus, it ranked chrome ("final thoughts", "open source",
+//   "days ago") while all three CONFIRMED missing themes (token economics,
+//   local inference, human judgment) scored zero or near-zero. The gist
+//   itself puts an LLM at this exact step ("ask the LLM to health-check the
+//   wiki... important concepts mentioned but lacking their own page"), and
+//   scopes its read narrowly -- exactly what lint.dot's own analyze node
+//   already does ("Read the wiki's index and overview pages only"). This
+//   pipeline's scan_arguments node follows that same "read a condensed
+//   view, not the raw corpus" precedent, but NOT with index.md/overview.md
+//   as the condensed view -- see ITERATION 4 below for why that seed was
+//   replaced.
+//   See wiki_weaver.synthesize.rank_candidates' module docstring for the
+//   full accounting of the retired n-gram mechanism (iteration 1).
+//
+//   ITERATION 4 (this pass): an independent evaluation of iteration 3's
+//   index.md+overview.md seed found it measurably self-referential --
+//   "the naming step is seeded from the index and overview, and the index
+//   and overview are themselves organized per-source and per-entity -- so
+//   a theme that has no entity and no title is invisible to the seed.
+//   Feeding the same structure back into itself will keep finding the same
+//   things." Measured: the entity-layer single-source ratio did not move
+//   (68.8% -> 68.8%) across a full run; both pages it named were themes
+//   whose vocabulary already existed in an article title. scan_arguments
+//   now reads wiki/index.md (unchanged -- still the cheapest "does a page
+//   already cover this" cross-check) + .ai/source-arguments.md, a NEW
+//   deterministic extraction (wiki_weaver.synthesize.extract_source_
+//   arguments) of the "## Thesis"/"## Thesis and Scope" section of every
+//   type:source wiki page -- the one layer that states each source's own
+//   argument independent of which entities it happens to mention. Chosen
+//   over reading the full source pages (300+ KB, too large to fit
+//   alongside everything else this pass needs) and over overview.md
+//   (per-source but arrival-ordered, arguments buried, not separated).
+//
+//   ITERATION 5 (widened ask): scan_arguments' prompt was widened from
+//   "the two or three arguments you are most confident about" to "aim to
+//   surface EVERY argument you can defend" -- a narrow ask was measurably
+//   suppressing real candidates. Widening it surfaced a THIRD candidate,
+//   ``cross-session-statelessness-cost``, cited at 3 sources -- below
+//   min_sources (4) and discarded. An independent evaluator separately
+//   identified this as one of exactly two themes this corpus genuinely
+//   argues but never named (9 articles, 8 authors). That single data point
+//   reframed the whole mechanism -- see ITERATION 6 below.
+//
+//   ITERATION 6 (this pass): DETECTION and ATTRIBUTION are different
+//   operations, and prior iterations asked scan_arguments to do both in one
+//   pass. Detection -- "what arguments recur across these source theses" --
+//   is a scan for pattern, and iterations 1-5 already show it works: every
+//   iteration since 3 has correctly NAMED real, uncovered arguments.
+//   Attribution -- "which of these source theses actually make THIS
+//   argument" -- is a per-candidate judgment against every source, and
+//   iteration 5's evidence shows THIS is where it degrades:
+//   cross-session-statelessness-cost was named correctly but attributed to
+//   3 sources when a human reader found 9, because the sources making that
+//   argument use entirely different vocabulary for it -- exactly the case a
+//   single pass juggling detection AND attribution for multiple candidates
+//   at once is least equipped to get right. This pass splits the two
+//   apart: scan_arguments (unchanged node, relaxed prompt -- see below)
+//   still detects arguments and proposes a SEED source_ids list, explicitly
+//   documented as non-exhaustive; three NEW nodes --
+//   wiki_weaver.synthesize.attribute_select (CODE, picks the next
+//   undecided candidate), attribute_sources (LLM box, judges ONE candidate
+//   against EVERY source thesis in .ai/source-arguments.md -- "does this
+//   source take a position on THIS contention, agreeing, extending,
+//   complicating, or disputing it" -- not a vocabulary match), and
+//   attribute_record (CODE, validates the box's output and can ADD sources
+//   the seed missed or DROP seed sources that do not actually hold) -- sit
+//   between scan_arguments and rank_gap_candidates. min_sources/
+//   max_source_fraction now threshold the ATTRIBUTED counts, never the
+//   detection seed. Cost is bounded to ONE model call per unique candidate
+//   (scanning the full ~44 KB source-arguments.md extract in that one
+//   call), not one call per source per candidate -- see
+//   wiki_weaver.synthesize.attribute_select's module docstring for the
+//   full cost-bound accounting (dedup, already-named pre-filter, a
+//   defensive candidate-count ceiling) and attribute_record's for the
+//   graceful, never-loop-wedging fallback when one candidate's attribution
+//   call itself misfires.
+//
+//   ITERATION 7 (this pass): a live experiment ran scan_arguments' own
+//   detection prompt against ALL 46 source theses (~44 KB, the full
+//   .ai/source-arguments.md) in one pass -- across six separate
+//   iterations of that pass (iterations 1-6 above), it proposed only 2-3
+//   candidate arguments every time. The IDENTICAL prompt, run against a
+//   SINGLE CHUNK of 8 theses drawn from that same file, returned 11
+//   distinct arguments in one pass -- including
+//   ``token-cost-is-the-governing-constraint`` (5 sources), a theme that
+//   scored zero across every one of the six full-corpus runs. Detection
+//   triages to the strongest few signals in whatever set it is shown; at
+//   46 theses, an argument dispersed across sources sharing no common
+//   vocabulary loses to lexically-anchored ones, while at 8 it surfaces.
+//   Set size was the only variable that changed. THE FIX: scan_arguments
+//   now runs once PER CHUNK of the source-arguments extract (default 8
+//   theses per chunk -- empirically derived from the experiment above, see
+//   wiki_weaver.synthesize.chunk_arguments' module docstring, not a
+//   general claim about LLM attention span) via a NEW select/box/record
+//   loop -- wiki_weaver.synthesize.chunk_arguments (splits the extract,
+//   CODE), select_chunk (picks the next un-scanned chunk, CODE),
+//   scan_arguments (unchanged LLM box, now scoped to ONE chunk instead of
+//   the whole extract), record_chunk_candidates (unions each chunk's
+//   candidates into the accumulated cross-chunk list, CODE) -- the SAME
+//   loop shape iteration 6 already proved for ATTRIBUTION, now applied to
+//   DETECTION. A term proposed by several different chunks is UNIONED
+//   (source_ids combined, never discarded) rather than treated as a
+//   duplicate to throw away -- a theme surfacing from multiple chunks is
+//   evidence of genuine dispersion, not noise. Once every chunk is
+//   scanned, the union is flattened into the SAME .ai/gap-candidates-
+//   raw.json file attribute_select already read before this pass --
+//   attribute_select/attribute_sources/attribute_record/rank_gap_
+//   candidates require NO changes: the attribution loop has no visibility
+//   into (and no need to know about) the chunking that produced its input.
+//   See wiki_weaver.synthesize.select_chunk's and record_chunk_
+//   candidates' module docstrings for the full resumability and merge
+//   accounting.
+//
+// THE EXIT CONDITION IS THE POINT
+//   ingest.dot's sink is a queue-drain predicate: "is sources/ - ledger.jsonl
+//   empty?" -- never anything about the WIKI (FINDINGS.md \u00a77: "ten
+//   fragmented pages satisfies it perfectly, forever"). select_gap's
+//   no_gap sentinel is the first exit condition in this system that
+//   describes the ARTIFACT: no argument remains, contended by >= min_sources
+//   distinct sources, that lacks its own wiki page. Bounded by
+//   iteration_bound alongside it (max_iterations) so a pathological corpus
+//   cannot loop forever even if the candidate list is long. An EMPTY
+//   candidate list (scan_arguments found no genuine unnamed argument) is a
+//   legitimate, expected no_gap outcome on a well-covered wiki -- it must
+//   never be confused with a failure.
+//
+// THE THRESHOLD
+//   min_sources default 4, max_source_fraction default 0.6 -- see
+//   wiki_weaver.synthesize.rank_candidates' module docstring for the full
+//   justification: FINDINGS.md \u00a75 measured that every concept page that
+//   emerged as a real theme in this project's own test wikis had >= 4
+//   discussing sources, and the three CONFIRMED missed themes (token
+//   economics: 13 sources, local inference: 11, human judgment: 8) all
+//   clear it by 2x-3x, while never exceeding 60% of the corpus (a phrase
+//   in most of the corpus is boilerplate, not a theme). Both are --params,
+//   not hardcoded, so a denser or sparser corpus can retune them without
+//   editing this graph.
+//   ITERATION 6: these thresholds are now applied to the ATTRIBUTED
+//   source_ids (attribute_select/attribute_sources/attribute_record's
+//   per-candidate output), never to scan_arguments' detection-pass seed --
+//   see rank_gap_candidates' node comment and rank_candidates.py's own
+//   ITERATION 6 docstring section for why that distinction is the entire
+//   point of this pass.
+//
+// synthesis_gate RETIRED FROM THE DEFAULT PATH (measured net-neutral -- see
+// the eval below): it was added to fill the last of the source gist's four
+// human jobs with no home elsewhere in this pipeline -- "think about what
+// it all means" (see wiki_weaver.synthesize.synthesis_brief's module
+// docstring for the full provenance). Sat between rank_gap_candidates and
+// select_gap: pre-write leverage to drop a weak candidate before any page
+// was written for it. The FIRST read (paired n=3, same base wiki, gate off
+// vs on) measured +1.1pp, 2/3 wins -- promising enough to KEEP, default off,
+// pending a wider read (SITE-EVALUATION.md). That wider read (paired n=6,
+// same base wikis, calibrated metric) did NOT hold:
+//
+//   base      ctl %   gate %   delta
+//   td1       48.6%    50.0%    +1.4
+//   td2       59.4%    61.3%    +1.9
+//   td3       37.9%    37.9%     0.0
+//   t1        36.7%    36.7%     0.0
+//   t2        36.7%    37.9%    +1.3
+//   t3        38.1%    37.5%    -0.6
+//
+//   PAIRED MEAN +0.7pp   wins 3/6
+//
+// The pre-committed bar for this read was >= 4/6 wins; it missed it (two
+// ties, one loss). The n=3 read was the optimistic half of a wider
+// distribution, not a stable effect. The mechanism is not BROKEN -- it
+// demonstrably drops a real candidate before any page is written, proven
+// live (see persist_synthesis_guidance's ledgering discipline) -- it simply
+// does not move quality enough to justify the extra pass and the extra
+// human/proxy touchpoint. `prepare_synthesis_brief`, `synthesis_gate`, and
+// `persist_synthesis_guidance` are GONE from this default pipeline --
+// `rank_gap_candidates` now proceeds straight to `select_gap` on
+// candidates_ok. `select_gap`'s own, UNCHANGED decided_terms() exclusion is
+// unaffected on this path -- it simply never sees any ADDITIONAL declined
+// terms this gate used to ledger.
+//
+// EXCISED, not left in-graph-but-unreachable (the same judgment call
+// pipeline/ingest.dot's own header already made for curate_gate's
+// retirement): this project has TWICE already been burned by exactly that
+// shape of mistake -- canon.dot and correct.dot both parsed and validated
+// for months while their entire wiki_weaver.canon/wiki_weaver.correct
+// Python packages were missing from src/ (see pipeline/CLI-CONTRACT.md's
+// "Known pre-existing gap"), because nothing ever actually ran them.
+// `--gate-mode-for` selects WHICH INTERVIEWER answers a gate an edge
+// already reaches -- it cannot restore an edge that no longer exists, so
+// "leave it reachable only via --gate-mode-for" was never actually
+// available once `rank_gap_candidates` routes straight to `select_gap`
+// (this task's own requirement). The mechanism is preserved, WIRED AND
+// RUNNABLE (not dead), as `evals/arms/synthesize-gate.dot` -- the same
+// pattern this project already uses for retired/alternative routing
+// decisions (see evals/arms/ingest-curate.dot, evals/arms/ingest-b.dot,
+// evals/arms/ingest-c.dot) -- so a future re-evaluation (a different
+// corpus, or a revised synthesis_brief prompt) has a real pipeline to run,
+// not a flag pointing at nothing.
+//
+// DOES NOT
+//   - Modify ingest.dot or ask.dot. Reuses wiki_weaver.ingest.validate (the
+//     SAME structural-validation module ingest.dot's own validate node
+//     calls) rather than editing either existing graph.
+//   - Let this become a page-generator. answer_gap is held to the SAME
+//     refuse-rather-than-guess discipline as ask.dot's answer node: if it
+//     cannot find real, citable cross-source support for the candidate
+//     term, it declines and the loop moves on (commit --decision declined,
+//     ledgered so the term is never re-proposed). scan_arguments is held to
+//     the SAME discipline one step earlier: an empty candidate array is the
+//     honest, expected output when no genuine unnamed argument exists --
+//     never invent one to look productive.
+//   - Route on LLM token output anywhere (AP-2, DESIGN.md \u00a712.1). Every
+//     routing decision here is a tool's stdout sentinel or a deterministic
+//     file check (gap_coverage_check tests WHICH FILE answer_gap wrote,
+//     exactly like ask.dot's coverage_check; rank_gap_candidates tests
+//     whether the attribution loop's JSON is well-formed, never what it
+//     says; attribute_select's routing is its own dedup/cap bookkeeping,
+//     never scan_arguments' claim text).
+//   - Let scan_arguments read anything beyond wiki/index.md and
+//     .ai/current-chunk.md (ITERATION 7: previously the full
+//     .ai/source-arguments.md; see header's ITERATION 7 section for why
+//     detection now runs per-chunk) -- check_nav_pages fails loud BEFORE
+//     the first model call if index.md is missing/a stub, or if too few
+//     type:source wiki pages exist for extract_source_arguments to build a
+//     real condensed view, rather than letting a cheap read silently
+//     produce zero (indistinguishable from a genuine no_gap).
+//   - Let attribute_sources read anything beyond
+//     .ai/current-attribution-candidate.json and .ai/source-arguments.md --
+//     same narrow-scope discipline as scan_arguments, and the same reason:
+//     the whole point is ONE bounded read per candidate, not a re-scan of
+//     the raw corpus.
+//   - Name any specific theme/term inside any prompt in this graph. Every
+//     prompt in this pipeline (scan_arguments, attribute_sources,
+//     answer_gap) is fully general -- if a theme only ever surfaces
+//     because it was named in a prompt, that proves nothing about whether
+//     the mechanism itself works on a corpus nobody has pre-inspected.
+//
+// REAL INVOCATION
+//   attractor run pipeline/synthesize.dot \
+//     --param wiki_root=/srv/wikis/acme \
+//     --cwd /srv/wikis/acme
+//   (No human gate in this pipeline -- it is designed to run unattended,
+//   same as lint.dot; --on-human-gate is irrelevant here.)
+//
+// REQUIRED CONTEXT VARS
+//   wiki_root           -- filesystem root of the wiki (REQUIRED)
+//   min_sources         -- (optional, default: 4 -- see rank_candidates.py)
+//                           distinct-source threshold a candidate must clear;
+//                           also the floor check_nav_pages requires on usable
+//                           type:source wiki pages (no candidate could ever
+//                           clear this threshold with fewer pages to draw on)
+//   max_source_fraction -- (optional, default: 0.6 -- see rank_candidates.py)
+//                           ceiling on source_count / total corpus sources
+//   max_iterations      -- (optional, default: 50) bounded cap on gap
+//                           iterations processed THIS invocation
+//   max_synth_retry     -- (optional, default: 2) bounded structural-
+//                           validation retry for the CURRENT gap
+//   max_attribution_candidates -- (optional, default: 25 -- see
+//                           attribute_select.py) ceiling on unique
+//                           candidates attributed per invocation
+//   detection_chunk_size -- (optional, default: 8 -- see
+//                           chunk_arguments.py; ITERATION 7) source theses
+//                           per detection chunk. Empirically derived from
+//                           the live experiment described in ITERATION 7
+//                           above, not a general LLM-attention claim --
+//                           retune for a corpus this has not been measured
+//                           against.
+//   dedupe_threshold     -- (optional, default: 0.75 -- see
+//                           rank_candidates.py's DEFAULT_DEDUPE_JACCARD)
+//                           Jaccard similarity (over ATTRIBUTED source_ids)
+//                           at or above which rank_gap_candidates (Gate A)
+//                           merges two candidates as near-duplicates.
+//                           Calibrated against a live run's confirmed
+//                           duplicate pair (0.846) and its next-highest,
+//                           genuinely-distinct near-miss (0.538) -- see
+//                           dedupe_near_duplicates' docstring.
+//
+// ARTIFACTS AND GUARDS
+//   synth-ledger.jsonl        -- COMMITTED, append-only: every term this
+//                                loop has ever decided on (paged or
+//                                declined). THE resume/idempotency state --
+//                                see wiki_weaver.synthesize.select_gap.
+//   wiki/<slug>.md             -- COMMITTED: a new theme page, one per
+//                                paged gap, type: theme, cites every
+//                                source that justified it.
+//   .ai/source-arguments.md    -- EPHEMERAL: extract_source_arguments'
+//                                condensed, one-thesis-per-source-page
+//                                view -- what attribute_sources reads
+//                                (iteration-4 fix). ITERATION 7:
+//                                scan_arguments no longer reads this file
+//                                directly (see .ai/argument-chunks.json
+//                                below); attribute_sources' read of it is
+//                                unchanged. Recomputed fresh every
+//                                invocation; never committed.
+//   .ai/argument-chunks.json   -- EPHEMERAL (ITERATION 7): chunk_
+//                                arguments' fixed-size split of the same
+//                                source theses -- a JSON array of chunk
+//                                document strings, read by select_chunk to
+//                                drive the per-chunk detection loop.
+//   .ai/chunk-detection-progress.json -- EPHEMERAL (ITERATION 7):
+//                                select_chunk/record_chunk_candidates'
+//                                resumable working state for the per-chunk
+//                                detection loop -- signature-stamped
+//                                against argument-chunks.json.
+//   .ai/current-chunk.md       -- EPHEMERAL (ITERATION 7): the ONE chunk
+//                                select_chunk chose for this pass -- what
+//                                scan_arguments actually reads instead of
+//                                the full source-arguments.md.
+//   .ai/current-chunk-candidates-raw.json -- EPHEMERAL (ITERATION 7):
+//                                scan_arguments' raw candidate list for
+//                                that ONE chunk -- validated and unioned
+//                                into chunk-detection-progress.json by
+//                                record_chunk_candidates.
+//   .ai/gap-candidates-raw.json -- EPHEMERAL: the FINAL, unioned cross-
+//                                chunk candidate list (ITERATION 7: written
+//                                by select_chunk once every chunk is
+//                                scanned, flattened from chunk-detection-
+//                                progress.json's accumulated union --
+//                                previously scan_arguments wrote this
+//                                directly in one pass). source_ids here
+//                                are a detection SEED (iteration 6), not a
+//                                final count -- attribute_select/
+//                                attribute_sources/attribute_record read
+//                                this file exactly as before; the chunking
+//                                that produced it is invisible to them.
+//   .ai/attribution-progress.json -- EPHEMERAL: attribute_select/
+//                                attribute_record's resumable working state
+//                                for the per-candidate attribution loop --
+//                                signature-stamped against
+//                                gap-candidates-raw.json (iteration 6).
+//   .ai/current-attribution-candidate.json -- EPHEMERAL: the ONE candidate
+//                                attribute_select chose for this pass
+//                                (iteration 6).
+//   .ai/current-attribution-result.json -- EPHEMERAL: attribute_sources'
+//                                (LLM box) corrected verdict for that ONE
+//                                candidate (iteration 6).
+//   .ai/gap-candidates-attributed.json -- EPHEMERAL: the attribution
+//                                loop's FINAL flat candidate list, written
+//                                once all candidates are attributed
+//                                (iteration 6) -- what rank_gap_candidates
+//                                now reads instead of the raw seed.
+//   .ai/gap-candidates.json    -- EPHEMERAL: rank_gap_candidates' ranked,
+//                                threshold-filtered candidate list --
+//                                computed ONCE per invocation, then read
+//                                by select_gap on every loop pass.
+//   .ai/current_gap.json       -- EPHEMERAL: the gap select_gap chose.
+//   .ai/gap-context.json       -- EPHEMERAL: corpus-scoped reading list.
+//   .ai/gap-answer.md          -- EPHEMERAL: written ONLY on real support.
+//   .ai/gap-declined.md        -- EPHEMERAL: written ONLY on refusal.
+//   .ai/synth-reweave-attempts.json -- EPHEMERAL: retry_bound's counter.
+//   This pipeline IS resumable: select_gap recomputes pending gaps from
+//   .ai/gap-candidates.json MINUS synth-ledger.jsonl on every pass
+//   (REWRITE-GUIDE.md \u00a72.4's doctrine, identical shape to ingest.dot's
+//   select_source) -- kill it mid-run, restart from start, it re-runs
+//   scan_arguments and the attribution loop and picks up with zero
+//   duplicate pages. The attribution loop itself (attribute_select /
+//   attribute_sources / attribute_record) is ALSO resumable WITHIN one
+//   scan_arguments run via .ai/attribution-progress.json's signature stamp
+//   (see wiki_weaver.synthesize.attribute_select's module docstring) --
+//   a crash mid-attribution costs at most the one candidate in flight.
+// =============================================================================
 
-digraph synthesize {
-    graph [
-        goal="Integrate one source into a coherent, link-valid, contradiction-flagging wiki",
-        default_max_retry="4",
-        default_fidelity="compact"
-    ]
+digraph wiki_weaver_v2_synthesize {
+  graph [
+    goal="Find arguments the corpus repeatedly contends but has never named (one bounded LLM detection pass over index.md + a deterministic extract of every source page's own thesis, code-validated), attribute each candidate against every source thesis individually (one bounded LLM pass per candidate, able to add or drop sources), threshold-filter the attributed counts, answer the highest-mass one from the whole corpus (one LLM pass, refuse rather than guess), write it as a cited page, loop until no candidate remains above threshold or the iteration cap is hit",
+    label="synthesize.dot -- the corpus-level theme-formation loop, unattended",
+    params="wiki_root, min_sources, max_source_fraction, max_iterations, max_synth_retry, max_attribution_candidates, detection_chunk_size, dedupe_threshold",
+    default_max_retry=1,
+    default_fidelity="full"
+  ]
+  rankdir=LR
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
 
-    start [shape=Mdiamond, label="Start"]
+  start [shape=Mdiamond, label="synthesize requested"]
+  exit  [shape=Msquare,  label="no gap remains above\nthreshold, nav pages missing,\ncandidates malformed, ledger\ncorrupt, or iteration cap exhausted"]
 
-    // INGEST (LLM): read source + existing wiki + prior feedback + schema,
-    // then create/update concept/entity pages with [[links]], frontmatter,
-    // and surface contradictions per the schema. Updates existing pages,
-    // never creates per-source duplicates -- under an explicit RETENTION
-    // CONTRACT (every prior claim ends the edit RETAINED / SUPERSEDED-with-
-    // trace / MOVED; terminology matches wiki_weaver/grading.py's
-    // claim-retention taxonomy) with removals self-declared to
-    // .ai/removals.jsonl (read post-run as a run-level advisory).
-    // CLEAR MANIFEST (code, deterministic): delete last cycle's touched-pages
-    // manifest so `gate_ingest` below can never be satisfied by a STALE file
-    // from a prior loop_restart. This is attractor's documented rm-f idempotency
-    // rule for verdicts inside loops. `rm -f` on an absent path is a no-op and
-    // always exits 0.
-    clear_manifest [
-        shape=parallelogram,
-        label="Clear Touched Manifest",
-        tool_command="rm -f $touched_manifest"
-    ]
+  // Fail-loud precondition, BEFORE any model call: scan_arguments reads
+  // wiki/index.md and .ai/source-arguments.md (built by the next node), so
+  // a missing/stub index.md OR a near-empty set of type:source wiki pages
+  // must never silently produce zero candidates (indistinguishable from a
+  // genuine, well-covered no_gap) -- this project has been bitten by
+  // exactly that class of failure three times.
+  check_nav_pages [
+    shape=parallelogram,
+    label="check_nav_pages\n(fail-loud precondition:\nindex.md populated + enough\ntype:source pages exist, deterministic)",
+    timeout="1m",
+    tool_env="min_sources,py",
+    tool_command="$py -m wiki_weaver.synthesize.check_nav_pages --wiki-root \"$wiki_root\" --min-source-pages \"$min_sources\""
+  ]
 
-    ingest [
-        llm_provider="anthropic",
-        llm_model="claude-sonnet-4-6",
-        label="Ingest Source",
-        prompt="You are weaving one source into a persistent knowledge wiki.\n\nSource to integrate: $source_path\nWiki directory: $wiki_dir\nSchema (the page contract you MUST follow): $schema_path\n\nThis source has ALREADY been assigned a stable source id by the orchestrator: $source_id. Use EXACTLY this integer in every page's frontmatter `sources:` list for claims drawn from this source. Do NOT invent, guess, or renumber source ids.\n\nHARD PROHIBITION (process state is owned by the deterministic CLI, never by you): You MUST NOT create, write, append to, move, or delete `.wiki/.processed.jsonl` (the ledger) or anything under `_sources/`. Archiving the source and appending the ledger line are the CLI's EXCLUSIVE job and happen ONLY after this pipeline reports real convergence. Do not fabricate run metadata (logs_dir, timestamps, converged flags). If you write or move those paths the run is treated as tampered and FAILS. Your job is ONLY to write/update wiki pages under $wiki_dir.\n\nFirst read $schema_path.\n\nREMEDIATION COMES FIRST: read $validation_report (the deterministic validator's latest result). If it exists and says FAIL, your #1 job THIS cycle is to fix EVERY listed failure -- each broken [[wikilink]], orphan page, missing/invalid-frontmatter page, and uncited page named there -- before any other work. Do not stop until each listed item is resolved.\n\nThen check .ai/feedback/ for refinement guidance from prior iterations.\n\nWork from a FOCUSED slice of the wiki, not the whole corpus (this must scale): read index.md and overview.md, the existing pages whose concepts THIS source touches (find them by title/topic), and every page named in $validation_report. Do NOT read every page in the wiki each cycle.\n\nThen integrate the source:\n- INTEGRATE EXISTING pages when the source adds to a concept already present (one page per concept; never create a near-duplicate): RE-READ the affected section(s) in full and RE-WRITE them so this source's claims are FUSED with existing claims at the sentence and paragraph level -- do NOT merely append new sentences or paragraphs that stand alone citing only this source; synthesize them INTO the existing prose. Sections MUST be organized by THEME, not by source. NEVER create a header of the form '## Topic (from Source N)', '## Topic (Source N)', or '## Source N: ...'. NEVER write consecutive paragraphs within a thematic section where each cites a single disjoint source -- if a paragraph citing only [2] is followed by a paragraph citing only [3], MERGE them: state the shared point once citing [2][3] and integrate the differences in the same breath. TARGET: a reader cannot tell how many sources a section drew from without reading the inline [N] markers; most cited sentences on a multi-source page should weave two or more sources, not form single-source runs. EXAMPLE -- STACKED (bad): 'Claude Code runs in the terminal [2]. It supports subagents [3]. It can do cross-language migration [3].' WOVEN (good): 'Claude Code is a terminal-native agent [2][3] whose subagent model [3] enables multi-step work like cross-language migrations [3], distinguishing it from editor-bound tools [2].' When two sources cover the same point, merge into one statement citing both [N][M]; when they disagree, use '## Open tensions' (see below) -- do not give each its own section.\n- RETENTION CONTRACT (governs every re-write above; integration is the goal, silent deletion is a defect): every claim already present on a page you touch MUST end this edit in exactly ONE of three states -- RETAINED (still present, possibly reworded, meaning preserved), SUPERSEDED (replaced by newer information WITH a visible trace: the new text names what it replaces, e.g. '500, up from 100' or 'superseded by [N]', or the old claim moves to a dated '## History' note), or MOVED (relocated to another page with a [[wikilink]]). Absence of mention is NOT evidence of staleness: if THIS source neither confirms nor supersedes an existing claim, KEEP IT UNCHANGED -- never remove or condense prior content merely because this source does not repeat it. Dated/operational history is CONTENT, not clutter: when it no longer fits the narrative flow, compact it into a '## History' subsection on the same page -- never silently drop it. Newly added or rewritten prose MUST carry grounding markers (inline citations) at the same standard and density as the existing content it joins -- never let this edit's new text dilute the page's grounding.\n- Create new concept/entity pages for genuinely new concepts, with valid frontmatter (title, type, sources, last_updated).\n- CITE-OR-DON'T-CLAIM: every non-trivial claim MUST trace to THIS source ($source_id) or an existing page. If you cannot ground a claim, do NOT assert it -- write a '> TODO-VERIFY: <the unverified statement>' blockquote instead. A TODO-VERIFY is PREFERRED over speculation; never invent facts to fill a gap.\n- FRAME-VENDOR-CLAIMS: vendor/marketing/promotional or superlative performance claims (e.g. 'production-ready in one attempt', '10x faster', star counts or adoption stats reported by the vendor) MUST be attributed in the wiki's voice ('X reports...', 'according to [N]...', 'claims to be...') not asserted as established fact. Distinguish vendor assertion from independently verified fact.\n- NO DANGLING LINKS: every [[wikilink]] must resolve to a real page. Either create a SUBSTANTIVE page for the target (see next rule) or do not add the link.\n- NO EMPTY STUBS: a page must contain at least one real, grounded sentence of content -- never a title-and-frontmatter-only shell. If you cannot say something real and sourced about a concept, do not create its page (and therefore do not link to it).\n- CONTRADICTIONS GO IN '## Open tensions' (surface, don't average): when the source DISAGREES with an existing page (different claim, or a different number for the same fact), DO NOT average or overwrite -- add/extend an '## Open tensions' section citing both sides with sources.\n- Maintain index.md: keep its page catalog current (add new pages, remove stale entries).\n- Maintain overview.md as a SYNTHESIZED NAVIGATIONAL MAP -- NOT a per-source log:\n  (1) Re-read the current overview.md.\n  (2) For each new concept page or hub created/updated this cycle, add or update a `##` theme section that links to it with [[wikilinks]] and a one-line orientation of what's there.\n  (3) HARD RULE: never write a `(source N)` parenthetical, `(sources N, M)`, or a \"A Nth thread (source N)...\" opener anywhere in overview.md -- the overview describes KNOWLEDGE THEMES, not ingest history.\n  (4) Organize every section by TOPIC/THEME, not by source or ingest order.\n  (5) A reader of overview.md must be able to navigate the whole wiki by theme; if it reads as an article-by-article list, rewrite it as a thematic map.\n\nREMOVAL MANIFEST (self-declare every removal -- append-only): whenever you remove, condense away, supersede, or move ANY prior claim during this cycle, APPEND one JSON line per claim to $wiki_dir/.ai/removals.jsonl of the form {\"page\": \"<wiki-relative page path>\", \"removed\": \"<the claim, quoted or tightly paraphrased>\", \"action\": \"superseded|condensed|moved\", \"reason\": \"<one line: why>\"}. Append only -- never rewrite or delete existing lines. If you removed or condensed nothing, do not create the file. Like the touched-pages manifest below, this is scratch state, NOT process state -- writing it is required and is not tampering.\n\nWrite all changes under $wiki_dir now.\n\nTOUCHED-PAGES MANIFEST (write this LAST, after every page write): OVERWRITE $touched_manifest with exactly one wiki-relative page path per line for EVERY page you created or modified THIS cycle (e.g. concept-x.md, index.md, overview.md). No prose, no bullets, no headers -- just paths, one per line. The assess step verifies exactly the pages you list; a page you changed but omit will NOT be re-checked. Like .ai/feedback/ and .ai/assessment.md this file is scratch state, NOT process state -- writing it is required and is not tampering.\n\nWhen you have finished writing, your FINAL message MUST be a short one-paragraph summary listing the pages you created or updated and (when you were repairing validator failures) how you resolved each listed item. NEVER end the turn with only tool calls or an empty message -- if your most recent action was a tool call, emit your summary now as plain text before stopping."
-    ]
+  // Deterministic, code-tier extraction (iteration-4 fix -- see header):
+  // condenses every type:source wiki page's own "## Thesis"/"## Thesis and
+  // Scope" section into .ai/source-arguments.md, so scan_arguments reads
+  // an ARGUMENT-bearing view instead of the per-entity index.md /
+  // per-arrival-order overview.md that iteration 3 measured as
+  // self-referential. See wiki_weaver.synthesize.extract_source_arguments'
+  // module docstring for the extraction choice and why the alternatives
+  // (first paragraph, first sentence per heading) were rejected.
+  extract_source_arguments [
+    shape=parallelogram,
+    label="extract_source_arguments\n(deterministic: condenses every\ntype:source page's own thesis)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.extract_source_arguments --wiki-root \"$wiki_root\""
+  ]
 
-    // GATE INGEST (code, deterministic): ingest's VERDICT.
-    //
-    // attractor's fail-closed goal-gate contract (EXTENSIONS.md 25) requires a
-    // goal_gate node to produce an EXPLICIT verdict; a plain-prose final message
-    // is NOT explicit and returns RETRY, so an LLM node that ends in prose burns a
-    // guaranteed wasted cycle re-doing correct work. A parallelogram's EXIT CODE
-    // is an explicit verdict by construction, so the gate moves here and `ingest`
-    // goes back to being a pure judgment node.
-    //
-    // Why a tool node instead of asking the prompt for a JSON marker: the router
-    // scrapes the LAST balanced {...} from the response, and this same prompt tells
-    // ingest to write JSON removal records to .ai/removals.jsonl -- so a model that
-    // narrates a removal after the marker silently reintroduces the exact defect.
-    // Measured, both directions: see eval/test_goal_gate_contract.py.
-    //
-    // The check is the touched-pages manifest ingest writes as its LAST action:
-    // non-empty => it wrote pages. Note this also closes the manifest's documented
-    // fail-OPEN behavior (missing manifest => assess silently widens to full scope).
-    gate_ingest [
-        shape=parallelogram,
-        label="Ingest Produced Pages?",
-        goal_gate=true,
-        retry_target="clear_manifest",
-        tool_command="test -s $touched_manifest"
-    ]
+  // ITERATION 7, CODE: splits the SAME source theses extract_source_
+  // arguments condenses into fixed-size groups (default 8, empirically
+  // derived -- see header's ITERATION 7 section and wiki_weaver.synthesize.
+  // chunk_arguments' module docstring for the live-run evidence). Writes
+  // .ai/argument-chunks.json for select_chunk to drive the per-chunk
+  // detection loop below.
+  chunk_arguments [
+    shape=parallelogram,
+    label="chunk_arguments\n(deterministic: splits source theses\ninto fixed-size detection chunks)",
+    timeout="1m",
+    tool_env="detection_chunk_size,py",
+    tool_command="$py -m wiki_weaver.synthesize.chunk_arguments --wiki-root \"$wiki_root\" --chunk-size \"$detection_chunk_size\""
+  ]
 
-    // NORMALIZE (code, deterministic): rewrite [[Display Title]] -> [[slug|Title]]
-    // so Obsidian can resolve all wikilinks as direct filename-stem matches.
-    // Always exits 0 (idempotent normalizer — no backup in pipeline mode).
-    normalize [
-        shape=parallelogram,
-        label="Normalize Links",
-        tool_command="$normalize_cmd"
-    ]
+  // ITERATION 7, CODE half of a NEW select/box/record DETECTION loop (see
+  // header's ITERATION 7 section) -- the same shape iteration 6 already
+  // proved for attribution, now applied one level upstream. Picks the next
+  // un-scanned chunk index, writes it to .ai/current-chunk.md for
+  // scan_arguments to read. Resumable within one chunk_arguments run via a
+  // signature-stamped .ai/chunk-detection-progress.json (see
+  // wiki_weaver.synthesize.select_chunk's module docstring). Routes
+  // has_chunk (more chunks to scan) | all_chunks_scanned (flattens the
+  // accumulated union into .ai/gap-candidates-raw.json -- the SAME file
+  // attribute_select already read before this pass, unchanged) |
+  // chunks_bad (argument-chunks.json itself missing/malformed -- fail
+  // loud).
+  select_chunk [
+    shape=parallelogram,
+    label="select_chunk\n(picks next un-scanned chunk;\nresumable via a\nsignature-stamped progress file)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.select_chunk --wiki-root \"$wiki_root\""
+  ]
 
-    // FOOTNOTES (code, deterministic): convert inline [N] citations to [^N]
-    // Obsidian footnote refs and bibliography bullets to [^N]: footnote defs.
-    // Backfills any missing defs from the corpus harvest; falls back to the
-    // registry filename title. Always exits 0 (idempotent — no backup in pipeline mode).
-    footnotes [
-        shape=parallelogram,
-        label="Footnote Citations",
-        tool_command="$footnotes_cmd"
-    ]
+  // THE detection LLM pass, now run ONCE PER CHUNK (ITERATION 7 -- see
+  // header section) instead of once over the whole corpus. Scoped
+  // narrowly like lint.dot's analyze node ("Read the wiki's index and
+  // overview pages only") so the scale problem this task exists to fix
+  // never recurs at this step either -- but the view it reads is now
+  // index.md + .ai/current-chunk.md (a fixed-size SUBSET of source theses,
+  // not the whole .ai/source-arguments.md extract). ITERATION 6 (still
+  // applies): this is a DETECTION pass only -- its source_ids are a SEED
+  // for the attribution loop downstream, never the final measured count.
+  scan_arguments [
+    shape=box,
+    label="scan_arguments\n(DETECTION pass over ONE CHUNK:\nfinds ARGUMENTS the corpus contends\nbut has never given a page;\nsource_ids are a SEED, attributed\ndownstream)",
+    prompt="This is a CORPUS-scoped argument-detection pass over ONE FIXED-SIZE CHUNK of the corpus's source theses, scoped narrowly on purpose: read ONLY wiki/index.md and .ai/current-chunk.md with your file tools -- do not open any other wiki page and do not read anything under sources/ (check_nav_pages already verified index.md is populated, extract_source_arguments already verified enough source-level pages exist, and select_chunk already picked and wrote this ONE chunk for you). .ai/current-chunk.md is a fixed-size SUBSET of the full corpus's argument-bearing extracts -- one thesis excerpt per source-level wiki page in THIS chunk only, each labeled with the source_id it came from -- that label is what you cite, not something you need to re-derive. Distinguish an ENTITY (a tool, person, model, or named technique the corpus mentions -- e.g. \\\"Ralph Loop\\\", \\\"omlx\\\", a person's name) from an ARGUMENT (something the corpus repeatedly CONTENDS -- a position, tradeoff, or claim that recurs across multiple DIFFERENT sources' extracts IN THIS CHUNK, worded differently each time -- e.g. \\\"splitting agents into multiple agents costs more than it saves except in narrow cases\\\" or \\\"local consumer hardware now rivals cloud inference for real workloads\\\"). This wiki already has pages for most of its entities; look for arguments instead -- especially ones that recur only as a fact or number buried in several UNRELATED-looking extracts within this chunk (different tools, different authors), never as a phrase anyone repeated -- including one visible only after you stop reading for TOPIC and start reading for the STRUCTURE of what each source recommends or measures. For each argument that recurs across multiple current-chunk.md extracts but has NO wiki page of its own (check index.md's page list and titles -- an argument already covered by an existing page's title does not count, even if worded differently here), name it, state the contention in one sentence, and list the source_id(s) WITHIN THIS CHUNK whose extract makes you confident this argument recurs (use exactly the source_id labels given in .ai/current-chunk.md -- never invent one that is not actually labeled there) -- this is a SEED for a downstream union step that combines candidates across every chunk, and an attribution pass that independently judges every source thesis in the FULL corpus against your named argument, so it does NOT need to be exhaustive even within this chunk, only enough to establish the argument genuinely recurs here. Write your findings to .ai/current-chunk-candidates-raw.json as a JSON array: [{\\\"term\\\": \\\"short label\\\", \\\"claim\\\": \\\"the one-sentence contention\\\", \\\"source_ids\\\": [\\\"017-....md\\\", \\\"007-....md\\\"]}, ...]. Aim to surface EVERY genuinely recurring argument you can defend from THIS CHUNK, not only the two or three you are most confident about -- missing an argument ENTIRELY is the one error downstream steps cannot correct (this chunk is your only chance to name it; the union step only combines arguments actually named by SOME chunk, it never invents a new one), whereas an incomplete source_ids list for an argument you DID name is corrected downstream (both by other chunks proposing the same term, and by the attribution pass), not fatal. An argument whose sources use entirely different vocabulary for the same contention still counts and is exactly what this pass exists to catch. The SAME argument may already have been proposed by a DIFFERENT chunk under different wording; you do not need to know that and should not try to avoid \\\"duplicating\\\" another chunk's finding -- name what THIS chunk's extracts genuinely support, a downstream union step merges duplicates across chunks automatically. If, after reading this chunk carefully, you find no genuine recurring argument without a page -- only entities, or arguments a page already covers -- write an empty array []: this is a legitimate, expected outcome for any one chunk (the argument may simply not appear in this particular subset of sources), and you must NOT invent a candidate just to look productive. This is a detection pass only -- do not judge whether a candidate deserves a page (answer_gap decides that downstream with the full sources); just report what you found in this chunk and why."
+  ]
 
-    // NORMALIZE UNICODE (code, deterministic): repair stray \uXXXX JSON-escape
-    // artifacts left in prose (e.g. \u2014 where a real em-dash belongs).
-    // Defense-in-depth bridge for a latent amplifier-core bug
-    // (get_serialized_output uses ensure_ascii=True; a model can copy the
-    // escape it was shown verbatim into page content) -- amplifier-support
-    // #306. Code-fence- and inline-code-aware, allowlist-scoped so technical
-    // docs (Rust source, MCP configs) that legitimately contain \uXXXX in code
-    // are never touched. Runs last among the deterministic passes, right
-    // before validate, so the artifact never reaches a persisted page
-    // regardless of when the upstream core fix lands. Always exits 0
-    // (idempotent -- no backup in pipeline mode).
-    normalize_unicode [
-        shape=parallelogram,
-        label="Normalize Unicode Artifacts",
-        tool_command="$normalize_unicode_cmd"
-    ]
+  // ITERATION 7, CODE half of the chunked-detection select/box/record loop
+  // (see header's ITERATION 7 section, and wiki_weaver.synthesize.
+  // record_chunk_candidates' module docstring for the full merge
+  // accounting): validates scan_arguments' per-chunk output, then UNIONS
+  // it into the accumulated cross-chunk candidate list -- a term proposed
+  // by several chunks has its source_ids merged (never discarded), which
+  // is itself evidence of genuine dispersion, not noise. Fails loud
+  // (chunks_bad) on malformed per-chunk output WITHOUT marking the chunk
+  // scanned, so a re-run retries the same chunk. No sentinel needed beyond
+  // chunks_ok/chunks_bad -- loops back to select_chunk for the next chunk.
+  record_chunk_candidates [
+    shape=parallelogram,
+    label="record_chunk_candidates\n(deterministic: validates shape,\nUNIONS this chunk's candidates into\nthe accumulated cross-chunk list)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.record_chunk_candidates --wiki-root \"$wiki_root\""
+  ]
 
-    // VALIDATE (code, deterministic): the Tier-1 structural graders.
-    // Non-zero exit (broken links / missing frontmatter / orphans) forces the
-    // loop back into the refine cycle via the validate -[fail]-> feedback edge
-    // below, instead of dead-ending at no_matching_edge. A FAILED tool node only
-    // traverses edges that match condition="outcome=fail" (engine fail-fast
-    // rule), so both outcomes are routed EXPLICITLY.
-    validate [
-        shape=parallelogram,
-        label="Validate Structure",
-        tool_command="$validate_cmd"
-    ]
+  // ITERATION 6, CODE half of the select/box/record attribution loop (see
+  // header's ITERATION 6 section): picks the next unique, not-already-named
+  // candidate scan_arguments proposed that has not yet been attributed this
+  // invocation, writes it to .ai/current-attribution-candidate.json for
+  // attribute_sources to judge. Resumable within one scan_arguments run via
+  // a signature-stamped .ai/attribution-progress.json (see
+  // wiki_weaver.synthesize.attribute_select's module docstring). Routes
+  // has_candidate (more work) | all_attributed (writes the FINAL flat
+  // .ai/gap-candidates-attributed.json rank_gap_candidates reads) |
+  // candidates_bad (scan_arguments' raw JSON itself was malformed -- fail
+  // loud, same discipline rank_gap_candidates used to apply to this file
+  // directly before this loop was inserted).
+  attribute_select [
+    shape=parallelogram,
+    label="attribute_select\n(picks next un-attributed\ncandidate; resumable via a\nsignature-stamped progress file)",
+    timeout="1m",
+    tool_env="max_attribution_candidates,py",
+    tool_command="$py -m wiki_weaver.synthesize.attribute_select --wiki-root \"$wiki_root\" --max-candidates \"$max_attribution_candidates\""
+  ]
 
-    // ASSESS (LLM): judge ONE source's integration against the PER-SOURCE
-    // convergence rubric (NOT the whole-corpus eval rubric, which votes refine
-    // forever on a single freshly-ingested article). MUST set
-    // preferred_label=converged or =refine.
-    assess [
-        llm_provider="anthropic",
-        llm_model="claude-sonnet-4-6",
-        label="Assess Quality",
-        goal_gate=true,
-        retry_target="assess",
-        prompt="You are assessing ONE question: has THIS single source -- $source_path (assigned id $source_id) -- been well integrated into the wiki at $wiki_dir?\n\nThis is a PER-SOURCE convergence gate, NOT a whole-corpus completeness grade. Judge ONLY the delta this source contributed and the pages it touched. Do NOT require other corpus sources to be present, do NOT demand whole-wiki completeness, and do NOT penalize the wiki for concepts THIS source never discussed. A small, honest, well-merged single-source contribution IS converged.\n\nVERIFICATION SCOPE (bounded work-list -- do NOT re-verify the whole wiki): read $touched_manifest first. It lists, one wiki-relative page path per line, exactly the pages the ingest step created or modified this cycle. Verify ONLY (a) the pages in that manifest and (b) that THIS source's claims are grounded in those pages. Do NOT open pages outside the manifest, except to follow one specific claim one hop when grounding requires it. Open-ended wiki-wide re-verification is FORBIDDEN here: on a large wiki it exhausts your session's tool budget before a verdict is rendered, which falsely quarantines a good source. FALLBACK (fail-open): if $touched_manifest does not exist or is empty, note 'manifest missing -- full-scope fallback' in .ai/assessment.md and locate the pages this source touched by title/topic, as before.\n\nApply the per-source rubric in $convergence_rubric, scoring each dimension 1-5 for THIS source only:\n  C1 synthesis -- the source was merged and pre-digested into the right concept pages, not dumped or concatenated as a raw blob.\n  C2 merge-correctness -- shared concepts updated EXISTING pages in place (one page per concept; no near-duplicate created).\n  C3 contradiction-handling -- genuine conflicts (with an existing page, or within the source) surfaced in an '## Open tensions' section citing BOTH sides, never averaged or overwritten.\n  C4 no-confabulation -- every non-trivial claim traces to THIS source or an existing page. A '> TODO-VERIFY:' blockquote for an ungrounded claim is the CORRECT, PREFERRED move and is NOT a failure; only invented facts or asserted strawman framings fail this dimension.\n  C5 provenance -- pages carrying this source's claims cite $source_id in their frontmatter.\n\nDo NOT re-litigate structural mechanics (link resolution, frontmatter, orphans). The deterministic validate node already gated those; if you reached this step, structure passed. Focus on integration QUALITY for THIS source.\n\nFirst write a brief assessment (per-dimension C1-C5 score + one-line evidence each) to .ai/assessment.md.\n\nThen DECIDE: if every dimension C1-C5 is >= 4/5 for THIS source, it has converged; otherwise it needs another refine cycle.\n\nYour FINAL message MUST end with exactly one FLAT JSON object and NOTHING after it. It routes the pipeline:\n  - converged: {\"status\": \"success\", \"preferred_label\": \"converged\"}\n  - refine:    {\"status\": \"success\", \"preferred_label\": \"refine\"}\nThe value of preferred_label MUST be exactly 'converged' or 'refine'. Emit EXACTLY the object shown for your verdict -- just these two keys, no notes field, no context_updates, no extra keys.\n\nFLATNESS RULES (the router extracts the LAST brace-delimited block in your final message, and its brace-matcher is NOT string-aware): the verdict object must be FLAT -- no nested objects -- and NO brace characters may appear anywhere else in the message. Any text, brace, or second object after the verdict WILL break routing.\n\nFINAL-MESSAGE CONTRACT (this is the rule that ROUTES the pipeline -- treat it as the single most important instruction): your VERY LAST message this turn MUST be exactly that one-line JSON object and NOTHING ELSE -- no prose before or after, no markdown, no code fence, no commentary. Writing .ai/assessment.md is a tool call, not your verdict. After you finish writing it -- or after ANY other tool call -- your most recent action will have been a tool call, so you MUST THEN emit the one-line JSON verdict as a fresh final message. Do NOT end the turn on a tool call, on a summary sentence, or on an empty message. Do NOT report your verdict via the report_outcome tool -- on this pipeline that tool call is never read; your final text message is the ONLY channel that routes. If you are about to reply with prose, replace that prose with the JSON. A missing, prose, or fenced verdict mis-routes the pipeline and FALSELY reports non-convergence even when the wiki is clean."
-    ]
+  // ITERATION 6, THE per-candidate attribution LLM pass: judges ONE
+  // argument (named in .ai/current-attribution-candidate.json) against
+  // EVERY source thesis in .ai/source-arguments.md -- "does this source
+  // take a position on THIS contention, agreeing, extending, complicating,
+  // or disputing it," never a vocabulary match. Scoped as narrowly as
+  // scan_arguments (reads exactly these two files, nothing under
+  // sources/), but ONE call per candidate rather than one call across the
+  // whole corpus, so its attention is on a single argument at a time --
+  // the entire fix this iteration makes. Never names any specific
+  // theme/term in its own prompt (see header's DOES NOT section) --
+  // fully general so it works on a corpus nobody has pre-inspected.
+  attribute_sources [
+    shape=box,
+    label="attribute_sources\n(per-candidate LLM pass: judges\nEVERY source thesis against ONE\nargument -- position, not vocabulary)",
+    prompt="This is a CORPUS-WIDE argument-ATTRIBUTION pass, scoped narrowly like the detection pass before it: read ONLY .ai/current-attribution-candidate.json (the ONE argument you are attributing this pass -- its \\\"term\\\" and \\\"claim\\\" fields, and a seed source_ids list) and .ai/source-arguments.md (the SAME condensed extract scan_arguments read: one argument-bearing excerpt per type:source wiki page, each labeled with the source_id it came from) with your file tools -- do not open any other wiki page and do not read anything under sources/. Detection (scan_arguments, upstream) found a pattern and proposed a rough seed list of sources; THIS pass is a different operation: for THIS ONE argument, go through source-arguments.md and judge EVERY source_id's own extract on its own terms, not just the seed's. For each source, ask: does this source's extract take a POSITION on the contention named in current-attribution-candidate.json -- agreeing with it, extending it, complicating it, or disputing it -- regardless of whether it uses the same words? A source that merely shares a word or number with the claim but is not actually addressing this contention does NOT count; a source that argues the same underlying point in completely different vocabulary DOES count, and finding exactly that case is the whole reason this pass exists. Do not trust the seed source_ids list as correct: you may ADD any source_id not in the seed whose extract genuinely takes a position on this argument, and you MUST DROP any seed source_id whose extract does not actually address this specific contention (it may only share surface vocabulary, or discuss something adjacent). Never invent a source_id that is not actually labeled in .ai/source-arguments.md. Write your judgment to .ai/current-attribution-result.json as a JSON object: {\\\"term\\\": \\\"<the exact term from current-attribution-candidate.json, unchanged>\\\", \\\"claim\\\": \\\"<the one-sentence contention, refined if you can state it more precisely, else unchanged>\\\", \\\"source_ids\\\": [\\\"<every source_id that actually takes a position, whether from the seed or newly found>\\\", ...]}. This is an attribution pass for the ONE argument you were given only -- do not scan for or report on any OTHER argument; that is scan_arguments' job, not this pass's."
+  ]
 
-    // FEEDBACK (LLM): only on refine. Targeted guidance for next cycle.
-    feedback [
-        llm_provider="anthropic",
-        llm_model="claude-sonnet-4-6",
-        label="Write Feedback",
-        prompt="Write targeted refinement guidance for the next ingest cycle.\n\nREAD THE DETERMINISTIC VALIDATOR FIRST: read $validation_report. If it says FAIL, that result -- NOT any quality assessment -- is your primary input. Your #1 job is remediation guidance that fixes EACH listed failure verbatim: name every broken [[wikilink]], orphan page, missing/invalid-frontmatter page, and uncited page it lists, and say concretely how the next ingest cycle must resolve each one (create the missing target page with real grounded content, add an inbound link, add frontmatter/sources, etc.). Do NOT treat the wiki as converged while $validation_report shows FAIL, regardless of what any assessment claims.\n\nThen read .ai/assessment.md and any prior files in .ai/feedback/ for secondary quality context only.\nWrite a new file to .ai/feedback/ using the Pyramid Summary pattern:\n  1. Key finding (1 sentence) -- the most important gap (lead with the validator failure if there is one).\n  2. What to change (3-5 specific, actionable bullets) -- EACH listed validator failure FIRST (which broken link to fix, which orphan to link, which page to cite), then any quality deltas.\n  3. Why it matters (1-2 sentences) -- how it moves toward a coherent, link-valid wiki.\nFocus only on the delta needed to converge.\n\nAfter writing the feedback file, your FINAL message MUST be a one-line confirmation naming the feedback file you wrote. Do not end with an empty message."
-    ]
+  // ITERATION 6, THE code-side half of the box/tool split applied to
+  // attribute_sources' output (same reasoning as validate_plan.py and
+  // rank_candidates: "the model cannot certify its own output's shape"):
+  // drops hallucinated source_id citations, and -- unlike rank_gap_
+  // candidates' fail-loud candidates_bad -- falls back to the ORIGINAL
+  // seed source_ids for just this ONE candidate on any malformed result
+  // (never fails the whole loop over one bad attribution call; see module
+  // docstring). Merges into .ai/attribution-progress.json and loops back
+  // to attribute_select for the next candidate -- no routing decision of
+  // its own, same shape as commit_paged/commit_declined looping back to
+  // select_gap.
+  attribute_record [
+    shape=parallelogram,
+    label="attribute_record\n(deterministic: validates shape,\ndrops hallucinated citations,\nfalls back to seed on malformed\noutput -- never wedges the loop)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.attribute_record --wiki-root \"$wiki_root\""
+  ]
 
-    done [shape=Msquare, label="Done"]
+  // THE code-side half of the box/tool split ("the planner cannot certify
+  // its own plan's syntax" -- same reasoning as validate_plan.py, applied
+  // to the attribution loop's output): parses/validates the ATTRIBUTED
+  // candidate list (ITERATION 6 -- previously this read scan_arguments'
+  // raw output directly; see rank_candidates.py's own ITERATION 6
+  // docstring section), drops hallucinated source_id citations and
+  // already-named terms (belt-and-suspenders -- attribute_select already
+  // pre-filtered these, but this module's own guarantees stay unconditional
+  // regardless of what ran upstream), applies the SAME min_sources/
+  // max_source_fraction thresholds the retired n-gram mechanism used, and
+  // writes the final ranked list select_gap will read on every subsequent
+  // pass. An EMPTY well-formed list routes candidates_ok (0 candidates) --
+  // never candidates_bad; only a malformed shape is candidates_bad.
+  // GATE A (near-duplicate detection, this pass -- see wiki_weaver.
+  // synthesize.rank_candidates.dedupe_near_duplicates' module docstring
+  // for the full accounting): an independent audit found exact-term dedup
+  // (this node's own seen_terms check, unchanged) structurally blind to
+  // two LEXICALLY DISTINCT candidates that are substantively the same
+  // argument -- a live run produced "empirical-verification-before-
+  // shipping" and "prove-before-acting" as two separate pages sharing 11
+  // of 12 attributed sources, with near-verbatim prose in places. This
+  // node now ALSO runs dedupe_near_duplicates on the threshold-filtered
+  // list -- pure source_id Jaccard overlap, no LLM, no embedding -- and
+  // MERGES (never silently drops) any cluster of candidates above
+  // --dedupe-threshold into one surviving candidate (union of source_ids),
+  // reporting every merge to stderr. Runs BEFORE select_gap ever sees the
+  // list, so a duplicate cluster can only ever produce ONE page --
+  // structurally closing the near-verbatim-prose defect, not just
+  // detecting it after the fact.
+  rank_gap_candidates [
+    shape=parallelogram,
+    label="rank_gap_candidates\n(deterministic: validates shape,\ndrops hallucinated citations,\napplies min_sources/max_source_fraction\nto the ATTRIBUTED counts, then MERGES\nnear-duplicate candidates -- Gate A)",
+    timeout="1m",
+    tool_env="min_sources,max_source_fraction,dedupe_threshold,py",
+    tool_command="$py -m wiki_weaver.synthesize.rank_candidates --wiki-root \"$wiki_root\" --min-sources \"$min_sources\" --max-source-fraction \"$max_source_fraction\" --dedupe-threshold \"$dedupe_threshold\""
+  ]
 
-    start -> clear_manifest
-    clear_manifest -> ingest
+  // synthesis_gate (+ prepare_synthesis_brief + persist_synthesis_guidance)
+  // RETIRED FROM THE DEFAULT PATH -- see header, "synthesis_gate RETIRED
+  // FROM THE DEFAULT PATH". Measured paired n=6: +0.7pp mean, 3/6 wins,
+  // below the pre-committed >= 4/6 bar. rank_gap_candidates now proceeds
+  // straight to select_gap on candidates_ok (see edges below). Preserved,
+  // wired and runnable, as evals/arms/synthesize-gate.dot.
 
-    // GATE_INGEST routes BOTH outcomes explicitly, same rule as `validate` below:
-    // a tool node that exits non-zero produces outcome=fail and will ONLY traverse
-    // an edge whose condition matches outcome=fail. Without the second edge an
-    // empty ingest dead-ends at no_matching_edge.
-    ingest -> gate_ingest
-    gate_ingest -> normalize [label="pages written", condition="outcome=success"]
-    gate_ingest -> feedback  [label="no pages",      condition="outcome=fail"]
-    normalize -> footnotes
-    footnotes -> normalize_unicode
-    normalize_unicode -> validate
+  // THE resume gate AND the wiki-scoped exit predicate (FINDINGS.md \u00a77):
+  // pending = .ai/gap-candidates.json (rank_gap_candidates' output, written
+  // ONCE per invocation) MINUS synth-ledger.jsonl decided terms, recomputed
+  // fresh every pass. no_gap is a statement about the ARTIFACT, not an
+  // input queue -- see wiki_weaver.synthesize.select_gap.
+  select_gap [
+    shape=parallelogram,
+    label="select_gap\n(THE resume gate + wiki-scoped\nexit predicate -- reads the\nranked candidate list, deterministic)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.select_gap --wiki-root \"$wiki_root\""
+  ]
 
-    // VALIDATE routes BOTH outcomes explicitly. A tool node that exits non-zero
-    // produces outcome=fail; the engine's fail-fast rule means it will ONLY
-    // traverse an edge whose condition matches outcome=fail. Without the second
-    // edge a structural failure dead-ends at no_matching_edge (the old defect:
-    // one dangling link halted every future ingest). On fail we drop into the
-    // refine loop at `feedback` so the broken-link/error output is turned into
-    // guidance and repaired on the next ingest cycle.
-    validate -> assess   [label="pass", condition="outcome=success"]
-    validate -> feedback [label="fail", condition="outcome=fail"]
+  // Per-invocation drain cap -- task's own requirement: "a max-iterations
+  // cap alongside the predicate, so a pathological corpus cannot loop
+  // forever." In-context counter, no disk file (mirrors ingest.dot's
+  // drain_bound -- REWRITE-GUIDE.md \u00a73.2).
+  iteration_bound [
+    shape=parallelogram,
+    label="iteration_bound\n(per-invocation gap cap,\nin-context counter)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.iteration_bound --count \"$iteration_count\" --max-iterations \"$max_iterations\""
+  ]
 
-    // ASSESS routes EXHAUSTIVELY (no dead-end). The engine's select_edge tries
-    // conditional edges FIRST (Step 1); only if none match does it fall through
-    // to the single UNCONDITIONAL edge (Step 4). So `done` is reachable ONLY via
-    // its explicit converged condition, while EVERYTHING ELSE -- refine, an unset
-    // preferred_label=None (the empty-spawn flake degrades assess to PROSE and
-    // _parse_outcome yields SUCCESS+label=None), prose, or any unrecognized label
-    // -- falls through to the unconditional fallback and the refine loop.
-    // The fail-safe direction is MORE work, never premature done.
-    assess -> done     [label="converged", condition="context.preferred_label=converged"]
-    assess -> feedback [label="refine",    condition="context.preferred_label=refine"]
-    // ELSE (unconditional fallback): the ONLY unconditional edge out of `assess`,
-    // so the engine's Step-4 lexical-tiebreak gotcha cannot bite. Catches None /
-    // prose / any non-converged label -> refine loop instead of no_matching_edge.
-    assess -> feedback [label="else (unset/unknown -> refine)"]
+  // Deterministic, corpus-scoped reading list: the gap's own measured
+  // source_ids (rank_gap_candidates already determined which sources
+  // discuss this term -- no rediscovery needed) + a short BM25 pass over
+  // the WIKI for existing related pages worth cross-linking.
+  retrieve_context [
+    shape=parallelogram,
+    label="retrieve_context\n(corpus-scoped reading list:\nmeasured source_ids + related\nwiki pages, deterministic)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.retrieve_context --wiki-root \"$wiki_root\""
+  ]
 
-    feedback -> clear_manifest [loop_restart="true"]
+  // THE second LLM pass, whose input is CORPUS-WIDE rather than
+  // single-source (FINDINGS.md \u00a77: "nobody automated the role of holding
+  // more than one source in mind"). Same hybrid + refuse-rather-than-guess
+  // discipline as ask.dot's answer node, applied to a MEASURED candidate
+  // term instead of a free-text question. Reads current_gap.json/gap-
+  // context.json from disk rather than $-substituting the term into the
+  // prompt (same pattern as ingest.dot's weave reading current_source.txt/
+  // current_slice.json -- the term is discovered per-iteration, not a
+  // --param).
+  answer_gap [
+    shape=box,
+    label="answer_gap\n(CORPUS-SCOPED: hybrid method,\nrefuse rather than guess)",
+    prompt="This is a CORPUS-SCOPED question no single source answers alone. Read .ai/current_gap.json for the exact term/phrase you are answering (its \"term\" field) and the exact source_ids wiki_weaver.synthesize.rank_candidates already measured as discussing it across the raw corpus -- read EVERY one of those source_ids in full under sources/ before writing anything; this is a small, already-measured set, not a broad search. Read .ai/gap-context.json for a short list of existing wiki pages (related_pages) that may already touch this topic -- check them for content worth cross-linking, but do not copy from them and do not treat them as sufficient on their own: the sources are the truth (same hybrid discipline as ask.dot's answer node -- the wiki orients, the sources are truth, the measured source_ids are a starting point, not a hard boundary; if what you read hints at more than it says, you may look further under sources/, but never assert a negative on a partial read). Determine, for the term named in current_gap.json: what do these sources actually claim about it, and do they AGREE, DISAGREE, or cover DIFFERENT FACETS of it? Never collapse disagreement into one settled-sounding conclusion (the disagreement contract) -- name who claims what if the sources diverge. If, after reading every listed source, they do NOT actually share a coherent, citable claim about this term -- they only co-occur by accident, or the discussion is too thin to honestly synthesize into a page -- you MUST decline rather than force a page: this is the same refuse-rather-than-guess discipline ask.dot already applies, guarding against this pipeline becoming a page-generator. As your final action, write to EXACTLY ONE of these two files (never both): .ai/gap-answer.md (prose only, no frontmatter -- write_gap_page adds title/type/sources deterministically afterward) citing every source_id you actually drew from, if you found real cross-source content; or .ai/gap-declined.md (briefly state why) if you must decline.",
+    fallback_retry_target="retry_bound"
+  ]
+
+  // Deterministic, code-tier: routes on WHICH FILE answer_gap actually
+  // wrote (AP-2) -- exactly like ask.dot's coverage_check.
+  gap_coverage_check [
+    shape=parallelogram,
+    label="gap_coverage_check\n(routes on which file\nanswer_gap actually wrote)",
+    tool_command="test -s .ai/gap-answer.md && printf answered || printf declined"
+  ]
+
+  // THE box/tool split (REWRITE-GUIDE.md \u00a71.6): answer_gap writes prose
+  // only; this deterministically assembles the real page (filename,
+  // frontmatter: title/type/sources, body) -- an LLM never has to get
+  // YAML-ish frontmatter exactly right.
+  write_gap_page [
+    shape=parallelogram,
+    label="write_gap_page\n(deterministic: title/type/sources\nfrontmatter + slug filename)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.write_gap_page --wiki-root \"$wiki_root\""
+  ]
+
+  // GATE B (this pass -- see wiki_weaver.synthesize.check_citations' module
+  // docstring for the full accounting): an independent audit found a real
+  // page (empirical-verification-before-shipping.md) carrying source 027
+  // in its frontmatter sources: list -- counted in its advertised
+  // source_count -- while grep -c "027" on the page BODY returned zero.
+  // The attribution was valid; answer_gap's prose silently dropped the
+  // source while the header kept advertising support for it. This node
+  // checks every frontmatter-listed source_id actually appears in the
+  // page's own body text (frontmatter excluded) -- a pure CODE-tier
+  // consistency check between two things the page itself already
+  // contains, no raw source re-reading, no re-judgment of attribution.
+  // ROUTES citations_ok | citations_bad. citations_bad reuses the SAME
+  // retry_bound safety net structural_bad already uses (never a new
+  // failure mode) -- chosen over silently shrinking the frontmatter count
+  // to match the body, because that would quietly discard a verified
+  // attribution rather than giving the page a chance to actually use it
+  // (see check_citations.py's module docstring, "THE CORRECTION CHOSEN"
+  // section, for the full reasoning).
+  check_citations [
+    shape=parallelogram,
+    label="check_citations\n(deterministic: every frontmatter\nsources: entry must be cited in\nthe body -- ROUTES citations_ok |\ncitations_bad -- Gate B)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.check_citations --wiki-root \"$wiki_root\""
+  ]
+
+  // Reuses wiki_weaver.ingest.validate -- the SAME structural-check module
+  // ingest.dot's own validate node calls (broken links, schema, orphans,
+  // zero-touch, root-level leak). Never edits ingest.dot; just imports its
+  // module, per the task's own instruction to prefer reuse over editing.
+  validate [
+    shape=parallelogram,
+    label="validate\n(reuses wiki_weaver.ingest.validate;\nROUTES: structural_ok | structural_bad)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.validate --wiki-root \"$wiki_root\" --out .ai/synth-validation-report.md && printf structural_ok || printf structural_bad"
+  ]
+
+  // Bounded retry for THIS gap term -- mirrors ingest.dot's reweave_bound
+  // (identity-gated counter, never a hard pipeline failure on one bad
+  // page). give_up routes to commit_declined so one stubborn candidate can
+  // never wedge the whole loop.
+  retry_bound [
+    shape=parallelogram,
+    label="retry_bound\n(attempt cap for THIS gap;\nprintf retry | give_up)",
+    tool_env="max_synth_retry,py",
+    tool_command="$py -m wiki_weaver.synthesize.retry_bound --wiki-root \"$wiki_root\" --max \"$max_synth_retry\""
+  ]
+
+  // Ledgers the term as paged, commits wiki + ledger together (guarded by
+  // git diff --staged --quiet -- no phantom commit on a no-op re-run).
+  commit_paged [
+    shape=parallelogram,
+    label="commit_paged\n(ledger as paged, one\ngit commit)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.commit --wiki-root \"$wiki_root\" --decision paged"
+  ]
+
+  // Reached from TWO edges (gap_coverage_check's declined sentinel, and
+  // retry_bound's give_up) -- reason is inferred from which ephemeral
+  // artifact is present (see commit.py's _infer_decline_reason), never a
+  // second context key. Reverts any partial page write before ledgering.
+  commit_declined [
+    shape=parallelogram,
+    label="commit_declined\n(revert any partial page,\nledger as declined, commit)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.synthesize.commit --wiki-root \"$wiki_root\" --decision declined"
+  ]
+
+  start -> check_nav_pages
+
+  check_nav_pages -> extract_source_arguments [label="nav_ok",      condition="context.tool.last_line=nav_ok"]
+  check_nav_pages -> exit                     [label="nav_missing\n(fail loud)", condition="context.tool.last_line=nav_missing"]
+
+  extract_source_arguments -> chunk_arguments
+  chunk_arguments -> select_chunk
+
+  select_chunk -> scan_arguments       [label="has_chunk",  condition="context.tool.last_line=has_chunk"]
+  select_chunk -> attribute_select     [label="all_chunks_scanned\n(union written to\ngap-candidates-raw.json)", condition="context.tool.last_line=all_chunks_scanned"]
+  select_chunk -> exit                 [label="chunks_bad\n(malformed chunk manifest --\nfail loud)", condition="context.tool.last_line=chunks_bad"]
+
+  scan_arguments -> record_chunk_candidates
+
+  record_chunk_candidates -> select_chunk [label="chunks_ok", condition="context.tool.last_line=chunks_ok", loop_restart="true"]
+  record_chunk_candidates -> exit         [label="chunks_bad\n(malformed per-chunk detection\noutput -- fail loud)", condition="context.tool.last_line=chunks_bad"]
+
+  attribute_select -> attribute_sources [label="has_candidate",  condition="context.tool.last_line=has_candidate"]
+  attribute_select -> rank_gap_candidates [label="all_attributed\n(every candidate\nattributed)", condition="context.tool.last_line=all_attributed"]
+  attribute_select -> exit               [label="candidates_bad\n(malformed detection output --\nfail loud)", condition="context.tool.last_line=candidates_bad"]
+
+  attribute_sources -> attribute_record
+  attribute_record  -> attribute_select [loop_restart="true"]
+
+  // synthesis_gate retired from the default path (see header) --
+  // rank_gap_candidates now proceeds straight to select_gap on
+  // candidates_ok, the same shape as pipeline/ingest.dot's
+  // drain_bound -> detect_kind after curate_gate's retirement.
+  rank_gap_candidates -> select_gap [label="candidates_ok",  condition="context.tool.last_line=candidates_ok"]
+  rank_gap_candidates -> exit       [label="candidates_bad\n(malformed attributed output --\nfail loud)", condition="context.tool.last_line=candidates_bad"]
+
+  select_gap -> iteration_bound [label="has_gap",       condition="context.tool.last_line=has_gap"]
+  select_gap -> exit            [label="no_gap\n(no unnamed argument\nremains -- clean exit)", condition="context.tool.last_line=no_gap"]
+  select_gap -> exit            [label="ledger corrupt\n(fail loud)", condition="context.tool.last_line=ledger_corrupt"]
+
+  iteration_bound -> retrieve_context [label="continue",         condition="context.iteration_status=continue"]
+  iteration_bound -> exit             [label="budget_exhausted", condition="context.iteration_status=budget_exhausted"]
+
+  retrieve_context -> answer_gap
+  answer_gap -> gap_coverage_check
+
+  gap_coverage_check -> write_gap_page   [label="answered",  condition="context.tool.last_line=answered"]
+  gap_coverage_check -> commit_declined  [label="declined\n(no real cross-source\nsupport)", condition="context.tool.last_line=declined"]
+
+  write_gap_page -> check_citations
+
+  check_citations -> validate     [label="citations_ok",  condition="context.tool.last_line=citations_ok"]
+  check_citations -> retry_bound  [label="citations_bad\n(attributed source not\ncited in body -- fail loud)", condition="context.tool.last_line=citations_bad"]
+
+  validate -> commit_paged [label="structural_ok",  condition="context.tool.last_line=structural_ok"]
+  validate -> retry_bound  [label="structural_bad",  condition="context.tool.last_line=structural_bad"]
+
+  retry_bound -> answer_gap       [label="retry",   condition="context.tool.last_line=retry", loop_restart="true"]
+  retry_bound -> commit_declined  [label="give_up\n(quarantine this gap)", condition="context.tool.last_line=give_up"]
+
+  commit_paged    -> select_gap [loop_restart="true"]
+  commit_declined -> select_gap [loop_restart="true"]
 }

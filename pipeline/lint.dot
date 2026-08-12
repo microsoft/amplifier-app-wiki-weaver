@@ -1,13 +1,99 @@
-digraph lint_wiki {
-    graph [goal="Validate wiki structure"]
-    start [shape=Mdiamond, label="Start"]
-    lint [
-        shape=parallelogram,
-        label="Validate Structure",
-        tool_command="$validate_cmd"
-    ]
-    done [shape=Msquare, label="Done"]
-    start -> lint
-    lint -> done [label="pass", condition="outcome=success"]
-    lint -> done [label="fail", condition="outcome=fail"]
+// =============================================================================
+// lint.dot -- wiki-weaver v2 : periodic health check (read-only, reports only)
+// =============================================================================
+//
+// PURPOSE
+//   Run a periodic sweep over the wiki: deterministic structural validation
+//   first, then exactly one bounded LLM pass over the index/overview looking
+//   for contradictions, stale claims, concept gaps, and missing cross-refs,
+//   plus suggested follow-up questions/sources. Emit a report.
+//
+// DOES NOT
+//   - Never edits the wiki. lint is diagnostic only -- fixes flow through
+//     correct.dot (for specific claims) or canon.dot (for ground truth),
+//     both explicit human/proxy-gated actions. lint itself has no gate and
+//     no write path: a "reports only" tool should not be able to silently
+//     become a "reports and also quietly patches" tool.
+//   - Does not retry or iterate the LLM pass to improve its own findings --
+//     one bounded pass, whatever it finds is what gets reported.
+//
+// KNOWN WEAKNESS (tracked, not hidden)
+//   Measured against a labeled set of known issues: the analyze pass's
+//   precision was ~55% and run-to-run stability was ~0.07 -- i.e. it is
+//   noisy and does not reliably reproduce its own findings. This is a known
+//   weakness to improve, not a reason to add a second LLM pass to
+//   "double-check" the first (see ingest.dot's rationale for why that
+//   doesn't work either).
+//
+// REAL INVOCATION
+//   attractor run pipeline/lint.dot \
+//     --param wiki_root=/srv/wikis/acme \
+//     --param report_dir=reports \
+//     --cwd /srv/wikis/acme
+//   (No human gate in this pipeline -- --on-human-gate is irrelevant here.)
+//
+// REQUIRED CONTEXT VARS
+//   wiki_root   -- filesystem root of the wiki (REQUIRED)
+//   report_dir  -- (optional, default: "reports", relative to wiki_root)
+//
+// ARTIFACTS AND GUARDS
+//   .ai/structural-report.md -- EPHEMERAL: structural_validate's findings.
+//   .ai/lint-findings.md     -- EPHEMERAL: analyze's findings (present only
+//                                when the structural gate allowed analysis
+//                                to run).
+//   reports/                 -- COMMITTED (or at least persisted) output of
+//                                write_report -- the one durable artifact.
+//   This pipeline never resumes mid-run -- it is a single bounded sweep, not
+//   a drain loop, so it has no ledger/guard of its own.
+// =============================================================================
+
+digraph wiki_weaver_v2_lint {
+  graph [
+    goal="Periodic read-only health check: deterministic validation + one bounded LLM analysis pass, report only",
+    label="lint.dot -- health check, reports only",
+    params="wiki_root, report_dir",
+    max_pipeline_duration="10m",
+    default_max_retry=1,
+    default_fidelity="full"
+  ]
+  rankdir=LR
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
+
+  start [shape=Mdiamond, label="lint requested"]
+  exit  [shape=Msquare,  label="report written"]
+
+  // Deterministic code-tier gate. Routes directly on tool.last_line -- no
+  // diamond no-op needed, and no context.structural_ok key that nothing sets.
+  structural_validate [
+    shape=parallelogram,
+    label="structural_validate\n(deterministic: broken links,\nschema conformance, orphan pages)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.lint.structural_validate --wiki-root \"$wiki_root\" --out .ai/structural-report.md"
+  ]
+
+  // ONE bounded LLM pass. Not iterated, not judged by a second model.
+  analyze [
+    shape=box,
+    label="analyze\n(ONE bounded pass:\ncontradictions, staleness,\ngaps, missing cross-refs)",
+    prompt="Read the wiki's index and overview pages only (do not open every page). Report: (1) apparent contradictions between claims, (2) claims that look stale relative to more recent sources, (3) concept gaps -- topics referenced but never explained, (4) missing cross-references between clearly related pages, and (5) suggested follow-up questions or sources that would close the gaps you found. This is diagnostic only -- do not propose or make any edits. Write your findings to .ai/lint-findings.md."
+  ]
+
+  write_report [
+    shape=parallelogram,
+    label="write_report\n(deterministic format + write;\nnever edits the wiki itself)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.lint.write_report --wiki-root \"$wiki_root\" --out \"$report_dir\" --structural .ai/structural-report.md --findings .ai/lint-findings.md"
+  ]
+
+  start -> structural_validate
+
+  structural_validate -> analyze       [condition="context.tool.last_line=structural_ok"]
+  // catch-all: if structural checks themselves failed badly enough, skip
+  // the LLM pass and report the structural failure alone -- lint always
+  // produces a report, even a degraded one.
+  structural_validate -> write_report  [label="skip analysis, report\nstructural failure only", condition="context.tool.last_line=structural_bad"]
+
+  analyze -> write_report
+  write_report -> exit
 }

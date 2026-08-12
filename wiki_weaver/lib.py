@@ -1,3092 +1,1602 @@
-# pyright: reportMissingImports=false
-"""wiki-weaver library API.
+"""wiki_weaver.lib -- shared internal library for the ingest subcommands.
 
-Importable concept-level functions that back the CLI and can be called
-directly by other Python code (tests, the future attractor shim, etc.).
-The CLI (wiki_weaver.py) is a thin argparse wrapper around these.
+Houses filesystem/path helpers, atomic writes, ledger I/O, frontmatter
+parsing, wikilink extraction, the deterministic slice builder, and thin git
+wrappers. Not a CLI subcommand itself -- every ``wiki_weaver.ingest.*``
+module imports from here.
 
-Public API
-----------
-init(wiki_dir)                      scaffold a fresh wiki
-ingest(wiki, *, source, ...)        integrate inbox sources via the engine
-lint(wiki)                          run the structural validator
-doctor(*, wiki)                     environment diagnostics
-ask(wiki, question, *, json_out)    answer a question from the compiled wiki
+NOTE on naming (flagged in the delivery report): ``pipeline/CLI-CONTRACT.md``
+names this shared module ``wiki_weaver.common``. The task that commissioned
+this package explicitly asked for ``wiki_weaver/lib.py``. Followed the
+explicit instruction; the discrepancy is cosmetic (an internal module name,
+not part of the CLI surface any pipeline node depends on).
 
-All functions print their own output (unchanged from the original cmd_*
-behaviour) and return an integer exit code (0 = success).
+Standard library only -- see docs/IMPLEMENTATION_PHILOSOPHY (stdlib first)
+and the task's explicit "no third-party deps" instruction.
 """
 
 from __future__ import annotations
 
-import filecmp
-import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
-import sys
-import time
+import tempfile
 from dataclasses import dataclass, field
-from datetime import date, datetime
 from pathlib import Path
-from typing import NamedTuple
 
-from ._assets import pipeline_dir
-
-GREEN = "\033[32m"
-RED = "\033[31m"
-YELLOW = "\033[33m"
-RESET = "\033[0m"
-
-WIKI_DIR = ".wiki"  # hidden machine-only subtree root
-LEDGER_NAME = ".processed.jsonl"
-INBOX = "_inbox"
-SOURCES = "_sources"  # was ARCHIVE; stays visible at corpus root
-FAILED = "_failed"  # logical name; actual path via wiki_failed()
-# Claim-retention gate's consecutive-grader-failure counter (fail-open/fail-closed
-# escalation state) -- see wiki_retention_state() below and wiki_weaver/retention.py.
-RETENTION_STATE_NAME = ".retention_gate_state.json"
-
-# Pipeline assets resolve to the wheel sibling (wiki_weaver_pipeline/) on a real
-# install or the repo-root pipeline/ in a dev tree -- see wiki_weaver._assets.
-REPO_ROOT = Path(__file__).resolve().parent.parent
-VALIDATE_PY = pipeline_dir() / "validate_wiki.py"
-
+from wiki_weaver import bm25
 
 # ---------------------------------------------------------------------------
-# Path helpers — single place that spells every machine/user path
+# Errors
 # ---------------------------------------------------------------------------
 
 
-def wiki_hidden_dir(wiki: Path) -> Path:
-    """Return the hidden machine-only root: ``<wiki>/.wiki``."""
-    return wiki / WIKI_DIR
+class LedgerCorruptError(Exception):
+    """``ledger.jsonl`` exists but at least one line fails to parse as JSON.
 
-
-def wiki_ledger(wiki: Path) -> Path:
-    """Return the ledger path: ``<wiki>/.wiki/.processed.jsonl``."""
-    return wiki / WIKI_DIR / LEDGER_NAME
-
-
-def wiki_registry(wiki: Path) -> Path:
-    """Return the source registry path: ``<wiki>/.wiki/.sources.json``."""
-    return wiki / WIKI_DIR / REGISTRY_NAME  # REGISTRY_NAME defined below
-
-
-def wiki_failed(wiki: Path) -> Path:
-    """Return the failed-sources dir: ``<wiki>/.wiki/failed``."""
-    return wiki / WIKI_DIR / "failed"
-
-
-def wiki_retention_state(wiki: Path) -> Path:
-    """Return the claim-retention gate's consecutive-grader-failure counter path:
-    ``<wiki>/.wiki/.retention_gate_state.json``.
-
-    Sibling to ``wiki_registry()`` (``.sources.json``) and the ledger -- same
-    ``.wiki/`` process-state subtree, same small-JSON-file convention. See
-    ``wiki_weaver/retention.py`` for the reader/writer and the fail-open/
-    fail-closed escalation policy built on top of this counter.
+    Per CLI-CONTRACT.md: fail loud, never silently treat a corrupt ledger as
+    "nothing pending" (that would look like a successful, empty drain and
+    mask real data loss).
     """
-    return wiki / WIKI_DIR / RETENTION_STATE_NAME
-
-
-def wiki_runs(wiki: Path) -> Path:
-    """Return the run-logs dir: ``<wiki>/.wiki/runs``."""
-    return wiki / WIKI_DIR / "runs"
-
-
-def wiki_sources(wiki: Path) -> Path:
-    """Return the archived-sources dir: ``<wiki>/_sources`` (visible)."""
-    return wiki / SOURCES
-
-
-def wiki_inbox(wiki: Path) -> Path:
-    """Return the inbox dir: ``<wiki>/_inbox`` (visible)."""
-    return wiki / INBOX
-
-
-def wiki_dashboard(wiki: Path) -> Path:
-    """Return the dashboard assets dir: ``<wiki>/.wiki/dashboard``."""
-    return wiki / WIKI_DIR / "dashboard"
-
-
-def wiki_policy_dir(wiki: Path) -> Path:
-    """Return the per-wiki policy override dir: ``<wiki>/.wiki/policy``."""
-    return wiki / WIKI_DIR / "policy"
-
-
-def wiki_snapshots(wiki: Path) -> Path:
-    """Return the preserved retention-snapshot root: ``<wiki>/.wiki/snapshots``.
-
-    When a retention signal fires for a source (judge-detected loss, the
-    deterministic page-shrinkage heuristic, or a non-empty removal manifest),
-    the pre-ingest page snapshot is MOVED here (instead of deleted) so a human
-    can diff/restore the damaged page(s). Bounded: only the newest
-    ``DEFAULT_SNAPSHOTS_KEEP`` preserved snapshots are kept -- see
-    ``wiki_weaver/retention.py``'s ``preserve_snapshot()``.
-    """
-    return wiki / WIKI_DIR / "snapshots"
-
-
-def removals_manifest_path(wiki: Path) -> Path:
-    """Return the ingest agent's self-declared removal manifest path:
-    ``<wiki>/.ai/removals.jsonl``.
-
-    APPENDED to by the ingest node whenever it removes, condenses, supersedes,
-    or moves a prior claim (one JSON line per claim: page / removed / action /
-    reason -- see pipeline/synthesize.dot's REMOVAL MANIFEST instruction).
-    Read post-convergence and surfaced as a run-level advisory so removals are
-    always LOUD and reviewable. Scratch state (like ``.ai/feedback/``), NOT
-    process state. Deleted deterministically before each source's synthesis on
-    the ``run_inner`` path (and once per drain on the ``run_ingest`` path,
-    whose retention check is whole-drain scoped) so stale declarations from a
-    previous run are never attributed to the current one.
-    """
-    return wiki / ".ai" / "removals.jsonl"
-
-
-def touched_manifest_path(wiki: Path) -> Path:
-    """Return the touched-pages manifest path: ``<wiki>/.ai/touched-pages.txt``.
-
-    Written (overwritten) by the ingest node each synthesize cycle with one
-    wiki-relative page path per line for every page it created/modified; read
-    by the assess node as its bounded verification work-list. Scratch state
-    (like ``.ai/feedback/``), NOT process state. Deleted deterministically
-    before each source's synthesis (run_inner / ingest_setup) so a stale
-    manifest from a previous source can never scope-poison the next assess.
-    """
-    return wiki / ".ai" / "touched-pages.txt"
-
-
-def _ok(msg: str) -> None:
-    print(f"{GREEN}\u2713{RESET} {msg}")
-
-
-def _fail(msg: str) -> None:
-    print(f"{RED}\u2717{RESET} {msg}")
-
-
-def _warn(msg: str) -> None:
-    print(f"{YELLOW}!{RESET} {msg}")
-
-
-def _gate_advisory(gate: str, msg: str) -> None:
-    """Loud, distinct, run-level gate-advisory line (the gate did NOT block)."""
-    print(f"{YELLOW}!! GATE ADVISORY [{gate}]{RESET} {msg}")
-
-
-def _print_advisories(advisories: list[str]) -> None:
-    """Distinct end-of-run advisory block so an advisory-fired run can never
-    present as byte-identical to a clean one (run-level, not buried per-source)."""
-    if not advisories:
-        return
-    print(
-        f"\n{YELLOW}!! {len(advisories)} gate advisory(ies) fired this run "
-        f"(ADVISORY -- did NOT block any source):{RESET}"
-    )
-    for a in advisories:
-        print(f"{YELLOW}   - {a}{RESET}")
 
 
 # ---------------------------------------------------------------------------
-# Obsidian-readiness helpers
-# ---------------------------------------------------------------------------
-
-# Marker line that wiki-weaver writes as the first line of its .gitignore block.
-# Its presence is used to detect idempotency — if already in the file, skip.
-_OBSIDIAN_GITIGNORE_MARKER = "# --- wiki-weaver: Obsidian ---"
-
-# §14 F5 entries: user-specific Obsidian files + macOS junk
-_OBSIDIAN_GITIGNORE_LINES: list[str] = [
-    "# Obsidian user-specific (not shared)",
-    ".obsidian/workspace.json",
-    ".obsidian/app.json",
-    ".obsidian/graph.json",
-    ".obsidian/hotkeys.json",
-    ".obsidian/graph-analysis.json",
-    "# macOS junk",
-    "._*",
-    ".DS_Store",
-]
-
-# Bundled Obsidian template directory (lives inside the installed package).
-# Resolution: wiki_weaver/templates/obsidian/ — always co-located with this file.
-_OBSIDIAN_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates" / "obsidian"
-
-
-def ensure_obsidian_ready(corpus: Path) -> None:
-    """Seed Obsidian vault config and update ``.gitignore`` at the corpus root.
-
-    Called by both ``init()`` (fresh corpora) and ``migrate()`` (existing
-    corpora). Both operations are idempotent:
-
-    * **``.gitignore``** — if the wiki-weaver marker line is absent the F5
-      block is appended once.  Existing user entries are never modified.
-    * **``.obsidian/``** — seeded from the package template *only* if the
-      directory does not already exist.  A user's existing vault is never
-      touched.
-
-    Note on ``.wiki/`` visibility: Obsidian excludes dot-prefixed folders
-    (``.*``) from its vault graph by default, so ``.wiki/`` is already hidden
-    without any extra configuration.  The seeded ``app.json`` adds
-    ``userIgnoreFilters`` as a belt-and-suspenders measure.
-    """
-    _ensure_corpus_gitignore(corpus)
-    _seed_obsidian_config(corpus)
-
-
-def _ensure_corpus_gitignore(corpus: Path) -> None:
-    """Append the Obsidian gitignore block if the marker is absent."""
-    gitignore_path = corpus / ".gitignore"
-
-    if gitignore_path.exists():
-        existing = gitignore_path.read_text(encoding="utf-8")
-        if _OBSIDIAN_GITIGNORE_MARKER in existing:
-            return  # block already present — idempotent no-op
-        # Separate from existing content with a blank line
-        sep = "\n" if existing.endswith("\n") else "\n\n"
-        block = (
-            sep
-            + _OBSIDIAN_GITIGNORE_MARKER
-            + "\n"
-            + "\n".join(_OBSIDIAN_GITIGNORE_LINES)
-            + "\n"
-        )
-        with gitignore_path.open("a", encoding="utf-8") as fh:
-            fh.write(block)
-    else:
-        # Fresh corpus — write the whole block
-        block = (
-            _OBSIDIAN_GITIGNORE_MARKER
-            + "\n"
-            + "\n".join(_OBSIDIAN_GITIGNORE_LINES)
-            + "\n"
-        )
-        gitignore_path.write_text(block, encoding="utf-8")
-
-
-def _seed_obsidian_config(corpus: Path) -> None:
-    """Copy the package Obsidian template into the corpus if absent."""
-    obsidian_dir = corpus / ".obsidian"
-    if obsidian_dir.is_dir():
-        return  # user's vault already exists — never overwrite
-    if not _OBSIDIAN_TEMPLATE_DIR.is_dir():
-        _warn(
-            "Obsidian template directory not found; skipping .obsidian/ seed. "
-            f"(Expected: {_OBSIDIAN_TEMPLATE_DIR})"
-        )
-        return
-    shutil.copytree(str(_OBSIDIAN_TEMPLATE_DIR), str(obsidian_dir))
-
-
-# ---------------------------------------------------------------------------
-# init
-# ---------------------------------------------------------------------------
-
-INDEX_TEMPLATE = """\
----
-title: Index
-type: index
-sources: []
-last_updated: {today}
----
-
-# Index
-
-Catalog of wiki pages, grouped by type. (Maintained by the ingest pipeline.)
-"""
-
-OVERVIEW_TEMPLATE = """\
----
-title: Overview
-type: overview
-sources: []
-last_updated: {today}
----
-
-# Overview
-
-One-paragraph orientation to this wiki. (Maintained by the ingest pipeline.)
-"""
-
-
-def init(wiki_dir: str | Path) -> int:
-    """Scaffold a fresh wiki directory."""
-    wiki = Path(wiki_dir).resolve()
-    # Hidden machine-only subtree
-    wiki_hidden_dir(wiki).mkdir(parents=True, exist_ok=True)
-    # Visible user-facing dirs
-    wiki_inbox(wiki).mkdir(parents=True, exist_ok=True)
-    wiki_sources(wiki).mkdir(parents=True, exist_ok=True)
-    (wiki / ".ai" / "feedback").mkdir(parents=True, exist_ok=True)
-
-    today = date.today().isoformat()
-    index = wiki / "index.md"
-    overview = wiki / "overview.md"
-    if not index.exists():
-        index.write_text(INDEX_TEMPLATE.format(today=today), encoding="utf-8")
-    if not overview.exists():
-        overview.write_text(OVERVIEW_TEMPLATE.format(today=today), encoding="utf-8")
-
-    ledger = wiki_ledger(wiki)
-    if not ledger.exists():
-        ledger.touch()
-
-    _ok(f"initialized wiki at {wiki}")
-    print(f"  {INBOX}/  {SOURCES}/  .ai/feedback/  .wiki/  index.md  overview.md")
-    ensure_obsidian_ready(wiki)
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# ledger helpers
-# ---------------------------------------------------------------------------
-
-
-def _read_ledger(wiki: Path) -> list[dict]:
-    ledger = wiki_ledger(wiki)
-    if not ledger.exists():
-        return []
-    rows: list[dict] = []
-    for line in ledger.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return rows
-
-
-def _processed_sources(wiki: Path) -> set[str]:
-    """Sources the wiki has SUCCESSFULLY ingested (converged ledger rows only).
-
-    The ledger now also records FAILED sources (status "failed",
-    converged false -- written when a source is quarantined to
-    ``.wiki/failed/``). Those rows must NOT mark a source as processed:
-    the documented retry path is "review, fix, and re-drop into _inbox/",
-    and a failed row counting as processed would silently skip the retry.
-    """
-    return {row.get("source", "") for row in _read_ledger(wiki) if row.get("converged")}
-
-
-def _append_ledger(wiki: Path, entry: dict) -> None:
-    with wiki_ledger(wiki).open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
-
-
-# Failure-kind vocabulary for quarantined sources (ledger ``failure_kind``
-# field + result.json ``failed[]`` entries). Answers ONE question -- was a
-# convergence verdict rendered for the final synthesis cycle?
-#   no_verdict           -- assess never rendered one (e.g. the child session
-#                           exhausted its tool budget mid-verification: the
-#                           2026-07 incident where 4/25 sources hit the 50-call
-#                           ceiling and were quarantined invisibly).
-#   judged_non_converged -- assess DID render verdict(s) (refine) and the
-#                           cycle budget ran out.
-#   unknown              -- the question was not / could not be evaluated.
-FAILURE_KIND_NO_VERDICT = "no_verdict"
-FAILURE_KIND_JUDGED = "judged_non_converged"
-FAILURE_KIND_UNKNOWN = "unknown"
-# spawn_timeout_no_progress -- the spawn circuit breaker tripped: the same
-# pipeline node was re-executed repeatedly (each execution killed at the
-# spawn timeout) with ZERO artifact writes between executions. See
-# wiki_weaver/spawn_breaker.py for the incident + mechanism.
-FAILURE_KIND_SPAWN_BREAKER = "spawn_timeout_no_progress"
-
-
-def spawn_breaker_marker_path(wiki: Path) -> Path:
-    """The spawn circuit breaker's trip marker (see wiki_weaver/spawn_breaker.py).
-
-    Written by the breaker when it trips; consumed (read for the ledger
-    ``failure_kind``, then deleted) by the fail path that quarantines the
-    source. Lives in ``.ai/`` scratch space -- like ``.ai/assessment.md`` it
-    is per-source state, cleared at the start of every synthesis run.
-    """
-    return wiki / ".ai" / "spawn-breaker.json"
-
-
-def classify_failure_kind(wiki: Path, started_at: float | None) -> str:
-    """Classify a non-convergence quarantine from fail-path artifacts.
-
-    PRAGMATIC HEURISTIC (wiki-weaver can only observe the filesystem; it
-    cannot see inside the engine): the assess node writes
-    ``<wiki>/.ai/assessment.md`` BEFORE rendering its verdict, so an
-    assessment file modified during THIS source's synthesis window proves a
-    verdict-rendering assess ran (=> ``judged_non_converged``); an absent or
-    stale file (mtime older than ``started_at`` -- i.e. left over from a
-    PREVIOUS source, since ``.ai/`` is shared scratch state) means no verdict
-    was ever rendered for this source (=> ``no_verdict``). Without a
-    ``started_at`` reference the question is undecidable (=> ``unknown``).
-
-    SPAWN-BREAKER OVERRIDE (checked FIRST): a trip marker written by the
-    spawn circuit breaker during this source's synthesis window (same mtime
-    gating as the assessment file; both run paths also clear the marker at
-    run start) means the source was killed by repeated no-progress
-    re-execution -- the distinct ``spawn_timeout_no_progress`` kind, more
-    specific than either verdict-based kind.
-    """
-    marker = spawn_breaker_marker_path(wiki)
-    try:
-        if marker.is_file() and (
-            started_at is None or marker.stat().st_mtime >= started_at
-        ):
-            return FAILURE_KIND_SPAWN_BREAKER
-    except OSError:
-        pass
-    if started_at is None:
-        return FAILURE_KIND_UNKNOWN
-    assessment = wiki / ".ai" / "assessment.md"
-    try:
-        if not assessment.is_file():
-            return FAILURE_KIND_NO_VERDICT
-        if assessment.stat().st_mtime >= started_at:
-            return FAILURE_KIND_JUDGED
-        return FAILURE_KIND_NO_VERDICT
-    except OSError:
-        return FAILURE_KIND_UNKNOWN
-
-
-def _append_failure_ledger(
-    wiki: Path,
-    *,
-    source: str,
-    source_id: int | str,
-    file_hash: str,
-    failed_to: str,
-    reason: str,
-    failure_kind: str,
-    logs_dir: str = "",
-) -> None:
-    """Append a FAILURE record to the ledger -- symmetrical with the success
-    record -- whenever a source is quarantined to ``.wiki/failed/``.
-
-    Fixes the incident where quarantined sources were INVISIBLE in
-    ``.wiki/.processed.jsonl`` (the ledger recorded only successes).
-    FAIL-SOFT: the quarantine move is the load-bearing act; a failed
-    observability write must never break the drain.
-    """
-    entry = {
-        "source": source,
-        "source_id": source_id,
-        "hash": file_hash,
-        "status": "failed",
-        "converged": False,
-        "failed_to": failed_to,
-        "reason": reason,
-        "failure_kind": failure_kind,
-        "logs_dir": logs_dir,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-    }
-    try:
-        _append_ledger(wiki, entry)
-    except OSError as e:
-        print(
-            f"! WARNING: could not append failure record to ledger for "
-            f"{source} ({type(e).__name__}: {e}) -- quarantine is unaffected",
-            file=sys.stderr,
-            flush=True,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Fix 3 -- persistent source registry (stable ids + content-hash dedupe)
+# argparse ``type=`` helper for in-context-counter / --param CLI arguments
 # ---------------------------------------------------------------------------
 #
-# Source ids used to be guessed per-run by the ingest LLM ([1]/[2]/[3]), which
-# collided across runs and produced duplicate summary pages on re-ingest. The
-# registry at <wiki>/.sources.json is the single source of truth: the CLI
-# assigns/looks up a stable id by CONTENT HASH *before* ingest and threads it
-# into the inner pipeline as $source_id. An already-ingested source (same hash)
-# is deduped and skipped.
+# Every pipeline .dot substitutes these values via the BARE ``$var`` form
+# (never ``${var:-default}`` -- the attractor engine's substitution does not
+# understand shell default-value syntax, so a ``${var:-default}`` token is
+# left untouched by the engine and expanded by bash itself, which ALWAYS
+# applies its own default and silently discards any ``--param`` the caller
+# supplied).
+#
+# The bare-``$var`` form has its own failure mode: when the context key is
+# absent, the engine leaves the literal ``$var`` token in place and bash's
+# unset-variable expansion resolves it to an empty string. ``int_or_default``
+# is the single place these defaults live -- the .dot files never encode a
+# default themselves, so the shell expression and the Python default can
+# never silently disagree.
 
-REGISTRY_NAME = ".sources.json"
 
+def int_or_default(default: int):
+    """Return an ``argparse`` ``type=`` callable: "" -> *default*, else ``int(value)``.
 
-def _parse_transcript_header(text: str) -> dict:
-    """Parse provenance from a meeting-transcript header block (no YAML frontmatter).
+    Args:
+        default: Value to use when the CLI receives an empty string (the
+            bare-``$var`` absent-key expansion described above).
 
-    Handles the format produced by Teams/Zoom/calendar export tools::
-
-        # Transcript: Weekly Planning Sync
-
-        Source: https://example.com/meetings/...
-        Duration: 1:00:50
-        Speakers: Nadia Brennan, Oskar Lindqvist, Rune Osgood
-        Date: 5/29/2026, 11:07:43 AM
-        Chat type: Meeting
-        Attendees: Rune Osgood, Nadia Brennan, Oskar Lindqvist
-
-        ---
-
-        [0:00:04] Nadia Brennan: ...
-
-    Returns a dict with keys ``author``, ``url``, ``date``, ``title`` (all
-    default to ``None``). Returns all-None for files that are not recognised
-    as transcripts — graceful fallback, no crash, no fabrication.
-
-    Detection: at least one of ``Speakers:`` or ``Attendees:`` must appear in
-    the header block (lines before the first ``---`` separator, or the first
-    50 lines when no separator is present). Labelled-field matching is
-    case-insensitive. ``Source:`` is only accepted when the value starts with
-    ``http://`` or ``https://`` to avoid false positives on prose fragments.
+    Returns:
+        A callable suitable for ``argparse.add_argument(..., type=...)``.
     """
-    result: dict = {"author": None, "url": None, "date": None, "title": None}
-    lines = text.splitlines()
 
-    # Locate the header block: up to the first "---" separator (the thematic
-    # break that ends the metadata preamble) or a 50-line cap.
-    sep_idx: int | None = None
-    for i, line in enumerate(lines):
-        if line.strip() == "---":
-            sep_idx = i
-            break
-    header_lines = lines[: sep_idx if sep_idx is not None else min(50, len(lines))]
+    def _parse(value: str) -> int:
+        if value == "":
+            return default
+        return int(value)
 
-    # Labelled-field regex: "Label Name: value" (multi-word keys allowed)
-    _labeled = re.compile(r"^([A-Za-z][A-Za-z0-9 ]*?):\s*(.+)$")
+    return _parse
 
-    has_speaker_marker = False  # True when Speakers: or Attendees: found
-    attendees_val: str | None = None
 
-    for line in header_lines:
-        stripped = line.strip()
+# ---------------------------------------------------------------------------
+# Wiki-root path conventions
+# ---------------------------------------------------------------------------
 
-        # Extract title from the first markdown heading
-        if stripped.startswith("#") and result["title"] is None:
-            heading = re.sub(r"^#+\s*", "", stripped)
-            heading = re.sub(r"(?i)^Transcript:\s*", "", heading).strip()
-            if heading:
-                result["title"] = heading
+
+@dataclass(frozen=True)
+class WikiRoot:
+    """Every path a ``--wiki-root`` implies, per CLI-CONTRACT.md's preamble:
+    ``sources/``, ``lens/``, ``wiki/``, ``AGENTS.md``, ``ledger.jsonl``,
+    ``cost.jsonl``, ``log.md``, and the ephemeral ``.ai/`` directory.
+    """
+
+    root: Path
+
+    def __init__(self, root: str | Path) -> None:
+        object.__setattr__(self, "root", Path(root))
+
+    @property
+    def sources_dir(self) -> Path:
+        return self.root / "sources"
+
+    @property
+    def lens_dir(self) -> Path:
+        return self.root / "lens"
+
+    @property
+    def wiki_dir(self) -> Path:
+        return self.root / "wiki"
+
+    @property
+    def ai_dir(self) -> Path:
+        return self.root / ".ai"
+
+    @property
+    def ledger_path(self) -> Path:
+        return self.root / "ledger.jsonl"
+
+    @property
+    def cost_path(self) -> Path:
+        return self.root / "cost.jsonl"
+
+    @property
+    def log_path(self) -> Path:
+        return self.root / "log.md"
+
+    @property
+    def current_source_file(self) -> Path:
+        return self.ai_dir / "current_source.txt"
+
+    @property
+    def source_start_file(self) -> Path:
+        return self.ai_dir / "source-start"
+
+    @property
+    def current_slice_file(self) -> Path:
+        return self.ai_dir / "current_slice.json"
+
+    @property
+    def current_catalog_file(self) -> Path:
+        """The index-first catalog ``build_catalog`` writes: filename, title,
+        one-line summary for EVERY wiki page, no bodies (evals/compounding/
+        PRECOMMIT-INDEX.md). This is what ``weave`` KNOWS EXISTS, as opposed
+        to ``current_slice_file`` above, which bounds what it may READ --
+        the two were conflated by the prior BM25-threshold routing rule this
+        file's sibling replaces."""
+        return self.ai_dir / "current_catalog.md"
+
+    @property
+    def review_guidance_file(self) -> Path:
+        return self.ai_dir / "review-guidance.md"
+
+    @property
+    def review_brief_file(self) -> Path:
+        """The self-contained brief ``prepare_review_brief`` writes for
+        ``review_gate`` -- ``{\"source_id\": ..., \"stage\": ..., \"brief\": ...}``
+        (``wiki_weaver.ingest.review_brief``). Stamped with the source id it
+        was built for so a reader (``wiki_weaver.aitl.proxy_interviewer``)
+        can verify freshness against ``current_source_file`` before trusting
+        it -- a brief from a previous source read at the wrong gate is worse
+        than no brief at all. Distinct from ``review_guidance_file`` above,
+        which is the HUMAN's/proxy's own steering text written back after a
+        [B] Guide decision -- this file is the input the decision is based
+        on, not the output of it."""
+        return self.ai_dir / "review-brief.json"
+
+    @property
+    def takeaways_brief_file(self) -> Path:
+        """The self-contained brief ``wiki_weaver.ingest.takeaways_brief``
+        writes for ``takeaways_gate`` -- the ONE pre-write discussion site
+        the source gist describes (docs/llm-wiki-pattern.md L50: "the LLM
+        reads the source, discusses key takeaways with you ... writes a
+        summary page") that this pipeline never built until now. Same
+        stamped ``{"source_id": ..., "stage": ..., "brief": ...}`` shape and
+        freshness contract as ``review_brief_file``/``guidance_brief_file``
+        above -- read by ``wiki_weaver.aitl.proxy_interviewer``, verified
+        fresh against ``current_source_file`` before being trusted."""
+        return self.ai_dir / "takeaways-brief.json"
+
+    @property
+    def takeaways_guidance_file(self) -> Path:
+        """The answerer's OWN emphasis text for the source about to be
+        woven -- written by ``wiki_weaver.ingest.persist_takeaways`` right
+        after ``takeaways_gate``, read directly by ``weave`` itself (a
+        plain-markdown file-tool read, the same hand-off shape
+        ``review_guidance_file`` above already proves for a POST-write
+        steer). Absent whenever no particular emphasis was requested
+        (including an unattended auto-approve answer -- see
+        ``persist_takeaways.py``'s module docstring) -- this is normal, not
+        an error."""
+        return self.ai_dir / "takeaways-guidance.md"
+
+    @property
+    def takeaways_answer_file(self) -> Path:
+        """THE fix for a verified platform defect (see
+        ``wiki_weaver.aitl.freeform_bridge``'s module docstring): environment
+        variable names containing periods (e.g. the engine's own
+        ``human.gate.text`` context key, upper-cased verbatim by
+        ``tool_env`` to ``HUMAN.GATE.TEXT``) do not reliably survive
+        ``asyncio.create_subprocess_shell``'s ``env=`` passthrough on this
+        platform -- verified by direct reproduction outside the pipeline
+        entirely. Every ``Interviewer`` this project constructs (regardless
+        of mode) therefore writes ITS OWN freeform ``takeaways_gate`` answer
+        directly to this stamped file -- ``{"source_id": ..., "stage": ...,
+        "text": ...}`` -- the moment it answers, sidestepping the broken
+        env-var channel AND the shell-injection risk of substituting free
+        text directly into a ``tool_command`` string. ``persist_takeaways``
+        reads this file (verifying freshness against ``current_source_file``,
+        same discipline as every other stamped brief file) instead of
+        ``HUMAN.GATE.TEXT``."""
+        return self.ai_dir / "takeaways-answer.json"
+
+    @property
+    def page_plan_file(self) -> Path:
+        """Arm C only (ingest-c.dot): the LLM planner's page-plan, validated
+        deterministically by ``wiki_weaver.ingest.validate_plan`` before
+        ``weave`` is allowed to execute it."""
+        return self.ai_dir / "page-plan.json"
+
+    @property
+    def reweave_attempts_file(self) -> Path:
+        return self.ai_dir / "reweave-attempts.json"
+
+    @property
+    def validation_report_file(self) -> Path:
+        """``validate``'s structural findings for the CURRENT weave pass --
+        ``.ai/validation-report.md``. Read by ``quarantine_brief`` (real,
+        quotable evidence for why a source is being offered to review_gate
+        after exhausting its re-weave attempts), same fixed relative path
+        every ``ingest.dot``/``correct.dot``/``canon.dot`` caller already
+        writes via ``--out``."""
+        return self.ai_dir / "validation-report.md"
+
+    @property
+    def guidance_brief_file(self) -> Path:
+        """The self-contained brief ``wiki_weaver.ingest.guidance_brief``
+        writes for ``collect_guidance`` -- the ``collect_guidance``
+        analogue of ``review_brief_file`` above (same defect class: a
+        freeform gate reached with no grounding refuses rather than
+        fabricates; this file is what fixes that). Stamped with the
+        source id it was built for, same freshness contract as
+        ``review_brief_file``."""
+        return self.ai_dir / "guidance-brief.json"
+
+    @property
+    def corrections_dir(self) -> Path:
+        """``lens/corrections/`` -- the second-highest-precedence lens layer
+        (docs/DESIGN.md \u00a74: canon > corrections > sources). THE load-bearing
+        artifact ``wiki_weaver.correct.persist_lens`` writes to (see its
+        module docstring) -- durable, machine-readable, re-read on every
+        subsequent ``weave`` pass (pipeline/ingest.dot's weave prompt) and,
+        via ``wiki_weaver.aitl.corrections``, on every subsequent AITL proxy
+        gate decision too."""
+        return self.lens_dir / "corrections"
+
+    @property
+    def gate_decisions_file(self) -> Path:
+        """The durable, append-only audit trail of every gate interaction
+        the proxy made -- ``wiki_weaver.aitl.audit``'s
+        ``.ai/gate-decisions.jsonl``. Formalized here (rather than only as
+        a path built inline in ``audit.py``) so ``guidance_brief`` can read
+        the reviewer's own stated reason for choosing [B] Guide without a
+        new ``ingest`` -> ``aitl`` package dependency."""
+        return self.ai_dir / "gate-decisions.jsonl"
+
+    @property
+    def quarantine_state_file(self) -> Path:
+        """One-shot, source-id-keyed latch: has THIS source already been
+        offered its one post-exhaustion review at ``review_gate``? See
+        ``wiki_weaver.ingest.quarantine_brief`` module docstring for the
+        termination argument this enforces. Identity-gated exactly like
+        ``reweave_attempts_file`` -- a stale latch left over from a
+        PREVIOUS source is reset, never silently reused."""
+        return self.ai_dir / "quarantine-state.json"
+
+    @property
+    def curate_brief_file(self) -> Path:
+        """The self-contained brief ``wiki_weaver.ingest.curate_brief``
+        writes for ``curate_gate`` -- the ONE source-level "does this belong
+        in this wiki" checkpoint (the gist's four human jobs: "curate
+        sources, direct the analysis, ask good questions, and think about
+        what it all means" -- the other three each already have a dedicated
+        gate; curation had none until now). Same stamped
+        ``{"source_id": ..., "stage": ..., "brief": ...}`` shape and
+        freshness contract as ``review_brief_file``/``takeaways_brief_file``
+        above -- read by ``wiki_weaver.aitl.proxy_interviewer``, verified
+        fresh against ``current_source_file`` before being trusted."""
+        return self.ai_dir / "curate-brief.json"
+
+    @property
+    def file_back_brief_file(self) -> Path:
+        """The self-contained brief ``wiki_weaver.ask.file_back_brief``
+        writes for ``ask.dot``'s ``file_back_gate`` -- the question asked
+        and a gist of the answer about to be offered for filing back into
+        the wiki. Unlike the ingest-side stamped briefs above (which are
+        verified fresh against a per-source ``current_source_file`` across
+        MANY sources in one pipeline run), ``ask.dot`` has no per-source
+        resume loop of its own -- one question in, one answer out, this
+        brief written fresh immediately before the gate in the SAME pass --
+        so no source-id-style freshness stamp is needed here; presence and
+        a non-empty ``brief`` field are the whole contract (see
+        ``wiki_weaver.ask.file_back_brief``'s module docstring)."""
+        return self.ai_dir / "file-back-brief.json"
+
+    # -- DESIGN.md §5 source-kind handling (detect_kind / segment_source) --
+
+    @property
+    def current_kind_file(self) -> Path:
+        """THE detected-kind breadcrumb for the current source (disk state,
+        not just in-context) -- written fresh by ``detect_kind`` every time a
+        source is (re)selected, and read by ``segment_source``,
+        ``budget``, and ``commit`` so the ledger/cost labels reflect what was
+        actually detected rather than falling back to the best-effort,
+        frontmatter-only ``read_source_kind()``."""
+        return self.ai_dir / "current_kind.json"
+
+    @property
+    def llm_kind_verdict_file(self) -> Path:
+        """Where ``classify_kind`` (the arm-of-last-resort LLM box, reached
+        only when ``detect_kind``'s own signals were ambiguous) writes its
+        one-word verdict. Never routed on directly (AP-2, DESIGN.md §12.1) --
+        ``detect_kind --from-verdict`` reads and validates it deterministically."""
+        return self.ai_dir / "kind-verdict.txt"
+
+    @property
+    def segments_dir(self) -> Path:
+        return self.ai_dir / "segments"
+
+    @property
+    def segments_manifest_file(self) -> Path:
+        return self.ai_dir / "segments.json"
+
+    @property
+    def current_segment_file(self) -> Path:
+        """Which segment of the CURRENT source is being processed right now
+        -- the segment-granularity analogue of ``current_source_file``."""
+        return self.ai_dir / "current_segment.json"
+
+    @property
+    def current_segment_content_file(self) -> Path:
+        """The bounded slice of text ``retrieve_slice``/``weave`` must read
+        for THIS pass -- always present once ``segment_source --select`` has
+        run, whether the source was segmented or not (one uniform file, one
+        uniform downstream code path -- see DESIGN.md §5)."""
+        return self.ai_dir / "current-segment-content.md"
+
+    # -- DESIGN.md §5 stream watermarking (wiki_weaver.ingest.watermark) --
+
+    @property
+    def current_source_content_file(self) -> Path:
+        """Written by ``watermark`` for a ``kind=stream`` source in
+        ``delta``/``full``/``watermark_reset`` mode: the bounded text
+        ``segment_source`` must read INSTEAD OF the raw file under
+        ``sources/`` for this pass (delta content + a small overlap window,
+        or the whole source on first sight / a detected reset). Absent for
+        every other kind -- ``detect_kind`` deletes any stale copy left by a
+        PRIOR stream source the moment a new source is selected, so
+        ``segment_source`` never accidentally reads another source's delta
+        (see detect_kind.py's cleanup comment)."""
+        return self.ai_dir / "current-source-content.md"
+
+    @property
+    def watermarks_path(self) -> Path:
+        """Durable, per-stream-identity watermark store -- sibling to
+        ``ledger.jsonl`` (persist watermarks where the ledger lives), a
+        single atomically-rewritten JSON object keyed by stable identity
+        (see ``wiki_weaver.ingest.watermark``), mirroring the existing
+        ``wiki_index_file`` precedent below for a small mutable JSON cache
+        that isn't append-only ledger data."""
+        return self.root / "watermarks.json"
+
+    @property
+    def wiki_index_dir(self) -> Path:
+        return self.wiki_dir / ".index"
+
+    @property
+    def wiki_index_file(self) -> Path:
+        return self.wiki_index_dir / "pages.json"
+
+    # -- pipeline/synthesize.dot (FINDINGS.md \u00a77: "no step forms a whole-corpus
+    # view" / "the exit condition is a queue-drain predicate, never anything
+    # about the wiki") --
+
+    @property
+    def synth_ledger_path(self) -> Path:
+        """Durable, append-only record of every gap-candidate this pipeline
+        has ever DECIDED on -- paged (a page was written) or declined (the
+        corpus-scoped answer node found no real cross-source support, or
+        structural validation never converged). Sibling to ``ledger.jsonl``
+        (same durability contract: committed, read via ``lib.read_ledger`` --
+        LedgerCorruptError on malformed JSONL, never silently treated as
+        empty). This IS what makes ``select_gap`` a resume gate: a term
+        already decided here is never proposed again, whether this run is
+        continuous or was killed and restarted from ``start``."""
+        return self.root / "synth-ledger.jsonl"
+
+    @property
+    def current_gap_file(self) -> Path:
+        """The gap candidate ``select_gap`` chose for THIS pass: ``{term,
+        source_count, source_ids}`` (see ``wiki_weaver.synthesize.find_gaps``).
+        The synthesize-loop analogue of ``current_source_file``."""
+        return self.ai_dir / "current_gap.json"
+
+    @property
+    def gap_context_file(self) -> Path:
+        """Corpus-scoped reading list for the current gap: the wiki pages
+        most relevant to the term (BM25) plus the source ids ``find_gaps``
+        already knows discuss it -- written by
+        ``wiki_weaver.synthesize.retrieve_context``, read by ``answer_gap``."""
+        return self.ai_dir / "gap-context.json"
+
+    @property
+    def gap_answer_file(self) -> Path:
+        """Written ONLY when ``answer_gap`` finds real cross-source support
+        for the current gap term -- mirrors ``ask.dot``'s
+        ``answer``/``.ai/answer.md`` split (exactly one of this and
+        ``gap_declined_file`` exists after ``answer_gap`` runs;
+        ``gap_coverage_check`` routes on which)."""
+        return self.ai_dir / "gap-answer.md"
+
+    @property
+    def gap_declined_file(self) -> Path:
+        """Written ONLY when ``answer_gap`` decides coverage is too thin to
+        justify a page -- refuse rather than guess, same discipline as
+        ``ask.dot``'s ``.ai/refusal.md``."""
+        return self.ai_dir / "gap-declined.md"
+
+    @property
+    def synth_reweave_attempts_file(self) -> Path:
+        """Attempt counter for THIS gap term's structural-validation retry
+        loop -- the synthesize-loop analogue of ``reweave_attempts_file``,
+        keyed by term (via ``current_gap_file``) instead of source id."""
+        return self.ai_dir / "synth-reweave-attempts.json"
+
+    @property
+    def gap_candidates_raw_file(self) -> Path:
+        """``scan_arguments``' (LLM box) raw, unvalidated candidate list --
+        ``.ai/gap-candidates-raw.json`` -- read and validated by
+        ``wiki_weaver.synthesize.rank_candidates`` before anything
+        downstream trusts it: \"the planner cannot certify its own plan's
+        syntax\" (``validate_plan.py``'s exact reasoning) applies equally
+        here to \"the model cannot certify its own candidate list's
+        shape.\""""
+        return self.ai_dir / "gap-candidates-raw.json"
+
+    @property
+    def gap_candidates_file(self) -> Path:
+        """``rank_candidates``' normalized, threshold-filtered, ranked
+        candidate list -- ``.ai/gap-candidates.json`` -- what ``select_gap``
+        actually reads on every pass (the synthesize-loop analogue of the
+        retired ``find_gaps()`` in-process call: candidates now come from
+        ONE bounded LLM pass over ``wiki/index.md`` + ``.ai/source-arguments.md``,
+        cached to disk for this invocation, rather than a live n-gram
+        count over ``sources/``)."""
+        return self.ai_dir / "gap-candidates.json"
+
+    @property
+    def synthesis_brief_file(self) -> Path:
+        """Self-contained PRE-write brief for ``synthesis_gate`` -- the ONE
+        pass-level checkpoint where a human or agent proxy can shape WHICH
+        ranked candidate themes actually get a page, before ``select_gap``
+        ever picks one to write (see ``pipeline/synthesize.dot``'s header
+        and ``wiki_weaver.synthesize.synthesis_brief``). Stamped with a
+        ``signature`` over the pending candidate set (never a source_id --
+        this gate has no single-source identity, unlike ``takeaways_gate``/
+        ``curate_gate``) so ``persist_synthesis_guidance`` can verify the
+        answer it reads was given for THIS pass's candidate list, never a
+        stale prior one."""
+        return self.ai_dir / "synthesis-brief.json"
+
+    @property
+    def synthesis_answer_file(self) -> Path:
+        """``synthesis_gate``'s freeform answer, written directly by
+        ``wiki_weaver.aitl.freeform_bridge.FreeformAnswerRecorder`` the
+        moment it is given -- the SAME dotted-env-var platform workaround
+        ``takeaways_answer_file`` uses (see that property's docstring and
+        ``freeform_bridge``'s module docstring for the defect this works
+        around). Stamped with ``signature`` (not ``source_id``) -- read by
+        ``wiki_weaver.synthesize.persist_synthesis_guidance``."""
+        return self.ai_dir / "synthesis-answer.json"
+
+    @property
+    def source_arguments_file(self) -> Path:
+        """``wiki_weaver.synthesize.extract_source_arguments``' deterministic
+        output -- ``.ai/source-arguments.md`` -- a condensed, one-extract-
+        per-source-page ARGUMENT view of the corpus, read by ``scan_arguments``
+        in place of ``wiki/overview.md`` (iteration-4 fix: overview.md and
+        index.md are themselves organized per-source-arrival-order and
+        per-entity respectively, so a theme with no entity and no shared
+        title vocabulary is invisible to a scan seeded from them -- see
+        pipeline/synthesize.dot's header and
+        wiki_weaver.synthesize.extract_source_arguments' module docstring).
+        Computed fresh every invocation (cheap, deterministic); never
+        committed -- ephemeral like every other ``.ai/`` artifact."""
+        return self.ai_dir / "source-arguments.md"
+
+    # -- iteration-6 fix: detection/attribution split (see pipeline/
+    # synthesize.dot's header, "ITERATION 6" section, and
+    # wiki_weaver.synthesize.attribute_select / attribute_record) --
+
+    @property
+    def attribution_progress_file(self) -> Path:
+        """Internal, resumable working state for the per-candidate
+        attribution loop -- ``.ai/attribution-progress.json`` --
+        ``{"raw_signature": <sha256 of gap-candidates-raw.json's bytes>,
+        "results": [{"term", "source_ids", "claim"}, ...]}``. Owned
+        entirely by ``attribute_select``/``attribute_record``; never read
+        by anything downstream of the attribution loop (that's
+        ``gap_candidates_attributed_file``, below). The stored
+        ``raw_signature`` is what makes a same-invocation crash/resume
+        cheap (partial progress survives) while a genuine new
+        ``scan_arguments`` run (different raw content -> different
+        signature) discards stale progress rather than silently mixing
+        two different detection passes' candidates."""
+        return self.ai_dir / "attribution-progress.json"
+
+    @property
+    def current_attribution_candidate_file(self) -> Path:
+        """The ONE candidate ``attribute_select`` chose for this pass --
+        ``{"term", "claim", "source_ids"}`` where ``source_ids`` is
+        ``scan_arguments``' SEED, not a final count -- the attribution-loop
+        analogue of ``current_gap_file``. Read by ``attribute_sources``."""
+        return self.ai_dir / "current-attribution-candidate.json"
+
+    @property
+    def current_attribution_result_file(self) -> Path:
+        """Written ONLY by ``attribute_sources`` (the LLM box): its
+        corrected ``{"term", "claim", "source_ids"}`` judgment for the ONE
+        candidate named in ``current_attribution_candidate_file`` -- may
+        add source_ids the seed missed and drop ones that do not actually
+        hold. Read and validated by ``attribute_record`` (box/tool split,
+        same reasoning as ``rank_candidates`` validating ``scan_arguments``'
+        own output: the model cannot certify its own attribution's shape)."""
+        return self.ai_dir / "current-attribution-result.json"
+
+    @property
+    def gap_candidates_attributed_file(self) -> Path:
+        """The attribution loop's FINAL artifact -- ``.ai/gap-candidates-
+        attributed.json`` -- a flat JSON array of ``{"term", "source_ids",
+        "claim"}``, one per unique candidate ``scan_arguments`` proposed,
+        with ``source_ids`` now the ATTRIBUTED count (every source thesis
+        judged individually against that one argument) rather than the
+        detection pass's rough seed. This is what
+        ``wiki_weaver.synthesize.rank_candidates`` reads and threshold-
+        filters -- the synthesize-loop analogue of the old direct read of
+        ``gap_candidates_raw_file`` before the iteration-6 attribution pass
+        was inserted between detection and ranking."""
+        return self.ai_dir / "gap-candidates-attributed.json"
+
+    # -- CHUNKED DETECTION (this pass): scan_arguments measurably triages to
+    # only 2-3 dominant signals when run once over the full ~44 KB source-
+    # arguments.md extract, but correctly surfaces far more when scoped to a
+    # small fixed-size chunk of source theses (see wiki_weaver.synthesize.
+    # chunk_arguments' module docstring for the measured evidence). This is
+    # a select/box/record loop for DETECTION, the same shape iteration 6
+    # already applied to ATTRIBUTION -- see wiki_weaver.synthesize.
+    # select_chunk / record_chunk_candidates. --
+
+    @property
+    def argument_chunks_file(self) -> Path:
+        """``wiki_weaver.synthesize.chunk_arguments``' deterministic output
+        -- ``.ai/argument-chunks.json`` -- a JSON array of fixed-size chunk
+        document strings, each a self-contained subset of the corpus's
+        source theses (same ``## <title>\\n(source_id: ...)`` section
+        format as ``source_arguments_file``, just fewer sections per
+        chunk). Read by ``wiki_weaver.synthesize.select_chunk`` to drive the
+        per-chunk detection loop; never read directly by ``scan_arguments``
+        (which reads only the ONE chunk ``select_chunk`` wrote to
+        ``current_chunk_file``)."""
+        return self.ai_dir / "argument-chunks.json"
+
+    @property
+    def chunk_detection_progress_file(self) -> Path:
+        """Resumable working state for the per-chunk detection loop --
+        ``.ai/chunk-detection-progress.json`` -- ``{"chunks_signature":
+        <sha256 of argument_chunks_file's bytes>, "scanned_indices": [...],
+        "current_index": <int, the chunk select_chunk most recently chose>,
+        "accumulated": [{"term", "claim", "source_ids", "chunk_indices"},
+        ...]}``. Same resumability discipline as
+        ``attribution_progress_file`` (see that property's docstring):
+        matching signature -> resume; different/absent signature -> a NEW
+        ``chunk_arguments`` run produced this file, start fresh rather than
+        silently mixing two different chunkings' candidates."""
+        return self.ai_dir / "chunk-detection-progress.json"
+
+    @property
+    def current_chunk_file(self) -> Path:
+        """The ONE chunk ``select_chunk`` chose for this pass -- a plain
+        markdown document (NOT JSON), the per-chunk analogue of
+        ``current_gap_file`` -- read by ``scan_arguments`` (the LLM box)
+        INSTEAD OF ``source_arguments_file``, the whole-corpus extract, for
+        the duration of the chunked detection loop."""
+        return self.ai_dir / "current-chunk.md"
+
+    @property
+    def current_chunk_candidates_raw_file(self) -> Path:
+        """Written ONLY by ``scan_arguments`` (the LLM box): its raw,
+        unvalidated candidate list for the ONE chunk named in
+        ``current_chunk_file`` -- the per-chunk analogue of the pre-
+        chunking ``gap_candidates_raw_file``. Read and validated by
+        ``wiki_weaver.synthesize.record_chunk_candidates`` (box/tool split,
+        same reasoning as every other box output in this pipeline: the
+        model cannot certify its own output's shape) before being unioned
+        into ``chunk_detection_progress_file``'s accumulated list."""
+        return self.ai_dir / "current-chunk-candidates-raw.json"
+
+
+def resolve_path(wr: WikiRoot, raw: str) -> Path:
+    """Resolve a ``--out``/``--append-*`` style argument.
+
+    Absolute paths pass through; relative paths are relative to
+    ``--wiki-root`` (matching how ``ingest.dot`` passes e.g.
+    ``--append-ledger ledger.jsonl``).
+    """
+    p = Path(raw)
+    return p if p.is_absolute() else wr.root / p
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Atomic writes -- tempfile.mkstemp + os.replace, per CLI-CONTRACT.md
+# ---------------------------------------------------------------------------
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` durably: never a torn/partial file."""
+    ensure_dir(path.parent)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_append_jsonl(path: Path, obj: dict) -> None:
+    """Append one JSON object as a line, fsynced before returning.
+
+    A true atomic *replace* is impossible for an append (the prior content
+    must be preserved), so durability here means: the write is flushed and
+    fsynced to disk before this function returns, and the process must not
+    print its "done" sentinel until after this call completes -- see the
+    ordering law in CLI-CONTRACT.md.
+    """
+    ensure_dir(path.parent)
+    line = json.dumps(obj) + "\n"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+# ---------------------------------------------------------------------------
+# Ledger
+# ---------------------------------------------------------------------------
+
+
+def read_ledger(path: Path) -> list[dict]:
+    """Read ``ledger.jsonl`` as a list of dicts.
+
+    Missing file -> empty list (nothing has been ingested yet). Existing
+    file that fails to parse as JSONL -> ``LedgerCorruptError``.
+    """
+    if not path.is_file():
+        return []
+    records: list[dict] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LedgerCorruptError(f"could not read {path}: {exc}") from exc
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
             continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise LedgerCorruptError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
+    return records
 
-        m = _labeled.match(stripped)
-        if not m:
+
+def _segment_status_by_source(records: list[dict]) -> dict[str, tuple[set[int], int]]:
+    """Group ledger records by source_id -> (ledgered segment indices, total).
+
+    Segment-aware extension for DESIGN.md §5 (meeting transcripts segmented
+    at turn boundaries): a ledger line MAY carry ``segment_index``/
+    ``segment_total``; when absent (every pre-segmentation ledger line, and
+    every line written by a caller that never ran ``segment_source``, e.g.
+    ``evals/arms/ingest-b.dot``/``ingest-c.dot``), it is treated as segment 1
+    of 1 -- so old ledgers, and non-segmenting callers, behave exactly as
+    before with zero special-casing.
+    """
+    result: dict[str, tuple[set[int], int]] = {}
+    for rec in records:
+        sid = rec.get("source_id")
+        if sid is None:
             continue
-        key = m.group(1).strip().lower()
-        val = m.group(2).strip()
-        if not val:
-            continue
-
-        if key == "source":
-            # Accept only URLs to avoid false positives on prose like "Source: Smith 2024"
-            if val.startswith(("http://", "https://")):
-                result["url"] = val
-        elif key == "speakers":
-            result["author"] = val
-            has_speaker_marker = True
-        elif key == "date":
-            result["date"] = val
-        elif key == "attendees":
-            attendees_val = val
-            has_speaker_marker = True
-
-    # Speakers: takes priority; Attendees: is the fallback author
-    if result["author"] is None and attendees_val is not None:
-        result["author"] = attendees_val
-
-    # If no speaker/attendee marker found this is not a transcript — return all-None
-    if not has_speaker_marker:
-        return {"author": None, "url": None, "date": None, "title": None}
-
+        idx = rec.get("segment_index", 1)
+        total = rec.get("segment_total", 1)
+        indices, prior_total = result.get(sid, (set(), total))
+        indices.add(idx)
+        # Take the LARGEST total this source has ever claimed, not the last one
+        # written. Rows for one source can disagree about segment_total the
+        # moment a source is ever re-split (which generation-aware re-selection
+        # would introduce), and taking the last row's value silently shrinks the
+        # completion bar: rows (1,2,3 of 4) followed by a row (1 of 1) made
+        # ledgered_source_ids report the source FULLY DONE on the strength of
+        # segment 1 alone, retiring segment 4 without it ever being woven.
+        # max() can only ever make a source look LESS complete, never more --
+        # the safe direction for a gate whose job is to keep work pending.
+        result[sid] = (indices, max(prior_total, total))
     return result
 
 
-def _read_source_frontmatter(src: Path) -> dict:
-    """Extract author, url, and date from YAML frontmatter of a source article.
+def ledgered_source_ids(path: Path) -> set[str]:
+    """Source ids that are FULLY done -- every segment 1..segment_total has
+    a ledger decision recorded (accept or skip; a source with only some of
+    its segments ledgered is still pending, see select_source's resume
+    gate)."""
+    by_source = _segment_status_by_source(read_ledger(path))
+    return {sid for sid, (indices, total) in by_source.items() if indices >= set(range(1, total + 1))}
 
-    Reads the ``---`` … ``---`` frontmatter block and returns a dict with keys
-    ``author``, ``url``, and ``date`` (all defaulting to ``None`` when absent).
 
-    Handles simple single-line string fields only (quoted or unquoted). Fails
-    silently on any parse error — provenance is best-effort; missing fields are
-    stored as ``None`` in the registry, never as fabrications.
+def ledgered_segment_indices(path: Path, source_id: str) -> set[int]:
+    """Which segment indices of ``source_id`` already have a ledger decision
+    (accept or skip) recorded, regardless of whether the source as a whole
+    is fully done yet."""
+    by_source = _segment_status_by_source(read_ledger(path))
+    indices, _total = by_source.get(source_id, (set(), 1))
+    return indices
 
-    Recognises both ``source:`` and ``url:`` as the URL field (acquisition
-    tools typically write ``source:``, other producers may write ``url:``).
 
-    Fallback: when no YAML frontmatter is found, attempts to parse a
-    meeting-transcript header block via :func:`_parse_transcript_header`.
-    Sources with neither frontmatter nor transcript markers are unchanged
-    (returns all-None).
+def already_ledgered(path: Path, source_id: str, segment_index: int = 1) -> bool:
+    """Is THIS (source, segment) pair already ledgered? Defaults to segment 1
+    -- the whole-source idempotency check every pre-segmentation caller
+    (and every caller that never ran ``segment_source``) already relies on."""
+    return segment_index in ledgered_segment_indices(path, source_id)
+
+
+# ---------------------------------------------------------------------------
+# Current-source breadcrumb
+# ---------------------------------------------------------------------------
+
+
+def read_current_source_id(wr: WikiRoot) -> str:
+    path = wr.current_source_file
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} does not exist -- select_source must run first")
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        raise FileNotFoundError(f"{path} is empty -- select_source must run first")
+    return content
+
+
+def read_current_segment_index(wr: WikiRoot) -> int:
+    """Which segment of the CURRENT source is being processed right now,
+    per ``current_segment_file`` -- defaults to ``1`` (the pre-segmentation
+    whole-source shape) when that file is absent, exactly like
+    ``commit.py``'s own ``_current_segment`` helper: a caller that never ran
+    ``segment_source --select`` (evals/arms/ingest-b.dot, ingest-c.dot, or
+    any fresh checkout) sees unchanged, backward-compatible behavior.
+
+    THE identity fix (docs/KNOWN_ISSUES.md #3): ``reweave_bound`` and
+    ``quarantine_brief`` key their per-source state (retry counter, one-shot
+    review latch) by source id ALONE. segment_source.py's own docstring
+    states the design intent plainly -- "each segment is a unit of work"
+    (DESIGN.md \u00a75) -- but both of those state files predate segmentation
+    and were never updated to treat a segment as its own unit once
+    segmentation shares one source id across many passes. The practical
+    effect, confirmed against a real 73-source production run: segment 1
+    of a multi-segment source consumes BOTH the shared retry budget and the
+    ONE-TIME per-source review-gate rescue on its own exhaustion, so segment
+    2+ of the SAME source inherits an already-spent counter (it can exhaust
+    in as little as a single failed validate) and finds the rescue latch
+    already burned -- auto-quarantining almost every time, regardless of
+    what that segment's own weave actually wrote. Reading the segment index
+    here (and folding it into both state files' identity, alongside
+    source_id) restores "each segment is a unit of work" as a matter of
+    accounting, not just intent: every segment gets its own retry budget and
+    its own one-shot rescue, exactly like a freshly-selected source does.
     """
-    result: dict = {"author": None, "url": None, "date": None}
+    path = wr.current_segment_file
+    if not path.is_file():
+        return 1
     try:
-        text = src.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return result
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 1
+    try:
+        return int(data.get("index", 1))
+    except (TypeError, ValueError):
+        return 1
 
+
+def read_current_kind(wr: WikiRoot) -> str:
+    """The kind ``detect_kind`` actually determined for the current source
+    (disk state -- see ``WikiRoot.current_kind_file``), not the best-effort,
+    frontmatter-only guess ``read_source_kind()`` makes. Raises
+    ``FileNotFoundError`` if ``detect_kind`` has not run yet for this source
+    -- mirrors ``read_current_source_id``'s contract."""
+    path = wr.current_kind_file
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} does not exist -- detect_kind must run first")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FileNotFoundError(f"{path} is not valid JSON: {exc}") from exc
+    kind = data.get("kind") if isinstance(data, dict) else None
+    if not kind:
+        raise FileNotFoundError(f"{path} has no 'kind' field -- detect_kind must run first")
+    return str(kind)
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter -- hand-rolled, no PyYAML (task instruction: stdlib only)
+#
+# Format observed in the seed wiki corpus (docs/DESIGN.md's evidence base):
+#     ---
+#     title: Some Title
+#     type: concept
+#     sources: [1]
+#     last_updated: 2026-07-25
+#     confidence: 0.6
+#     ---
+#     <body>
+# ---------------------------------------------------------------------------
+
+
+def _parse_scalar(raw: str) -> object:
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _parse_value(raw: str) -> object:
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_scalar(v.strip()) for v in inner.split(",")]
+    return _parse_scalar(raw)
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Split ``text`` into (frontmatter dict, body). No frontmatter -> ({}, text)."""
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
-        # No YAML frontmatter — try transcript header as graceful fallback.
-        fm = _parse_transcript_header(text)
-        if fm.get("author"):
-            result["author"] = fm["author"]
-        if fm.get("url"):
-            result["url"] = fm["url"]
-        if fm.get("date"):
-            result["date"] = fm["date"]
-        return result
-
-    end_idx = None
-    for i, line in enumerate(lines[1:], 1):
-        if line.strip() == "---":
-            end_idx = i
-            break
-    if end_idx is None:
-        return result
-
-    # Regex for `key: "quoted value"` or `key: 'quoted value'` or `key: plain value`
-    _quoted = re.compile(r'^(\w+):\s*["\'](.*)["\']$')
-    _plain = re.compile(r"^(\w+):\s*(.+)$")
-
-    for line in lines[1:end_idx]:
-        line = line.strip()
-        m = _quoted.match(line) or _plain.match(line)
-        if not m:
+        return {}, text
+    meta: dict[str, object] = {}
+    i = 1
+    while i < len(lines) and lines[i].strip() != "---":
+        line = lines[i]
+        i += 1
+        if not line.strip() or ":" not in line:
             continue
-        key = m.group(1).lower()
-        val = m.group(2).strip().strip("\"'")
-        if not val:
-            continue
-        if key == "author":
-            result["author"] = val
-        elif key in ("source", "url"):
-            result["url"] = val
-        elif key == "date":
-            result["date"] = val
-
-    return result
-
-
-def _source_hash(src: Path) -> str:
-    """Stable content hash (sha256) of a source file."""
-    h = hashlib.sha256()
-    h.update(src.read_bytes())
-    return h.hexdigest()
-
-
-def _load_registry(wiki: Path) -> dict:
-    reg_path = wiki_registry(wiki)
-    if not reg_path.exists():
-        return {"version": 1, "next_id": 1, "sources": []}
-    try:
-        data = json.loads(reg_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {"version": 1, "next_id": 1, "sources": []}
-    if not isinstance(data, dict):
-        return {"version": 1, "next_id": 1, "sources": []}
-    data.setdefault("version", 1)
-    data.setdefault("next_id", 1)
-    data.setdefault("sources", [])
-    return data
-
-
-def _save_registry(wiki: Path, registry: dict) -> None:
-    """Atomic write of the registry (tmp + replace)."""
-    reg_path = wiki_registry(wiki)
-    tmp = reg_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(reg_path)
-
-
-def _registry_entry_for_hash(registry: dict, file_hash: str) -> dict | None:
-    for entry in registry.get("sources", []):
-        if entry.get("hash") == file_hash:
-            return entry
-    return None
-
-
-def _assign_source_id(wiki: Path, src: Path) -> tuple[dict, bool]:
-    """Look up or assign a stable id for ``src`` by content hash.
-
-    Returns ``(entry, is_new)``. ``entry`` always has id/filename/hash/ingested.
-    On a new source the registry is persisted immediately so the id is stable
-    even if the ingest run later fails or is retried.
-
-    Provenance fields (author, url, date) are read from the source file's YAML
-    frontmatter and stored alongside id/filename/hash so citation ``[N]`` can
-    resolve to a real author + URL.  Missing fields are stored as ``None``
-    (or omitted) — never fabricated.
-    """
-    file_hash = _source_hash(src)
-    registry = _load_registry(wiki)
-    existing = _registry_entry_for_hash(registry, file_hash)
-    if existing is not None:
-        return existing, False
-
-    fm = _read_source_frontmatter(src)
-    entry: dict = {
-        "id": int(registry["next_id"]),
-        "filename": src.name,
-        "hash": file_hash,
-        "first_seen": datetime.now().isoformat(timespec="seconds"),
-        "ingested": False,
-    }
-    # Provenance from frontmatter — store only fields that are present so the
-    # registry stays clean (no null-value noise for articles without metadata).
-    if fm.get("author"):
-        entry["author"] = fm["author"]
-    if fm.get("url"):
-        entry["url"] = fm["url"]
-    if fm.get("date"):
-        entry["date"] = fm["date"]
-
-    registry["sources"].append(entry)
-    registry["next_id"] = int(registry["next_id"]) + 1
-    _save_registry(wiki, registry)
-    return entry, True
-
-
-def _mark_source_ingested(wiki: Path, file_hash: str) -> None:
-    registry = _load_registry(wiki)
-    entry = _registry_entry_for_hash(registry, file_hash)
-    if entry is not None and not entry.get("ingested"):
-        entry["ingested"] = True
-        entry["ingested_at"] = datetime.now().isoformat(timespec="seconds")
-        _save_registry(wiki, registry)
+        key, _, raw_value = line.partition(":")
+        meta[key.strip()] = _parse_value(raw_value)
+    body_lines = lines[i + 1 :] if i < len(lines) else []
+    return meta, "\n".join(body_lines)
 
 
 # ---------------------------------------------------------------------------
-# Fix 1b -- deterministic tamper guard (the safety net under fs sandboxing)
+# Wikilinks -- [[slug]] or [[slug|Display Title]]
 # ---------------------------------------------------------------------------
-#
-# Process state (the ledger + _sources/) is the CLI's EXCLUSIVE job and is
-# written ONLY here, AFTER a real convergence. The spawned ingest node is
-# additionally sandboxed at the filesystem-tool layer (engine_runner Fix 1),
-# but tool-bash has no path sandbox, so we ALSO verify deterministically: snap
-# the ledger + archive before the inner run; if EITHER changed during the run,
-# the agent fabricated process state. We never trust it -- we restore the
-# pre-run state (drop fabricated ledger lines, return falsely-archived files to
-# the inbox) and FAIL LOUD.
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
 
 
-def _snapshot_process_state(wiki: Path) -> tuple[int, set[str]]:
-    ledger = wiki_ledger(wiki)
-    ledger_lines = (
-        len(ledger.read_text(encoding="utf-8").splitlines()) if ledger.exists() else 0
-    )
-    sources = wiki_sources(wiki)
-    sources_files = {p.name for p in sources.iterdir()} if sources.is_dir() else set()
-    return ledger_lines, sources_files
-
-
-def _detect_and_undo_tamper(wiki: Path, before: tuple[int, set[str]]) -> list[str]:
-    """Compare process state to the pre-run snapshot; undo + report tamper.
-
-    Returns a list of human-readable violation strings (empty == clean).
-    """
-    before_lines, before_sources = before
-    violations: list[str] = []
-
-    # (1) Ledger: any new line during the inner run is agent-fabricated, since
-    # the lib appends only after this guard runs. Truncate back to before_lines.
-    ledger = wiki_ledger(wiki)
-    if ledger.exists():
-        lines = ledger.read_text(encoding="utf-8").splitlines()
-        if len(lines) > before_lines:
-            fabricated = lines[before_lines:]
-            violations.append(
-                f"agent wrote {len(fabricated)} fabricated ledger line(s): "
-                + "; ".join(s[:160] for s in fabricated)
-            )
-            kept = lines[:before_lines]
-            ledger.write_text(
-                ("\n".join(kept) + "\n") if kept else "", encoding="utf-8"
-            )
-
-    # (2) Sources: any file that appeared during the inner run is an
-    # agent-performed move. Return it to the inbox so it is NOT falsely treated
-    # as processed, and so the source can be re-ingested honestly.
-    sources = wiki_sources(wiki)
-    inbox = wiki_inbox(wiki)
-    if sources.is_dir():
-        now_sources = {p.name for p in sources.iterdir()}
-        new_files = sorted(now_sources - before_sources)
-        if new_files:
-            violations.append(
-                "agent moved source(s) into _sources/ (CLI-exclusive): "
-                + ", ".join(new_files)
-            )
-            inbox.mkdir(exist_ok=True)
-            for name in new_files:
-                try:
-                    (sources / name).replace(inbox / name)
-                except OSError:
-                    pass
-
-    return violations
+def extract_wikilinks(text: str) -> list[str]:
+    return [m.strip() for m in _WIKILINK_RE.findall(text)]
 
 
 # ---------------------------------------------------------------------------
-# ingest helpers
+# Source citations -- inline "NNN-Name.md" references a wiki page makes back
+# to the raw source file(s) it was derived from (the ORIGINAL source id
+# convention weave's prompt requires -- see ingest.dot's weave node). Cheap,
+# regex-only, no additional page opens beyond whatever already opened the
+# page for another reason (see refresh_page_index below, which computes this
+# alongside title/links/tokens on the same read).
 # ---------------------------------------------------------------------------
 
-
-def _collision_safe_move(src: Path, dest_dir: Path) -> Path:
-    """Move *src* into *dest_dir*, adding an integer suffix if the name is taken.
-
-    Returns the final destination path.  Raises RuntimeError only on extreme
-    collision counts (>= 10,000), which should never occur in practice.
-    """
-    dest = dest_dir / src.name
-    if not dest.exists():
-        src.replace(dest)
-        return dest
-    stem, suffix = src.stem, src.suffix
-    for i in range(1, 10_000):
-        candidate = dest_dir / f"{stem}.{i}{suffix}"
-        if not candidate.exists():
-            src.replace(candidate)
-            return candidate
-    raise RuntimeError(f"too many name collisions in {dest_dir} for {src.name}")
+_INLINE_SOURCE_CITATION_RE = re.compile(r"\b\d{3}-[^\s\]\)\"']+?\.md\b")
 
 
-def _looks_like_text(path: Path) -> bool:
-    """Return True unless *path* is binary, using git's heuristic: a file is
-    binary iff it contains a NUL byte.
-
-    Scans the whole file in 64 KB chunks (ingest sources are read in full by the
-    engine downstream anyway, so this costs nothing next to the LLM pass) and
-    stops at the first NUL.  Deliberately encoding-agnostic -- it does NOT decode
-    the bytes.
-
-    History: an earlier version decoded an 8 KB head *slice* as UTF-8 and treated
-    a decode error as "binary".  But a multi-byte UTF-8 character straddling the
-    8 KB cut raises UnicodeDecodeError, so valid UTF-8 text with long lines was
-    silently misclassified as binary and dropped.  NUL-sniffing the whole file
-    has no boundary hazard, accepts text in any encoding (UTF-8, latin-1, ...),
-    and still rejects real binaries (images, archives, executables, UTF-16) since
-    those carry NUL bytes.  Genuinely mis-encoded input is surfaced loudly
-    downstream, not hidden here.
-    """
-    try:
-        with path.open("rb") as fh:
-            while chunk := fh.read(65536):
-                if b"\x00" in chunk:
-                    return False
-    except OSError:
-        return False
-    return True
+def extract_source_citations(text: str) -> list[str]:
+    """Inline ``NNN-Name.md`` source-file citations anywhere in a wiki page
+    (frontmatter or body), order-preserving and deduplicated."""
+    seen: dict[str, None] = {}
+    for m in _INLINE_SOURCE_CITATION_RE.finditer(text):
+        seen.setdefault(m.group(0), None)
+    return list(seen)
 
 
 # ---------------------------------------------------------------------------
-# ingest (headline command) -- the OUTER corpus sweep
+# Wiki page loading (the in-memory equivalent of "wiki/.index/", built at
+# call time -- DESIGN.md measured this at ~0.025ms/page, three orders of
+# magnitude below one LLM pass, so no persistent index is needed for the
+# ingest subcommands this package implements)
 # ---------------------------------------------------------------------------
-
-
-def _print_summary(summary: list[tuple[str, str]]) -> None:
-    print("\n--- ingest summary ---")
-    for name, status in summary:
-        mark = GREEN + "\u2713" if status == "converged" else YELLOW + "\u2022"
-        print(f"  {mark}{RESET} {status:<14} {name}")
-    if summary:
-        failed_n = sum(
-            1
-            for _, s in summary
-            if s in {"error", "not-converged", "tampered", "binary"}
-        )
-        converged_n = sum(1 for _, s in summary if s == "converged")
-        print(f"  total={len(summary)}  converged={converged_n}  failed={failed_n}")
-
-
-def _finish_ingest_run(
-    run_dir: Path,
-    run_id: str,
-    summary: list[tuple[str, str]],
-    advisories: list[str],
-    blocked: list[dict],
-    errored: list[dict],
-    failed: list[dict] | None = None,
-) -> int:
-    """End-of-run contract for BOTH ingest paths (single-file + drain).
-
-    Builds the machine-readable run result from the per-source summary plus
-    the structured gate-block / engine-error records collected along the way,
-    writes ``<run_dir>/result.json`` (fail-soft), prints the honest headline,
-    and returns the documented exit code -- see ``wiki_weaver/run_result.py``
-    for the full contract (verdict rules, exit codes, the 0-converged
-    invariant).
-    """
-    from wiki_weaver.run_result import build_result, counts_from_statuses, finish_run
-
-    counts = counts_from_statuses(s for _, s in summary)
-    result = build_result(
-        run_id,
-        counts,
-        advisories=advisories,
-        blocked=blocked,
-        errored=errored,
-        failed=failed,
-        sources=[{"name": n, "status": s} for n, s in summary],
-    )
-    return finish_run(run_dir, result)
-
-
-def _adopt_interrupted_runs(
-    wiki: Path, run_dir: Path, run_id: str
-) -> tuple[list[tuple[str, str]], list[str], list[dict], list[dict], list[dict]]:
-    """Crash-safe drain resume: adopt crashed runs' ``in_progress`` snapshots.
-
-    Re-running the drain on the same wiki dir IS the resume path (no flag).
-    A crashed drain leaves ``<run>/result.json`` with ``status: in_progress``
-    (the drain rewrites it after every source); nothing else can -- every
-    live ingest holds the per-wiki pidlock and every non-crash exit
-    finalizes its result. So at drain start we fold those snapshots'
-    per-source records into this run's accumulation, making this run's
-    result.json reflect the COMBINED drain state across the crash.
-
-    WHY the snapshot and not the ledger: the ledger records only CONVERGED
-    sources and spans the wiki's whole history, so it cannot distinguish
-    "this interrupted drain's completions" from years of prior ingests, and
-    it forgets failed/blocked dispositions entirely. The in_progress
-    snapshot is exactly the durable per-drain state we need.
-
-    Durability ordering: persist OUR seeded ``in_progress`` snapshot FIRST,
-    then flip the crashed ones to ``superseded`` (never double-adopted). If
-    we crash between the two writes, the next resume adopts both snapshots
-    and the by-name merge dedupes -- never double-counts.
-
-    Returns ``(sources, advisories, blocked, errored, failed)`` seed lists
-    (all empty in the common no-crash case). Fail-soft throughout: resume is
-    built entirely from fail-soft run_result primitives and can never make
-    a drain refuse to run.
-    """
-    from wiki_weaver.run_result import (
-        STATUS_IN_PROGRESS,
-        build_result,
-        counts_from_statuses,
-        find_interrupted_runs,
-        mark_superseded,
-        merge_source_records,
-        write_result_json,
-    )
-
-    interrupted = find_interrupted_runs(wiki_runs(wiki), exclude_run_id=run_id)
-    if not interrupted:
-        return [], [], [], [], []
-
-    merged: list[dict] = []
-    advisories: list[str] = []
-    blocked: list[dict] = []
-    errored: list[dict] = []
-    failed: list[dict] = []
-    for _crashed_dir, result in interrupted:
-        merged = merge_source_records(merged, list(result.get("sources") or []))
-        for adv in result.get("advisories") or []:
-            if adv not in advisories:
-                advisories.append(adv)
-        blocked.extend(result.get("blocked") or [])
-        errored.extend(result.get("errored") or [])
-        failed.extend(result.get("failed") or [])
-
-    sources = [(str(r.get("name", "")), str(r.get("status", ""))) for r in merged]
-    _warn(
-        f"resuming after interrupted drain: adopted {len(sources)} completed "
-        f"source record(s) from crashed run(s): "
-        + ", ".join(d.name for d, _ in interrupted)
-    )
-    write_result_json(
-        run_dir,
-        build_result(
-            run_id,
-            counts_from_statuses(s for _, s in sources),
-            advisories=advisories,
-            blocked=blocked,
-            errored=errored,
-            failed=failed,
-            sources=[{"name": n, "status": s} for n, s in sources],
-            status=STATUS_IN_PROGRESS,
-        ),
-    )
-    for crashed_dir, result in interrupted:
-        mark_superseded(crashed_dir, result, resumed_by=run_id)
-    return sources, advisories, blocked, errored, failed
 
 
 @dataclass
-class DrainReport:
-    """Opt-in out-channel for the drain's ``--limit`` cap-hit signal.
+class WikiPage:
+    id: str  # filename, e.g. "andrej-karpathy.md"
+    slug: str  # filename stem, e.g. "andrej-karpathy"
+    title: str
+    links: list[str] = field(default_factory=list)
+    tokens: list[str] = field(default_factory=list)
+    byte_size: int = 0  # on-disk UTF-8 size -- the unit build_slice's byte budget spends
 
-    ``ingest()``'s return type stays ``-> int`` (a contract existing callers and
-    tests depend on -- see the rationale in ``ingest()``'s docstring below).
-    Callers who need to know whether a drain stopped early because it ran out
-    of budget (rather than because the inbox was empty) pass a ``DrainReport``
-    in and read ``.hit_limit`` back out after the call.
 
-    ``advisories`` is the machine-readable run-level gate-advisory signal:
-    non-empty means a runtime gate (duplicate-page / claim-retention) FIRED
-    but did NOT block (advisory mode -- the default; see
-    ``wiki_weaver.grading.gates_enforced()``). Lets a scheduler tell an
-    "advisory fired" run apart from a genuinely clean one. Populated on both
-    the single-file and drain paths whenever a report is passed.
+def list_wiki_pages(wiki_dir: Path) -> list[Path]:
+    if not wiki_dir.is_dir():
+        return []
+    return sorted(p for p in wiki_dir.glob("*.md") if p.is_file())
+
+
+# ---------------------------------------------------------------------------
+# Unambiguous external page-path convention (the write-path bug fix, see
+# ISSUE_HANDLING: 13 real content pages landed at wiki_root instead of
+# wiki/). weave's file tools are rooted at --wiki-root (the pipeline cwd),
+# so a BARE filename like "index.md" is genuinely ambiguous -- both
+# wiki_root/index.md and wiki_root/wiki/index.md are valid resolutions of a
+# relative write, and nothing forced the correct one. Every artifact weave
+# reads to learn a page's identity -- the catalog (build_catalog.py) and
+# the candidate slice (retrieve_slice.py) -- must render "wiki/<filename>",
+# never a bare filename, and the weave prompt (ingest.dot) must say so
+# explicitly. This is the single place that string is assembled so the
+# three can never drift out of agreement.
+# ---------------------------------------------------------------------------
+
+
+def to_wiki_relpath(page_id: str) -> str:
+    """``page_id`` (a bare wiki page filename, e.g. "index.md") rendered as
+    the unambiguous path relative to --wiki-root: "wiki/index.md". Internal
+    dict keys (catalog entries, slice bookkeeping) keep the bare filename --
+    only the on-disk artifacts weave actually reads use this form."""
+    return f"wiki/{page_id}"
+
+
+# ---------------------------------------------------------------------------
+# Root-level content-page guard -- the write-path bug's DETECTION half (see
+# to_wiki_relpath above for the PREVENTION half). Every file init.persist
+# legitimately places directly at wiki_root is enumerated below (AGENTS.md --
+# see init/persist.py's module docstring) plus log.md (WikiRoot.log_path,
+# appended by ingest.commit per the gist's append-only-log-at-root design).
+# ANY OTHER ``*.md`` file appearing directly at wiki_root is always a
+# content page that escaped wiki/, never legitimate scaffolding.
+# ---------------------------------------------------------------------------
+
+ROOT_LEVEL_MD_ALLOWLIST = ("log.md", "AGENTS.md")
+
+
+def list_root_pages(root: Path) -> list[Path]:
+    """``*.md`` files directly at ``root`` (non-recursive) -- mirrors
+    ``list_wiki_pages``'s glob but scoped one level up, for detecting
+    content pages that landed at wiki_root instead of wiki/."""
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.glob("*.md") if p.is_file())
+
+
+def find_stray_root_pages(root: Path) -> list[Path]:
+    """``*.md`` files directly at ``root`` that are NOT legitimate
+    scaffolding (see ``ROOT_LEVEL_MD_ALLOWLIST``) -- the write-path bug's
+    symptom: a content page weave meant to write to ``wiki/`` landing at
+    ``wiki_root`` itself instead, because a bare filename is ambiguous once
+    the child session's file tools are rooted at wiki_root."""
+    return [p for p in list_root_pages(root) if p.name not in ROOT_LEVEL_MD_ALLOWLIST]
+
+
+def load_wiki_pages(wiki_dir: Path) -> dict[str, WikiPage]:
+    pages: dict[str, WikiPage] = {}
+    for path in list_wiki_pages(wiki_dir):
+        text = path.read_text(encoding="utf-8")
+        meta, body = parse_frontmatter(text)
+        title = str(meta.get("title", path.stem))
+        links = extract_wikilinks(body)
+        tokens = bm25.tokenize(f"{title}\n{body}")
+        byte_size = len(text.encode("utf-8"))
+        pages[path.name] = WikiPage(
+            id=path.name, slug=path.stem, title=title, links=links, tokens=tokens, byte_size=byte_size
+        )
+    return pages
+
+
+def count_wiki_pages(wiki_dir: Path) -> int:
+    return len(list_wiki_pages(wiki_dir))
+
+
+# ---------------------------------------------------------------------------
+# Source reading (kind, query text for BM25)
+# ---------------------------------------------------------------------------
+
+_KIND_LINE_RE = re.compile(r"^\s*kind\s*[:=]\s*(\w+)", re.IGNORECASE)
+VALID_KINDS = ("article", "meeting", "stream", "repo")
+
+
+def read_explicit_kind(source_path: Path) -> str | None:
+    """The EXPLICIT ``kind`` a source declares for itself, if any: a leading
+    ``kind: <article|meeting|stream|repo>`` line (first 5 lines) or a
+    ``kind:`` frontmatter field. Returns ``None`` -- never a guess, never a
+    default -- when no explicit marker is present, so callers that must NOT
+    silently default (``detect_kind``) can tell "declared" apart from
+    "absent". ``read_source_kind()`` below is the best-effort wrapper that
+    still defaults to ``article`` for the pre-existing ledger-label use case.
     """
+    if not source_path.is_file():
+        return None
+    try:
+        text = source_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines()[:5]:
+        m = _KIND_LINE_RE.match(line)
+        if m:
+            return m.group(1).lower()
+    meta, _ = parse_frontmatter(text)
+    kind = meta.get("kind")
+    return str(kind) if kind else None
 
-    hit_limit: bool = False
-    advisories: list[str] = field(default_factory=list)
+
+def read_source_kind(source_path: Path) -> str:
+    """Best-effort ``kind`` (DESIGN.md §5) for a raw source file, for the
+    pre-existing ledger/cost-label use case. Prefers an explicit marker (see
+    ``read_explicit_kind``); absent one, defaults to ``article`` (the common
+    case for un-annotated one-shot documents).
+
+    NOTE: this is deliberately NOT what ``detect_kind`` uses to make routing
+    decisions -- a silent ``article`` default is exactly the failure mode
+    DESIGN.md §5 calls out (a real transcript with no ``kind:`` line would
+    default to ``article`` here, which is fine for a cost-ledger label but
+    would be wrong -- and dangerous -- as a segmentation/routing decision).
+    """
+    kind = read_explicit_kind(source_path)
+    return kind if kind is not None else "article"
 
 
-def ingest(
-    wiki: str | Path = ".",
+def extract_query_text(source_path: Path, max_words: int = 500) -> str:
+    """Title + first ~``max_words`` words of a source (or of a bounded
+    segment of it -- see ``build_slice``'s ``content_path`` parameter), for
+    BM25 querying."""
+    if not source_path.is_file():
+        return ""
+    text = source_path.read_text(encoding="utf-8")
+    meta, body = parse_frontmatter(text)
+    title = str(meta.get("title", "")) if meta else ""
+    content = body if meta else text
+    if not title:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                title = stripped.lstrip("#").strip()
+                break
+    words = content.split()
+    snippet = " ".join(words[:max_words])
+    return f"{title}\n{snippet}"
+
+
+# ---------------------------------------------------------------------------
+# The deterministic slice: BM25 top-k UNION link-graph neighbors UNION nav
+# ---------------------------------------------------------------------------
+
+NAV_PAGES = ("index.md", "overview.md")
+
+# ---------------------------------------------------------------------------
+# Byte-budgeted candidate selection -- replaces the historical FIXED top-k
+# default. THE measured defect (docs/DESIGN.md, the retrieve_slice byte-
+# budget fix): with a fixed COUNT, touches-per-source DECLINE as the wiki
+# grows (37.5% of pages readable at 16 pages, 0.8% at 751 -- the opposite of
+# the design intent, that the wiki compounds). A fixed count also starves
+# small-page corpora (articles, ~14KB/page -- 6 pages is only ~84KB of
+# context, far under any reasonable budget) while flooding large-page ones
+# (transcripts, ~138KB/page -- 6 pages is ~828KB, likely more than the rest
+# of the prompt combined). The budget that actually matters is BYTES of
+# context weave must read, not a page COUNT -- so we cut the BM25-ranked
+# list where the bytes run out, not where an arbitrary count does.
+#
+# weave's prompt also carries the bounded source segment
+# (segment_source.DEFAULT_SEGMENT_BYTES = 80_000) and the whole-wiki catalog
+# (build_catalog.MAX_CATALOG_BYTES = 60_000) before the slice contributes
+# anything -- ~140KB of fixed overhead. DEFAULT_SLICE_BUDGET_BYTES keeps the
+# slice in the same order of magnitude as that existing overhead (so it
+# cannot unilaterally dominate the prompt) while leaving the total
+# comfortably inside a modern LLM context window (a 150-200K-token window is
+# 600KB+ of raw text). This is a CHOSEN ceiling, not a measured one -- there
+# is no equivalent to the S7 BM25 recall experiment for "the right" byte
+# budget. Revisit if a real corpus shows the slice starving or flooding at
+# this number.
+DEFAULT_SLICE_BUDGET_BYTES = 150_000
+
+# Floor: even a wiki made entirely of huge pages (the ~138KB/page transcript
+# corpus DESIGN.md itself measured) must still get SOME merge targets -- a
+# strict byte budget alone could select zero or one candidate there, which
+# is worse than the fixed-k defect this replaces (weave's create-vs-fold
+# decision needs at least a couple of real options to compare, per entity).
+# 3 is not an arbitrary floor: it is the smallest k this codebase has actual
+# recall evidence for -- the S7 BM25 result (docs/DESIGN.md §3) measured
+# k=3 already hitting >=90% recall on a 25-page corpus.
+MIN_SLICE_CANDIDATES = 3
+
+# Ceiling: an unbounded count on a wiki of many TINY pages could otherwise
+# put hundreds of entries in the slice for a budget this size (150_000
+# bytes / a ~200-byte stub page is 750 candidates). 60 keeps the slice's own
+# page COUNT in the same order of magnitude as build_catalog's own listing
+# ceiling (MAX_CATALOG_BYTES=60_000, roughly one short line per page) --
+# past that point weave is better served by the catalog's judgment (what
+# EXISTS) than by an ever-longer READ list.
+MAX_SLICE_CANDIDATES = 60
+
+
+def _select_candidates_by_budget(
+    ranked: list[tuple[str, float]],
+    byte_sizes: dict[str, int],
+    budget_bytes: int,
+    floor: int,
+    ceiling: int,
+) -> list[tuple[str, float]]:
+    """Walk ``ranked`` (BM25 best-first, see ``bm25.BM25.top_k``) accepting
+    candidates until the cumulative byte budget would be exceeded.
+
+    ``floor`` guarantees at least this many candidates come back even when
+    the very first one alone exceeds the whole budget (huge-page corpora).
+    ``ceiling`` guarantees no more than this many come back even when the
+    budget has bytes to spare (tiny-page corpora). BM25 order is never
+    disturbed -- this only decides where to CUT the ranked list, so the
+    best-matching pages are always the ones kept.
+    """
+    selected: list[tuple[str, float]] = []
+    used_bytes = 0
+    for doc_id, score in ranked:
+        if len(selected) >= ceiling:
+            break
+        page_bytes = byte_sizes.get(doc_id, 0)
+        if len(selected) >= floor and used_bytes + page_bytes > budget_bytes:
+            break
+        selected.append((doc_id, score))
+        used_bytes += page_bytes
+    return selected
+
+
+def build_slice(
+    wr: WikiRoot,
+    source_id: str,
+    k: int | None = None,
     *,
-    source: str | Path | None = None,
-    max_cycles: int | None = None,
-    keep_going: bool = False,
-    limit: int | None = None,  # drain-path cap on real-ingest sources; None = unlimited
-    report: DrainReport | None = None,  # opt-in out-channel for hit_limit
-) -> int:
-    """Integrate inbox sources via the engine.
+    budget_bytes: int = DEFAULT_SLICE_BUDGET_BYTES,
+    floor: int = MIN_SLICE_CANDIDATES,
+    ceiling: int = MAX_SLICE_CANDIDATES,
+    content_path: Path | None = None,
+) -> dict:
+    """THE scale fix (DESIGN.md §3, S7 BM25 result) -- now byte-budgeted.
 
-    Parameters
-    ----------
-    wiki:
-        Wiki directory (resolved from cwd if relative).
-    source:
-        Path to a single source file.  When omitted the full inbox is drained.
-    max_cycles:
-        Convergence budget passed to the inner pipeline.  ``None`` means use
-        the wiki policy default (or 3 if no policy is configured).
-    keep_going:
-        In single-file mode: continue to the next source after a failure.
-        In drain mode: this flag is a documented NO-OP — failures always route
-        to ``_failed/`` and draining always continues regardless.
-    limit:
-        Caps the number of sources that reach real LLM synthesis (``run_inner``)
-        in **drain mode only**.  ``None`` means unlimited.  ``0`` means process
-        zero real-ingestion sources this call (cheap dispositions -- binary
-        rejects, already-ingested duplicates -- still run for free).  Has no
-        effect in single-file (``source=``) mode, which always processes
-        exactly the one file given.
-    report:
-        Optional out-channel.  When provided, ``.hit_limit`` is set to ``True``
-        if the drain stopped early because the ``--limit`` budget was spent
-        (see ``DrainReport`` above).  The loud cap-hit signal (a ``WARN`` log
-        line) does not depend on this -- it fires regardless of whether a
-        report was passed.
+    slice = BM25-ranked candidates, cut at a BYTE budget (not a fixed count)
+            UNION one-hop link-graph neighbors of those hits
+            UNION always-include nav pages (index.md, overview.md)
 
-    Returns -- THE EXIT-CODE CONTRACT (see wiki_weaver/run_result.py)
-    -----------------------------------------------------------------
-    Every run also writes ``<wiki>/.wiki/runs/ingest-<ts>/result.json``
-    (machine-readable verdict + counts + gate blocks + errors; fail-soft)
-    and prints an honest one-line headline. The returned int follows the
-    documented contract, propagated verbatim by ``wiki-weaver ingest`` and
-    ``schedule run-now``::
+    ``k``, when given (an explicit ``--k`` override -- see
+    retrieve_slice.py), reproduces the ORIGINAL fixed-top-k behavior
+    exactly: BM25 top-``k``, no byte budget, no floor/ceiling. This is the
+    DEPRECATED path, kept only so existing callers/tests can still pin an
+    exact count.
 
-        0  -- >=1 source converged AND no gate-blocked AND no errored
-              (verdicts: converged, partial; advisories allowed)
-        1  -- engine/infrastructure error (verdict: errored) -- also
-              returned for a missing wiki dir (pre-run validation)
-        3  -- nothing to do: empty inbox, or only already-ingested
-              duplicates (verdict: empty)
-        4  -- gate-blocked under WIKI_WEAVER_ENFORCE_GATES=1
-              (verdict: blocked)
-        5  -- attempted > 0 but 0 converged, no gate/infra cause
-              (verdict: failed)
+    ``k=None`` (the default) is the fix described above: BM25-ranked
+    candidates are accepted until ``budget_bytes`` of cumulative page size
+    is exhausted, with ``floor`` guaranteeing a few candidates even when
+    pages are huge and ``ceiling`` preventing runaway counts when pages are
+    tiny. See ``DEFAULT_SLICE_BUDGET_BYTES``/``MIN_SLICE_CANDIDATES``/
+    ``MAX_SLICE_CANDIDATES`` above for the justification of each number.
 
-    THE INVARIANT: converged == 0 with attempted > 0 can NEVER return 0
-    (the incident this contract exists to prevent: a fully-blocked run
-    that looked healthy for a week).
+    ``content_path``, when given, is queried INSTEAD of the raw source file
+    -- this is how DESIGN.md §5 segmentation flows through: once
+    ``segment_source --select`` has bounded a huge source down to one
+    segment, retrieve_slice must query on that bounded text, not the
+    original (possibly 200KB+) file. Defaults to ``None`` (query the raw
+    source directly), which is the exact pre-segmentation behavior every
+    existing caller (and both eval arms) still gets unchanged.
     """
-    wiki = Path(wiki).resolve()
-    if not wiki.is_dir():
-        _fail(f"wiki dir not found: {wiki} (run `wiki-weaver init {wiki}` first)")
-        return 1
+    pages = load_wiki_pages(wr.wiki_dir)
+    source_path = content_path if content_path is not None else wr.sources_dir / source_id
+    query_tokens = bm25.tokenize(extract_query_text(source_path))
 
-    inbox = wiki_inbox(wiki)
-    sources_dir = wiki_sources(wiki)
-    inbox.mkdir(exist_ok=True)
-    sources_dir.mkdir(exist_ok=True)
+    corpus_tokens = {pid: page.tokens for pid, page in pages.items()}
+    ranker = bm25.BM25(corpus_tokens)
 
-    # Run-result contract (see wiki_weaver/run_result.py): every ingest run --
-    # single-file, drain, even a nothing-to-do tick -- ends with one
-    # <run_dir>/result.json + an honest headline + a documented exit code.
-    # Microsecond suffix so back-to-back runs never share a dir.
-    run_id = f"ingest-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
-    run_dir = wiki_runs(wiki) / run_id
+    if not pages:
+        hits: list[tuple[str, float]] = []
+    elif k is not None:
+        hits = ranker.top_k(query_tokens, k)
+    else:
+        ranked_all = ranker.top_k(query_tokens, len(pages))
+        byte_sizes = {pid: page.byte_size for pid, page in pages.items()}
+        hits = _select_candidates_by_budget(ranked_all, byte_sizes, budget_bytes, floor, ceiling)
 
-    if source:
-        # ------------------------------------------------------------------ #
-        # SINGLE-FILE PATH — behavior UNCHANGED from original.                #
-        # keep_going and exit-on-first-failure semantics are preserved here.  #
-        # NOTE [C9c]: --limit is a no-op in single-file mode (exactly one     #
-        # source is ever processed here regardless of the cap).              #
-        # ------------------------------------------------------------------ #
-        sources: list[Path] = [Path(source).resolve()]
+    hit_ids = [pid for pid, _score in hits]
+    hit_set = set(hit_ids)
 
-        # Import the engine runner lazily so `doctor`/`init`/`lint` never pay
-        # the cost of pulling in the attractor engine.
-        from wiki_weaver.engine_runner import run_inner
-        from wiki_weaver.grading import gates_enforced, no_duplicate_pages
-        from wiki_weaver.retention import run_retention_checks, snapshot_pages
+    neighbor_ids: set[str] = set()
+    for pid in hit_ids:
+        page = pages[pid]
+        for slug in page.links:
+            target = f"{slug}.md"
+            if target in pages:
+                neighbor_ids.add(target)
+        for other_id, other_page in pages.items():
+            if page.slug in other_page.links:
+                neighbor_ids.add(other_id)
+    neighbor_ids -= hit_set
 
-        processed = _processed_sources(wiki)
-        summary: list[tuple[str, str]] = []
-        # Run-level gate advisories. By DEFAULT both runtime gates below are
-        # ADVISORY (detect + surface loudly, never block); the env hatch
-        # WIKI_WEAVER_ENFORCE_GATES=1 restores the old hard-blocking behavior
-        # for both gates -- see wiki_weaver.grading.gates_enforced().
-        advisories: list[str] = []
-        # Structured run-result records (see wiki_weaver/run_result.py):
-        # enforce-mode gate blocks name the GATE (never a generic error line);
-        # errored carries engine/infra reasons.
-        blocked_records: list[dict] = []
-        errored_records: list[dict] = []
+    nav_ids = {name for name in NAV_PAGES if name in pages}
 
-        for src in sources:
-            name = src.name
+    ordered: list[str] = []
 
-            # Text sniff: fail loud on binary source; don't pollute the registry.
-            if not _looks_like_text(src):
-                _fail(f"{name}: unsupported binary source (no text handler)")
-                summary.append((name, "binary"))
-                _print_summary(summary)
-                return _finish_ingest_run(
-                    run_dir,
-                    run_id,
-                    summary,
-                    advisories,
-                    blocked_records,
-                    errored_records,
-                )
+    def _add(pid: str) -> None:
+        if pid not in ordered:
+            ordered.append(pid)
 
-            # Fix 3: assign/look up a STABLE id by content hash BEFORE ingest
-            # and dedupe an already-ingested source (same bytes) regardless of
-            # filename.
-            entry, is_new = _assign_source_id(wiki, src)
-            source_id = entry["id"]
-            file_hash = entry["hash"]
-            already_done = entry.get("ingested") or name in processed
-            if already_done:
-                _warn(
-                    f"skip (already ingested as source id [{source_id}], "
-                    f"hash {file_hash[:12]}): {name}"
-                )
-                summary.append((name, "skipped"))
-                continue
-            if is_new:
-                print(f"  assigned stable source id [{source_id}] for {name}")
-            else:
-                print(f"  reusing stable source id [{source_id}] for {name}")
+    for pid in hit_ids:
+        _add(pid)
+    for pid in sorted(neighbor_ids):
+        _add(pid)
+    for pid in sorted(nav_ids):
+        _add(pid)
 
-            print(f"\n=== ingest: {name} (source id [{source_id}]) ===")
-
-            # Fix 1b: snapshot process state so we can detect any agent-written
-            # ledger line / archive move performed DURING the inner run (the lib
-            # writes process state only AFTER this, on real convergence).
-            before_state = _snapshot_process_state(wiki)
-
-            # Claim-retention backstop: snapshot the current page BODIES before
-            # the inner run so a post-convergence independent re-check can tell
-            # whether the re-write silently dropped any prior content. See
-            # wiki_weaver/retention.py for the full mechanism + honest framing
-            # (this is an LLM-judge-backed re-check, NOT a deterministic gate).
-            retention_snapshot_dir = (
-                wiki_runs(wiki)
-                / f".retention-snap-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
-            )
-            snapshot_pages(wiki, retention_snapshot_dir)
-
-            try:
-                try:
-                    result = run_inner(
-                        src, wiki, max_cycles=max_cycles, source_id=source_id
-                    )
-                except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
-                    _fail(f"engine error on {name}: {type(e).__name__}: {e}")
-                    summary.append((name, "error"))
-                    errored_records.append(
-                        {"reason": f"engine error on {name}: {type(e).__name__}: {e}"}
-                    )
-                    if not keep_going:
-                        _print_summary(summary)
-                        return _finish_ingest_run(
-                            run_dir,
-                            run_id,
-                            summary,
-                            advisories,
-                            blocked_records,
-                            errored_records,
-                        )
-                    continue
-
-                # Fix 1b: never trust agent-written process state. Undo + fail loud.
-                violations = _detect_and_undo_tamper(wiki, before_state)
-                if violations:
-                    _fail(
-                        f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
-                        f"state it does not own. Convergence is NOT trusted; "
-                        f"fabricated records were reverted."
-                    )
-                    for v in violations:
-                        _fail(f"    - {v}")
-                    summary.append((name, "tampered"))
-                    if not keep_going:
-                        _print_summary(summary)
-                        return _finish_ingest_run(
-                            run_dir,
-                            run_id,
-                            summary,
-                            advisories,
-                            blocked_records,
-                            errored_records,
-                        )
-                    continue
-
-                if result.converged:
-                    # Claim-retention backstop: an independent, LLM-judge-backed
-                    # re-check of whether this re-write silently dropped prior
-                    # content. ADVISORY by default (detect + surface, never
-                    # block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
-                    # blocking behavior (refuse archive/ledger-advance).
-                    # run_retention_checks additionally runs the deterministic
-                    # page-shrinkage heuristic + reads the agent's self-declared
-                    # removal manifest (both ADVISORY-ONLY, never blocking), and
-                    # decides the snapshot's fate: preserved to .wiki/snapshots/
-                    # when any retention signal fired, deleted on a clean pass.
-                    retention_checks = run_retention_checks(
-                        wiki, retention_snapshot_dir, name
-                    )
-                    retention_decision = retention_checks.decision
-                    for gate_name, adv in retention_checks.advisory_signals:
-                        if adv not in advisories:
-                            _gate_advisory(gate_name, adv)
-                            advisories.append(adv)
-                    if retention_decision.action in (
-                        "block_confirmed_loss",
-                        "block_escalated_errors",
-                    ):
-                        if gates_enforced():
-                            _fail(f"{name}: {retention_decision.message}")
-                            summary.append((name, "retention-blocked"))
-                            # Structured record: the GATE is named (mislabel fix
-                            # -- never a generic error line).
-                            blocked_records.append(
-                                {
-                                    "gate": "claim-retention",
-                                    "scope": "source",
-                                    "reason": retention_decision.message,
-                                    "offending_items": [name],
-                                }
-                            )
-                            if not keep_going:
-                                _print_summary(summary)
-                                return _finish_ingest_run(
-                                    run_dir,
-                                    run_id,
-                                    summary,
-                                    advisories,
-                                    blocked_records,
-                                    errored_records,
-                                )
-                            continue
-                        advisory = (
-                            "claim-retention gate (ADVISORY -- did NOT block) "
-                            f"[source {name}]: {retention_decision.message}"
-                        )
-                        _gate_advisory("claim-retention", advisory)
-                        advisories.append(advisory)
-                    elif retention_decision.message:
-                        # Either a plain PASS note or a fail-open WARN -- both
-                        # non-blocking; the source proceeds to archive below.
-                        print(f"  {retention_decision.message}")
-
-                    # Duplicate-page backstop: a cheap, deterministic scan for
-                    # merge-fragment duplicates (e.g. concept-2.md alongside
-                    # concept.md -- the "appended instead of fused" failure
-                    # signature). Free/no-LLM, so it always runs. ADVISORY by
-                    # default; WIKI_WEAVER_ENFORCE_GATES=1 restores blocking.
-                    dup_pages = no_duplicate_pages(wiki)
-                    if dup_pages:
-                        if gates_enforced():
-                            _fail(
-                                f"{name}: duplicate-page gate: merge-fragment "
-                                f"duplicate(s) detected: {', '.join(dup_pages)}"
-                            )
-                            summary.append((name, "duplicate-blocked"))
-                            # Structured record: the GATE is named (mislabel fix
-                            # -- never a generic error line).
-                            blocked_records.append(
-                                {
-                                    "gate": "duplicate-page",
-                                    "scope": "wiki",
-                                    "reason": (
-                                        "duplicate-page gate: merge-fragment "
-                                        f"duplicate(s) detected: {', '.join(dup_pages)}"
-                                    ),
-                                    "offending_items": list(dup_pages),
-                                }
-                            )
-                            if not keep_going:
-                                _print_summary(summary)
-                                return _finish_ingest_run(
-                                    run_dir,
-                                    run_id,
-                                    summary,
-                                    advisories,
-                                    blocked_records,
-                                    errored_records,
-                                )
-                            continue
-                        # Wiki-STRUCTURAL observation, not a verdict on this
-                        # source: the pairs may pre-date this run entirely.
-                        advisory = (
-                            "duplicate-page gate (ADVISORY -- did NOT block): "
-                            f"wiki contains {len(dup_pages)} version/merge-"
-                            f"fragment page pair(s): {', '.join(dup_pages)}"
-                        )
-                        if advisory not in advisories:
-                            _gate_advisory("duplicate-page", advisory)
-                            advisories.append(advisory)
-
-                    dest = sources_dir / name
-                    if src.is_file() and src.parent == inbox:
-                        src.replace(dest)
-                    _append_ledger(
-                        wiki,
-                        {
-                            "source": name,
-                            "source_id": source_id,
-                            "hash": file_hash,
-                            "status": result.status,
-                            "converged": result.converged,
-                            "archived_to": str(dest),
-                            "logs_dir": str(result.logs_dir),
-                            "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        },
-                    )
-                    _mark_source_ingested(wiki, file_hash)
-                    _ok(f"{name}: converged (logs: {result.logs_dir})")
-                    summary.append((name, "converged"))
-                else:
-                    _fail(
-                        f"{name}: did not converge "
-                        f"(status={result.status}, reason={result.failure_reason})"
-                    )
-                    summary.append((name, "not-converged"))
-                    if not keep_going:
-                        _print_summary(summary)
-                        return _finish_ingest_run(
-                            run_dir,
-                            run_id,
-                            summary,
-                            advisories,
-                            blocked_records,
-                            errored_records,
-                        )
-            finally:
-                # Belt-and-suspenders: enforce_retention_gate() already removes
-                # retention_snapshot_dir on every path it runs; this covers the
-                # error/tamper/not-converged paths above where it is never
-                # invoked. ignore_errors=True tolerates an already-removed dir.
-                shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
-
-        _print_summary(summary)
-        _print_advisories(advisories)
-        if report is not None:
-            report.advisories.extend(advisories)
-        return _finish_ingest_run(
-            run_dir, run_id, summary, advisories, blocked_records, errored_records
-        )
-
-    # ---------------------------------------------------------------------- #
-    # INBOX DRAIN PATH — re-globs _inbox on every pass so files added mid-run #
-    # are picked up automatically.                                            #
-    #                                                                         #
-    # Load-bearing invariant: every file picked from _inbox MUST leave        #
-    # _inbox this pass.  This keeps the inbox strictly shrinking and          #
-    # guarantees termination — no infinite spin on bad files.                 #
-    #                                                                         #
-    # Terminal dispositions:                                                  #
-    #   converged   → _sources/  (existing behaviour)                        #
-    #   duplicate   → _sources/  (collision-safe; was: left in inbox → spin) #
-    #   error/tamper/non-convergence → _failed/ (new; was: halted the run)   #
-    #                                                                         #
-    # --keep-going is accepted but is a NO-OP in drain mode: failures always  #
-    # route to _failed/ and draining always continues regardless.  The flag   #
-    # no longer controls early-exit here; exit code is set after the drain.   #
-    # ---------------------------------------------------------------------- #
-
-    # Crash-safe resume (drain path only): adopt any crashed drain's
-    # in_progress result.json so this run's result reflects the COMBINED
-    # state. Re-running the same ingest command IS the resume -- no flag.
-    # All-empty in the common no-crash case. See _adopt_interrupted_runs.
-    (
-        seed_sources,
-        seed_advisories,
-        seed_blocked,
-        seed_errored,
-        seed_failed,
-    ) = _adopt_interrupted_runs(wiki, run_dir, run_id)
-
-    # Warn + bail early if inbox is empty (preserves original UX; lazy import).
-    if not any(
-        p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
-    ):
-        if seed_sources:
-            # A crashed drain completed every inbox source before dying
-            # (e.g. during the final re-weave): finalize the adopted
-            # combined state instead of forgetting it behind "empty".
-            return _finish_ingest_run(
-                run_dir,
-                run_id,
-                seed_sources,
-                seed_advisories,
-                seed_blocked,
-                seed_errored,
-                failed=seed_failed,
-            )
-        _warn(f"no sources to ingest (inbox empty: {inbox})")
-        # Distinct nothing-to-do outcome (verdict "empty", exit 3): a headless
-        # caller must be able to tell "no work" from "work succeeded".
-        return _finish_ingest_run(run_dir, run_id, [], [], [], [])
-
-    # Import the engine runner lazily so `doctor`/`init`/`lint` never pay the
-    # cost of pulling in the attractor engine.
-    from wiki_weaver.engine_runner import run_inner, shared_engine_loop
-    from wiki_weaver.grading import gates_enforced, no_duplicate_pages
-    from wiki_weaver.retention import run_retention_checks, snapshot_pages
-
-    processed = _processed_sources(wiki)
-    summary_drain: list[tuple[str, str]] = []
-    # Run-level gate advisories. By DEFAULT both runtime gates below are
-    # ADVISORY (detect + surface loudly, never block); the env hatch
-    # WIKI_WEAVER_ENFORCE_GATES=1 restores the old hard-blocking behavior
-    # for both gates -- see wiki_weaver.grading.gates_enforced().
-    advisories_drain: list[str] = []
-    # Structured run-result records (see wiki_weaver/run_result.py):
-    # enforce-mode gate blocks name the GATE (never a generic error line);
-    # errored carries engine/infra reasons.
-    blocked_drain: list[dict] = []
-    errored_drain: list[dict] = []
-    # Per-source failure detail for result.json's failed[] -- one record per
-    # source quarantined to .wiki/failed/ this run, mirroring the ledger
-    # failure records ({source, reason, failure_kind}).
-    failed_drain: list[dict] = []
-
-    from wiki_weaver.run_result import (
-        STATUS_IN_PROGRESS,
-        build_result,
-        counts_from_statuses,
-        merge_source_records,
-        write_result_json,
-    )
-
-    def _combined_state() -> tuple[
-        list[tuple[str, str]], list[str], list[dict], list[dict], list[dict]
-    ]:
-        """COMBINED drain state: adopted pre-crash seed + this run's own work.
-
-        Per-source records merge by name (see merge_source_records for the
-        ledger-wins "skipped never overwrites" rule); advisories dedupe
-        preserving order; blocked/errored records concatenate. All seed
-        lists are empty in the common no-crash case, so this reduces to
-        exactly the pre-resume behavior.
-        """
-        merged = merge_source_records(
-            [{"name": n, "status": s} for n, s in seed_sources],
-            [{"name": n, "status": s} for n, s in summary_drain],
-        )
-        merged_tuples = [(str(r["name"]), str(r["status"])) for r in merged]
-        advisories_all = list(seed_advisories)
-        for adv in advisories_drain:
-            if adv not in advisories_all:
-                advisories_all.append(adv)
-        return (
-            merged_tuples,
-            advisories_all,
-            [*seed_blocked, *blocked_drain],
-            [*seed_errored, *errored_drain],
-            [*seed_failed, *failed_drain],
-        )
-
-    def _checkpoint() -> None:
-        """Durability contract: rewrite result.json after EVERY source.
-
-        Atomic (tmp + os.replace inside write_result_json) and fail-soft --
-        a crash mid-drain now leaves ``status: in_progress`` counts-so-far
-        instead of stranding hours of completed work invisibly. The mid-run
-        verdict is the normal verdict rules applied to counts-so-far.
-        """
-        s, a, b, e, f = _combined_state()
-        write_result_json(
-            run_dir,
-            build_result(
-                run_id,
-                counts_from_statuses(st for _, st in s),
-                advisories=a,
-                blocked=b,
-                errored=e,
-                failed=f,
-                sources=[{"name": n, "status": st} for n, st in s],
-                status=STATUS_IN_PROGRESS,
-            ),
-        )
-
-    failed_dir = wiki_failed(wiki)
-    failed_dir.mkdir(parents=True, exist_ok=True)
-
-    # Debounce: skip files written < 2 s ago (half-written by a concurrent
-    # producer).  If all pending files are too-fresh, sleep briefly and retry
-    # up to _FRESH_RETRIES_MAX times before declaring the drain complete.
-    _DEBOUNCE_SECS = 2.0
-    _FRESH_RETRIES_MAX = 5
-    _fresh_retries = 0
-
-    # --limit budget: counts only commitments to run_inner (real LLM work).
-    # Cheap dispositions (binary reject, already-ingested duplicate) never
-    # touch this counter -- see the gate below and
-    # docs/designs/scheduled-ingestion-limit-addendum.md §2 [C3][C4].
-    real_count = 0
-
-    # Single event loop for the ENTIRE drain + final re-weave (Option A):
-    # every per-source run_inner() and the overview re-weave share ONE loop,
-    # so the load-once _BASE_BUNDLE provider client stays bound to a live loop
-    # for the whole ingest (was: a fresh asyncio.run() per source that closed
-    # its loop, wedging source N+1 on the closed-loop client).
-    with shared_engine_loop():
-        while True:
-            # NOTE [C9a]: selection order is existing alphabetical-by-filename,
-            # unrelated to --limit and unchanged by this addendum. Under
-            # sustained new arrivals with early-sorting names, an older
-            # backlog item with a late-sorting name can be deferred across
-            # many ticks -- accepted, not a fairness bug introduced here (see
-            # docs/designs/scheduled-ingestion-limit-addendum.md §6).
-            pending = sorted(
-                p for p in inbox.iterdir() if p.is_file() and not p.name.startswith(".")
-            )
-            now = time.time()
-            ready = [p for p in pending if (now - p.stat().st_mtime) >= _DEBOUNCE_SECS]
-
-            if not ready:
-                if pending and _fresh_retries < _FRESH_RETRIES_MAX:
-                    # Files exist but all too-fresh; wait and retry.
-                    _fresh_retries += 1
-                    time.sleep(0.5)
-                    continue
-                # No files at all, or fresh-retry budget exhausted → drain complete.
-                break
-
-            _fresh_retries = 0  # reset whenever we find a ready file
-            src = ready[0]
-            name = src.name
-
-            # Text sniff: route binary files to _failed/ without calling run_inner.
-            if not _looks_like_text(src):
-                _fail(
-                    f"{src.name}: unsupported binary source (no text handler)"
-                    " — routing to _failed/"
-                )
-                dest_f = _collision_safe_move(src, failed_dir)
-                _append_failure_ledger(
-                    wiki,
-                    source=src.name,
-                    source_id="",
-                    file_hash="",
-                    failed_to=str(dest_f),
-                    reason="unsupported binary source (no text handler)",
-                    failure_kind=FAILURE_KIND_UNKNOWN,
-                )
-                failed_drain.append(
-                    {
-                        "source": src.name,
-                        "reason": "unsupported binary source (no text handler)",
-                        "failure_kind": FAILURE_KIND_UNKNOWN,
-                    }
-                )
-                summary_drain.append((src.name, "binary"))
-                _checkpoint()
-                continue
-
-            # Fix 3: assign/look up a STABLE id by content hash BEFORE ingest and
-            # dedupe an already-ingested source (same bytes) regardless of filename.
-            entry, is_new = _assign_source_id(wiki, src)
-            source_id = entry["id"]
-            file_hash = entry["hash"]
-            already_done = entry.get("ingested") or name in processed
-            if already_done:
-                _warn(
-                    f"skip (already ingested as source id [{source_id}], "
-                    f"hash {file_hash[:12]}): {name}"
-                )
-                # Drain mode: move dup out of inbox to clear it (prevents spin).
-                _collision_safe_move(src, sources_dir)
-                summary_drain.append((name, "skipped"))
-                _checkpoint()
-                continue
-            if is_new:
-                print(f"  assigned stable source id [{source_id}] for {name}")
-            else:
-                print(f"  reusing stable source id [{source_id}] for {name}")
-
-            # --limit gate [C4]: eligibility is already determined at this
-            # point (text file, not a duplicate, real source) -- check *then*
-            # increment, so "capped" is decided precisely and cheaply, with no
-            # extra end-of-loop inbox rescan. With limit == N, files 1..N each
-            # pass here (real_count is 0..N-1 at check time) and the drain
-            # reports complete; the (N+1)-th eligible file holds here with
-            # real_count == N, sets hit_limit, and breaks -- leaving it in
-            # _inbox/ for the next tick. _assign_source_id above may have
-            # pre-registered this deferred source's stable id; that is
-            # idempotent and harmless, the next tick just re-looks-it-up. This
-            # break (not continue) preserves the drain's "every file picked
-            # from _inbox/ must leave _inbox/ this pass" invariant: we haven't
-            # picked this file for a disposition, we've stopped the whole
-            # drain with it still sitting in _inbox/. See
-            # docs/designs/scheduled-ingestion-limit-addendum.md §2 [C3][C4][C5].
-            if limit is not None and real_count >= limit:
-                if report is not None:
-                    report.hit_limit = True
-                _warn(
-                    f"LIMIT REACHED: processed {real_count} real-ingest source(s) this "
-                    f"pass (--limit {limit}); at least one more eligible source remains "
-                    f"in _inbox/ and will be handled on the next tick. Raise the cap "
-                    f"with `schedule install --limit N`, or process more now with "
-                    f"`schedule run-now --wiki <dir> --limit N`."
-                )
-                break
-            real_count += 1
-
-            print(f"\n=== ingest: {name} (source id [{source_id}]) ===")
-
-            # Fix 1b: snapshot process state so we can detect any agent-written
-            # ledger line / archive move performed DURING the inner run (the lib
-            # writes process state only AFTER this, on real convergence).
-            before_state = _snapshot_process_state(wiki)
-
-            # Claim-retention backstop: snapshot the current page BODIES before
-            # the inner run so a post-convergence independent re-check can tell
-            # whether the re-write silently dropped any prior content. See
-            # wiki_weaver/retention.py for the full mechanism + honest framing
-            # (this is an LLM-judge-backed re-check, NOT a deterministic gate).
-            retention_snapshot_dir = (
-                wiki_runs(wiki)
-                / f".retention-snap-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
-            )
-            snapshot_pages(wiki, retention_snapshot_dir)
-
-            try:
-                # Synthesis start time: the failure-kind classifier compares
-                # .ai/assessment.md's mtime against this to tell "assess
-                # rendered a verdict during THIS source's synthesis" from
-                # "no verdict was ever rendered" (see classify_failure_kind).
-                synth_started = time.time()
-                try:
-                    result = run_inner(
-                        src, wiki, max_cycles=max_cycles, source_id=source_id
-                    )
-                except Exception as e:  # noqa: BLE001 -- surface the real failure, loudly
-                    _fail(f"engine error on {name}: {type(e).__name__}: {e}")
-                    if src.is_file() and src.parent == inbox:
-                        dest_f = _collision_safe_move(src, failed_dir)
-                        reason = f"engine error: {type(e).__name__}: {e}"
-                        _append_failure_ledger(
-                            wiki,
-                            source=name,
-                            source_id=source_id,
-                            file_hash=file_hash,
-                            failed_to=str(dest_f),
-                            reason=reason,
-                            failure_kind=FAILURE_KIND_UNKNOWN,
-                        )
-                        failed_drain.append(
-                            {
-                                "source": name,
-                                "reason": reason,
-                                "failure_kind": FAILURE_KIND_UNKNOWN,
-                            }
-                        )
-                    summary_drain.append((name, "error"))
-                    errored_drain.append(
-                        {"reason": f"engine error on {name}: {type(e).__name__}: {e}"}
-                    )
-                    continue  # drain always continues; exit code is set after drain
-
-                # Fix 1b: never trust agent-written process state. Undo + fail loud.
-                violations = _detect_and_undo_tamper(wiki, before_state)
-                if violations:
-                    _fail(
-                        f"{name}: TAMPER DETECTED -- the ingest agent wrote process "
-                        f"state it does not own. Convergence is NOT trusted; "
-                        f"fabricated records were reverted."
-                    )
-                    for v in violations:
-                        _fail(f"    - {v}")
-                    if src.is_file() and src.parent == inbox:
-                        dest_f = _collision_safe_move(src, failed_dir)
-                        reason = (
-                            "tamper detected: the ingest agent wrote process "
-                            "state it does not own (fabricated records reverted)"
-                        )
-                        _append_failure_ledger(
-                            wiki,
-                            source=name,
-                            source_id=source_id,
-                            file_hash=file_hash,
-                            failed_to=str(dest_f),
-                            reason=reason,
-                            failure_kind=FAILURE_KIND_UNKNOWN,
-                            logs_dir=str(result.logs_dir),
-                        )
-                        failed_drain.append(
-                            {
-                                "source": name,
-                                "reason": reason,
-                                "failure_kind": FAILURE_KIND_UNKNOWN,
-                            }
-                        )
-                    summary_drain.append((name, "tampered"))
-                    continue
-
-                if result.converged:
-                    # Claim-retention backstop: an independent, LLM-judge-backed
-                    # re-check of whether this re-write silently dropped prior
-                    # content. ADVISORY by default (detect + surface, never
-                    # block); WIKI_WEAVER_ENFORCE_GATES=1 restores the old
-                    # blocking behavior (route to _failed/ like any other
-                    # non-convergence disposition). run_retention_checks
-                    # additionally runs the deterministic page-shrinkage
-                    # heuristic + reads the agent's self-declared removal
-                    # manifest (both ADVISORY-ONLY, never blocking), and
-                    # decides the snapshot's fate: preserved to
-                    # .wiki/snapshots/ when any retention signal fired,
-                    # deleted on a clean pass.
-                    retention_checks = run_retention_checks(
-                        wiki, retention_snapshot_dir, name
-                    )
-                    retention_decision = retention_checks.decision
-                    for gate_name, adv in retention_checks.advisory_signals:
-                        if adv not in advisories_drain:
-                            _gate_advisory(gate_name, adv)
-                            advisories_drain.append(adv)
-                    if retention_decision.action in (
-                        "block_confirmed_loss",
-                        "block_escalated_errors",
-                    ):
-                        if gates_enforced():
-                            _fail(f"{name}: {retention_decision.message}")
-                            if src.is_file() and src.parent == inbox:
-                                dest_f = _collision_safe_move(src, failed_dir)
-                                reason = f"claim-retention gate: {retention_decision.message}"
-                                _append_failure_ledger(
-                                    wiki,
-                                    source=name,
-                                    source_id=source_id,
-                                    file_hash=file_hash,
-                                    failed_to=str(dest_f),
-                                    reason=reason,
-                                    failure_kind=FAILURE_KIND_UNKNOWN,
-                                    logs_dir=str(result.logs_dir),
-                                )
-                                failed_drain.append(
-                                    {
-                                        "source": name,
-                                        "reason": reason,
-                                        "failure_kind": FAILURE_KIND_UNKNOWN,
-                                    }
-                                )
-                            summary_drain.append((name, "retention-blocked"))
-                            # Structured record: the GATE is named (mislabel fix
-                            # -- never a generic error line).
-                            blocked_drain.append(
-                                {
-                                    "gate": "claim-retention",
-                                    "scope": "source",
-                                    "reason": retention_decision.message,
-                                    "offending_items": [name],
-                                }
-                            )
-                            continue
-                        advisory = (
-                            "claim-retention gate (ADVISORY -- did NOT block) "
-                            f"[source {name}]: {retention_decision.message}"
-                        )
-                        _gate_advisory("claim-retention", advisory)
-                        advisories_drain.append(advisory)
-                    elif retention_decision.message:
-                        print(f"  {retention_decision.message}")
-
-                    # Duplicate-page backstop: cheap, deterministic, always-on
-                    # (no fail-open/fail-closed escalation needed). ADVISORY by
-                    # default; WIKI_WEAVER_ENFORCE_GATES=1 restores blocking.
-                    dup_pages = no_duplicate_pages(wiki)
-                    if dup_pages:
-                        if gates_enforced():
-                            _fail(
-                                f"{name}: duplicate-page gate: merge-fragment "
-                                f"duplicate(s) detected: {', '.join(dup_pages)}"
-                            )
-                            if src.is_file() and src.parent == inbox:
-                                dest_f = _collision_safe_move(src, failed_dir)
-                                reason = (
-                                    "duplicate-page gate: merge-fragment "
-                                    f"duplicate(s) detected: {', '.join(dup_pages)}"
-                                )
-                                _append_failure_ledger(
-                                    wiki,
-                                    source=name,
-                                    source_id=source_id,
-                                    file_hash=file_hash,
-                                    failed_to=str(dest_f),
-                                    reason=reason,
-                                    failure_kind=FAILURE_KIND_UNKNOWN,
-                                    logs_dir=str(result.logs_dir),
-                                )
-                                failed_drain.append(
-                                    {
-                                        "source": name,
-                                        "reason": reason,
-                                        "failure_kind": FAILURE_KIND_UNKNOWN,
-                                    }
-                                )
-                            summary_drain.append((name, "duplicate-blocked"))
-                            # Structured record: the GATE is named (mislabel fix
-                            # -- never a generic error line).
-                            blocked_drain.append(
-                                {
-                                    "gate": "duplicate-page",
-                                    "scope": "wiki",
-                                    "reason": (
-                                        "duplicate-page gate: merge-fragment "
-                                        f"duplicate(s) detected: {', '.join(dup_pages)}"
-                                    ),
-                                    "offending_items": list(dup_pages),
-                                }
-                            )
-                            continue
-                        # Wiki-STRUCTURAL observation, not a verdict on this
-                        # source: the pairs may pre-date this run entirely.
-                        advisory = (
-                            "duplicate-page gate (ADVISORY -- did NOT block): "
-                            f"wiki contains {len(dup_pages)} version/merge-"
-                            f"fragment page pair(s): {', '.join(dup_pages)}"
-                        )
-                        if advisory not in advisories_drain:
-                            _gate_advisory("duplicate-page", advisory)
-                            advisories_drain.append(advisory)
-
-                    dest = sources_dir / name
-                    if src.is_file() and src.parent == inbox:
-                        src.replace(dest)
-                    _append_ledger(
-                        wiki,
-                        {
-                            "source": name,
-                            "source_id": source_id,
-                            "hash": file_hash,
-                            "status": result.status,
-                            "converged": result.converged,
-                            "archived_to": str(dest),
-                            "logs_dir": str(result.logs_dir),
-                            "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        },
-                    )
-                    _mark_source_ingested(wiki, file_hash)
-                    _ok(f"{name}: converged (logs: {result.logs_dir})")
-                    summary_drain.append((name, "converged"))
-                else:
-                    _fail(
-                        f"{name}: did not converge "
-                        f"(status={result.status}, reason={result.failure_reason})"
-                    )
-                    if src.is_file() and src.parent == inbox:
-                        dest_f = _collision_safe_move(src, failed_dir)
-                        reason = (
-                            f"did not converge (status={result.status}, "
-                            f"reason={result.failure_reason})"
-                        )
-                        # Distinguish "assess never rendered a verdict" from
-                        # "assess judged it non-converged" -- see
-                        # classify_failure_kind for the heuristic.
-                        kind = classify_failure_kind(wiki, synth_started)
-                        _append_failure_ledger(
-                            wiki,
-                            source=name,
-                            source_id=source_id,
-                            file_hash=file_hash,
-                            failed_to=str(dest_f),
-                            reason=reason,
-                            failure_kind=kind,
-                            logs_dir=str(result.logs_dir),
-                        )
-                        failed_drain.append(
-                            {
-                                "source": name,
-                                "reason": reason,
-                                "failure_kind": kind,
-                            }
-                        )
-                    summary_drain.append((name, "not-converged"))
-                    # Drain mode: always continue (never halt on non-convergence).
-            finally:
-                # Belt-and-suspenders: enforce_retention_gate() already removes
-                # retention_snapshot_dir on every path it runs; this covers the
-                # error/tamper/not-converged paths above where it is never
-                # invoked. ignore_errors=True tolerates an already-removed dir.
-                shutil.rmtree(retention_snapshot_dir, ignore_errors=True)
-                # Durability contract: persist counts-so-far after every real
-                # attempt's disposition (error/tamper/blocked/converged/
-                # not-converged all funnel through here). Fail-soft.
-                _checkpoint()
-
-        # Deterministic index/overview consistency pass (free, no LLM) --
-        # runs after the full drain, BEFORE the advisory print + overview
-        # re-weave below, so (a) its advisories land in this run's advisory
-        # block / DrainReport / result.json and (b) a mechanically repaired
-        # index.md feeds the re-weave (which synthesizes overview.md FROM
-        # index.md). Advisory-only; the staleness signal also trips the
-        # re-weave gate via its default composed grader (OV3). See
-        # wiki_weaver/consistency.py.
-        from wiki_weaver.consistency import run_consistency_checks
-
-        consistency = run_consistency_checks(wiki)
-        for gate_name, adv in consistency.advisory_signals:
-            if adv not in advisories_drain:
-                _gate_advisory(gate_name, adv)
-                advisories_drain.append(adv)
-
-        _print_summary(summary_drain)
-        _print_advisories(advisories_drain)
-        if report is not None:
-            report.advisories.extend(advisories_drain)
-        # Fail-loud after the drain: surface anything routed to _failed/ as a
-        # distinct, un-missable block (not merely a yellow bullet in the summary) so
-        # silently-dropped sources cannot slip past the operator.
-        failed_items = [
-            (n, s)
-            for n, s in summary_drain
-            if s in {"error", "not-converged", "tampered", "binary"}
-        ]
-        if failed_items:
-            print(
-                f"\n{RED}!! {len(failed_items)} source(s) were NOT added to the wiki"
-                f" -- moved to {failed_dir}{RESET}"
-            )
-            for n, s in failed_items:
-                print(f"{RED}   - {n}  ({s}){RESET}")
-            print(
-                f"{RED}   review these, fix, and re-drop into _inbox/ to retry,"
-                f" or remove them.{RESET}"
-            )
-
-        # ---------------------------------------------------------------------- #
-        # Item 2 (overview re-weave): runs ONCE HERE, after the ENTIRE _inbox/    #
-        # drain has completed -- never per source. grade_overview() is free and  #
-        # deterministic; a re-weave LLM call only happens when overview.md has   #
-        # actually degraded into a per-source narration log. Bounded retries;    #
-        # fails loud (never silently reports success on a still-failing gate).   #
-        # See wiki_weaver/reweave.py for the mechanism + cost-bounded design.    #
-        # ---------------------------------------------------------------------- #
-        from wiki_weaver.reweave import reweave_overview_if_needed
-
-        reweave_result = reweave_overview_if_needed(wiki)
-        if reweave_result.attempts:
-            if reweave_result.final_passed:
-                _ok(
-                    f"overview.md re-woven into a synthesized map "
-                    f"({reweave_result.attempts} attempt(s))"
-                )
-            else:
-                _fail(
-                    f"overview.md still fails grade_overview() after "
-                    f"{reweave_result.attempts} re-weave attempt(s):\n"
-                    f"{reweave_result.final_report}"
-                )
-                errored_drain.append(
-                    {
-                        "reason": (
-                            f"overview re-weave failed after "
-                            f"{reweave_result.attempts} attempt(s): "
-                            f"{reweave_result.final_report}"
-                        )
-                    }
-                )
-
-        # Run-result contract: result.json + honest headline + documented exit
-        # code (see wiki_weaver/run_result.py). Replaces the old binary
-        # `1 if failed_items or reweave-failure else 0` -- which exited 0 even
-        # when EVERY source was gate-blocked in enforce mode (the incident's
-        # "looked healthy for a week" hole: retention-/duplicate-blocked
-        # statuses were not in the failed_items set).
-        #
-        # A RESUMED drain finalizes the COMBINED state (adopted pre-crash
-        # records + this run's own) so counts never forget pre-crash
-        # completions; the exit code follows the combined verdict.
-        return _finish_ingest_run(run_dir, run_id, *_combined_state())
+    return {
+        "source_id": source_id,
+        # The ACTUAL number of BM25 candidates selected -- with an explicit
+        # --k override this equals k (min'd against corpus size, unchanged
+        # from the original behavior); in the default budget-driven path
+        # there is no single requested count to report, so this is the
+        # count the budget/floor/ceiling logic actually produced.
+        "k": len(hits),
+        "pages": ordered,
+        "bm25_hits": [{"page": pid, "score": score} for pid, score in hits],
+    }
 
 
 # ---------------------------------------------------------------------------
-# lint
+# Header/body splitting -- shared by segment_source (DESIGN.md §5 turn/
+# heading-safe segmentation) and watermark (DESIGN.md §5 stream delta:
+# watermark comparisons must be done on the BODY only, never the header --
+# see watermark.py's module docstring for why the header is NOT append-only
+# stable across re-exports of the same stream identity).
 # ---------------------------------------------------------------------------
 
 
-def lint(wiki: str | Path = ".") -> int:
-    """Run the structural validator against a wiki directory."""
-    wiki = Path(wiki).resolve()
-    if not wiki.is_dir():
-        _fail(f"wiki dir not found: {wiki}")
-        return 1
-    # Use the same validator config as the in-pipeline validate node so that
-    # `wiki-weaver lint` and the pipeline `validate` step always agree.
-    argv = [sys.executable, str(VALIDATE_PY), str(wiki)]
-    validator_cfg = wiki_policy_dir(wiki) / "validator.yaml"
-    if validator_cfg.is_file():
-        argv += ["--config", str(validator_cfg)]
-    proc = subprocess.run(
-        argv,
+def split_header(text: str) -> tuple[str, str]:
+    """(header block including its trailing '---' + blank line, body).
+
+    Every real source in the target corpus (and CLI-CONTRACT.md's own
+    ``kind:`` convention) uses a leading metadata block terminated by a bare
+    ``---`` line. Absent that delimiter (kind=article/repo with no header
+    convention), there is no header to carry and the whole text is body.
+    """
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            end = i + 1
+            if end < len(lines) and lines[end].strip() == "":
+                end += 1
+            return "".join(lines[:end]), "".join(lines[end:])
+    return "", text
+
+
+# ---------------------------------------------------------------------------
+# Structural validation (deterministic -- see wiki_weaver.ingest.validate)
+# ---------------------------------------------------------------------------
+
+
+def find_structural_issues(wiki_dir: Path) -> list[str]:
+    """Broken links, missing required frontmatter fields, orphan pages."""
+    pages = load_wiki_pages(wiki_dir)
+    if not pages:
+        return []
+
+    issues: list[str] = []
+    incoming: dict[str, int] = dict.fromkeys(pages, 0)
+    required_fields = ("title", "type")
+
+    for pid, page in pages.items():
+        text = (wiki_dir / pid).read_text(encoding="utf-8")
+        meta, _ = parse_frontmatter(text)
+        for required in required_fields:
+            if not str(meta.get(required, "")).strip():
+                issues.append(f"schema: {pid} missing required frontmatter field '{required}'")
+        for slug in page.links:
+            # A wikilink may target a specific section of a page --
+            # [[page-slug#Section Heading]] -- exactly like the file-level
+            # link, just with a fragment. The PAGE is what exists on disk;
+            # the fragment is not a filename component. Strip it before
+            # checking existence/counting incoming links, or every
+            # section-anchored link to a real, existing page is reported as
+            # a false-positive "broken link" forever (see docs/KNOWN_ISSUES.md
+            # #3 -- this exact false positive, present since before any
+            # ingest ran, made validate() return non-zero for EVERY source in
+            # a 73-source production run, not just the ones with a genuine
+            # structural problem).
+            target = f"{slug.split('#', 1)[0]}.md"
+            if target not in pages:
+                issues.append(f"broken link: {pid} -> [[{slug}]] (target page does not exist)")
+            else:
+                incoming[target] = incoming.get(target, 0) + 1
+
+    for pid in pages:
+        if pid not in NAV_PAGES and incoming.get(pid, 0) == 0:
+            issues.append(f"orphan: {pid} has no incoming wikilinks")
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Persistent page index (wiki/.index/pages.json) -- incremental maintenance
+# so wiki_weaver.ask.load_index does not need to open every page on every
+# call (CLI-CONTRACT.md: "index-first ... must NOT open every page in the
+# wiki"). Only pages that are new or whose mtime changed since the last
+# refresh are actually read and re-tokenized; unchanged pages are served
+# straight from the cached index entry.
+# ---------------------------------------------------------------------------
+
+
+def load_page_index(wr: WikiRoot) -> dict[str, dict]:
+    """Read the persisted per-page index. Missing or corrupt -> ``{}``
+    (the caller rebuilds incrementally from an empty index, which is
+    equivalent to a cold-start full build)."""
+    path = wr.wiki_index_file
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def refresh_page_index(wr: WikiRoot) -> dict[str, dict]:
+    """Incrementally refresh ``wiki/.index/pages.json``.
+
+    Only pages that are new or whose mtime differs from the cached entry
+    are opened and re-tokenized; everything else is served from the
+    existing cache entry untouched. Returns ``{page_id: {title, links,
+    tokens, mtime, cited_sources, frontmatter_sources}}`` and persists the
+    result (no-op write if nothing changed since the tracked state is
+    already durable).
+
+    ``cited_sources`` (inline ``NNN-Name.md`` references, see
+    ``extract_source_citations``) and ``frontmatter_sources`` (the raw
+    ``sources:`` frontmatter value, if present) are computed on the SAME
+    read that already opens a changed page for title/links/tokens -- no
+    additional file opens, so ``wiki_weaver.ask.load_index`` can surface
+    each candidate page's cited source files for free (DESIGN.md's hybrid
+    query flow: the wiki for orientation, the cited sources for the words).
+    """
+    index = load_page_index(wr)
+    pages = list_wiki_pages(wr.wiki_dir)
+    known_ids = {p.name for p in pages}
+
+    changed = False
+    for path in pages:
+        pid = path.name
+        mtime = path.stat().st_mtime
+        entry = index.get(pid)
+        if entry is not None and entry.get("mtime") == mtime:
+            continue  # unchanged since last refresh -- do not reopen this page
+        text = path.read_text(encoding="utf-8")
+        meta, body = parse_frontmatter(text)
+        title = str(meta.get("title", path.stem))
+        links = extract_wikilinks(body)
+        tokens = bm25.tokenize(f"{title}\n{body}")
+        cited_sources = extract_source_citations(text)
+        frontmatter_sources = meta.get("sources", [])
+        if not isinstance(frontmatter_sources, list):
+            frontmatter_sources = [frontmatter_sources]
+        index[pid] = {
+            "title": title,
+            "links": links,
+            "tokens": tokens,
+            "mtime": mtime,
+            "cited_sources": cited_sources,
+            "frontmatter_sources": frontmatter_sources,
+        }
+        changed = True
+
+    for stale_id in set(index) - known_ids:
+        del index[stale_id]
+        changed = True
+
+    if changed:
+        ensure_dir(wr.wiki_index_dir)
+        atomic_write_text(wr.wiki_index_file, json.dumps(index) + "\n")
+
+    return index
+
+
+# ---------------------------------------------------------------------------
+# git helpers -- thin, best-effort wrappers
+# ---------------------------------------------------------------------------
+
+
+def git_available(root: Path) -> bool:
+    return (root / ".git").exists()
+
+
+def git_init_if_absent(root: Path) -> None:
+    """``git init`` if ``root`` has no ``.git`` yet -- idempotent (per
+    ``init.persist``'s contract: "git init if .git absent (idempotent)")."""
+    if git_available(root):
+        return
+    ensure_dir(root)
+    _run_git(root, "init", "-q")
+
+
+def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
         capture_output=True,
         text=True,
-    )
-    sys.stdout.write(proc.stdout)
-    if proc.stderr:
-        sys.stderr.write(proc.stderr)
-    return proc.returncode
-
-
-# ---------------------------------------------------------------------------
-# preflight: shared HARD-prerequisite checks (single source of truth)
-# ---------------------------------------------------------------------------
-#
-# doctor() renders these verbosely (✓/✗ per check). The command wrappers in
-# wiki_weaver.py call preflight() to fail CLEAN + UPFRONT before any engine or
-# LLM work, so a broken environment never produces a mid-ingest traceback.
-# Both paths run the SAME probes here, so doctor and the gate can never drift.
-
-
-class _EnvCheck(NamedTuple):
-    """One HARD prerequisite probe result (pure detection -- no printing)."""
-
-    ok: bool
-    ok_msg: str
-    fail_msg: str
-    remediation: tuple[str, ...] = ()
-
-
-def _hard_env_checks(*, require_api_key: bool) -> list[_EnvCheck]:
-    """Probe the HARD environment prerequisites in display order.
-
-    ``require_api_key`` gates the ANTHROPIC_API_KEY check: engine/LLM-driven
-    commands (init, ingest, ask) need a key; deterministic ones (lint) do not.
-    All import probes are wrapped so a missing dependency is reported as a
-    failed check, never raised -- the caller decides how loud to be.
-    """
-    checks: list[_EnvCheck] = []
-
-    # API key -- only the engine/LLM-driven commands require it.
-    if require_api_key:
-        checks.append(
-            _EnvCheck(
-                ok=bool(os.environ.get("ANTHROPIC_API_KEY")),
-                ok_msg="ANTHROPIC_API_KEY is set",
-                fail_msg="ANTHROPIC_API_KEY is not set",
-                remediation=(
-                    "  export ANTHROPIC_API_KEY=... (or set it in ~/.amplifier settings)",
-                ),
-            )
-        )
-
-    # foundation is the engine entrypoint; prepare() resolves the loop-pipeline
-    # orchestrator and hook modules from the bundle on demand.
-    try:
-        import amplifier_foundation  # noqa: F401
-
-        checks.append(
-            _EnvCheck(True, "amplifier_foundation importable", "amplifier_foundation")
-        )
-    except Exception as e:  # noqa: BLE001
-        checks.append(
-            _EnvCheck(
-                ok=False,
-                ok_msg="",
-                fail_msg=f"amplifier_foundation not importable: {e}",
-                remediation=(
-                    "  run wiki-weaver under a python env that has amplifier-foundation",
-                    "  (e.g. the interpreter behind ~/.local/bin/amplifier)",
-                ),
-            )
-        )
-
-    # unified_llm must be importable: the engine's DirectProviderBackend fallback
-    # imports it, and a stale unified-llm-client (>=0.2 ships as `llm/`, not
-    # `unified_llm/`) makes that fallback crash AFTER a multi-minute ingest with
-    # ModuleNotFoundError. Catch the regression here in one second instead.
-    #
-    # Name-aware guardrail: if `unified_llm` is missing but `llm` IS present,
-    # that is the v0.2 import-name regression -- emit a specific, actionable
-    # message rather than a generic "not found".
-    try:
-        import unified_llm  # noqa: F401
-
-        checks.append(
-            _EnvCheck(True, "unified_llm importable (engine fallback path safe)", "")
-        )
-    except Exception as e:  # noqa: BLE001
-        import importlib.util
-
-        if importlib.util.find_spec("llm") is not None:
-            # `llm` is present but `unified_llm` isn't -> v0.2 rename regression.
-            checks.append(
-                _EnvCheck(
-                    ok=False,
-                    ok_msg="",
-                    fail_msg=(
-                        "IMPORT REGRESSION: `unified_llm` NOT importable -- but `llm` "
-                        "IS present. The installed amplifier-unified-llm-client uses the "
-                        "new `llm` import layout (v0.2+); this wiki-weaver expects "
-                        "`unified_llm` (v0.1.x). Incompatible -- reinstall wiki-weaver or "
-                        "align the client version."
-                    ),
-                    remediation=(
-                        "  fix: uv tool install --force"
-                        " git+https://github.com/microsoft/amplifier-app-wiki-weaver",
-                    ),
-                )
-            )
-        else:
-            # Neither unified_llm nor llm found -- client not installed at all.
-            checks.append(
-                _EnvCheck(
-                    ok=False,
-                    ok_msg="",
-                    fail_msg=f"unified_llm NOT importable: {e}",
-                    remediation=(
-                        "  install the correct client:"
-                        " uv pip install --python <amplifier py> \\",
-                        "  --force-reinstall <attractor-cache>/modules/unified-llm-client"
-                        " (v0.1.x, ships unified_llm/)",
-                    ),
-                )
-            )
-
-    # structural validator presence (deterministic lint + ingest verify nodes).
-    checks.append(
-        _EnvCheck(
-            ok=VALIDATE_PY.is_file(),
-            ok_msg=f"structural validator found: {VALIDATE_PY}",
-            fail_msg=f"validate_wiki.py missing: {VALIDATE_PY}",
-        )
+        check=False,
     )
 
-    return checks
+
+def git_show_head(root: Path, relpath: str) -> str | None:
+    """``git show HEAD:<relpath>`` or ``None`` if there is no such blob at HEAD."""
+    result = _run_git(root, "show", f"HEAD:{relpath}")
+    if result.returncode != 0:
+        return None
+    return result.stdout
 
 
-def preflight(*, require_api_key: bool) -> list[str]:
-    """Return HARD-prerequisite failure messages (empty list = environment OK).
+def git_changed_wiki_files(root: Path, wiki_dir_name: str = "wiki") -> set[str]:
+    """Basenames of wiki pages modified or newly added in the working tree
+    relative to HEAD (tracked modifications + untracked new files)."""
+    if not git_available(root):
+        return set()
+    changed: set[str] = set()
 
-    Command wrappers call this BEFORE any engine/LLM work so a broken
-    environment fails CLEAN + UPFRONT (no mid-ingest traceback). doctor() runs
-    the SAME probes (via ``_hard_env_checks``) for its verbose report, so the
-    two can never drift.
+    modified = _run_git(root, "diff", "--name-only", "--", wiki_dir_name)
+    if modified.returncode == 0:
+        changed.update(Path(p).name for p in modified.stdout.splitlines() if p.strip())
+
+    staged = _run_git(root, "diff", "--staged", "--name-only", "--", wiki_dir_name)
+    if staged.returncode == 0:
+        changed.update(Path(p).name for p in staged.stdout.splitlines() if p.strip())
+
+    untracked = _run_git(root, "ls-files", "--others", "--exclude-standard", "--", wiki_dir_name)
+    if untracked.returncode == 0:
+        changed.update(Path(p).name for p in untracked.stdout.splitlines() if p.strip())
+
+    return changed
+
+
+def count_pages_touched(root: Path, wiki_dir: Path) -> int:
+    return len(git_changed_wiki_files(root))
+
+
+def git_changed_wiki_files_detail(root: Path, wiki_dir_name: str = "wiki") -> tuple[set[str], set[str]]:
+    """Split of ``git_changed_wiki_files`` into (created, updated) basenames.
+
+    ``created`` = pages that did not exist at HEAD -- untracked new files, plus
+    staged adds (``git diff --staged --diff-filter=A``). ``updated`` = tracked
+    pages modified, staged or not. The touches_per_source metric (DESIGN.md's
+    headline number -- see pipeline/ingest.dot's weave prompt and its entity
+    decomposition) needs this split, not just the total ``count_pages_touched``
+    gives: it is the created/updated ratio that shows whether ingest is
+    building new landing zones or folding into existing ones.
+
+    A path can surface from more than one of the three underlying git queries
+    (e.g. staged-added AND still unstaged-modified again before this check
+    runs); ``created`` wins any such overlap -- on net, it is still a page
+    that did not exist before this source.
     """
-    return [
-        c.fail_msg
-        for c in _hard_env_checks(require_api_key=require_api_key)
-        if not c.ok
-    ]
+    if not git_available(root):
+        return set(), set()
 
+    created: set[str] = set()
+    updated: set[str] = set()
 
-# ---------------------------------------------------------------------------
-# doctor
-# ---------------------------------------------------------------------------
+    untracked = _run_git(root, "ls-files", "--others", "--exclude-standard", "--", wiki_dir_name)
+    if untracked.returncode == 0:
+        created.update(Path(p).name for p in untracked.stdout.splitlines() if p.strip())
 
-
-def doctor(*, wiki: str | Path | None = None) -> int:
-    """Run environment diagnostics, optionally checking a specific wiki."""
-    ok = True
-
-    # HARD prerequisites -- the SAME probes the command wrappers gate on, so the
-    # verbose report and the upfront gate can never disagree.
-    for c in _hard_env_checks(require_api_key=True):
-        if c.ok:
-            _ok(c.ok_msg)
-        else:
-            _fail(c.fail_msg)
-            for line in c.remediation:
-                _warn(line)
-            ok = False
-
-    # Engine runner imports cleanly (local code; needed for the WARN probes).
-    try:
-        from wiki_weaver.engine_runner import (
-            ATTRACTOR_PIPELINE_LOCAL,
-            load_ci_config,
-        )
-    except Exception as e:  # noqa: BLE001
-        _fail(f"could not load engine_runner: {e}")
-        return 1
-
-    # Amplifier runtime present: wiki-weaver is a companion tool. The engine's
-    # load_bundle() fetches the attractor-pipeline bundle on first ingest and
-    # reads API keys from ~/.amplifier/settings. A missing or empty cache means
-    # first ingest will cold-fetch from git (needs network + Amplifier install).
-    _amplifier_home = Path.home() / ".amplifier"
-    _amplifier_cache = _amplifier_home / "cache"
-    if not _amplifier_home.is_dir():
-        _warn(
-            "~/.amplifier/ not found — Amplifier (amplifier-app-cli) does not appear "
-            "installed/initialized. wiki-weaver is a companion tool; first ingest will "
-            "cold-fetch the engine bundle and requires network + an Amplifier install. "
-            "See README."
-        )
-    elif not _amplifier_cache.is_dir() or not any(_amplifier_cache.iterdir()):
-        _warn(
-            "~/.amplifier/cache/ is missing or empty — Amplifier may not be fully "
-            "initialized; first ingest will cold-fetch the engine bundle from git. "
-            "Initialize Amplifier first, or ensure network access is available."
-        )
-    else:
-        _ok("Amplifier runtime present (~/.amplifier/cache is non-empty)")
-
-    # Network reachability: load_bundle() fetches from github.com when the cache
-    # is cold. Fast TCP-only probe (no HTTP, no auth, no bundle load) — non-fatal
-    # WARN so it never blocks a user with an already-warm cache.
-    import socket as _socket
-
-    try:
-        with _socket.create_connection(("github.com", 443), timeout=3):
-            _ok("network: github.com:443 reachable")
-    except OSError as e:
-        _warn(
-            f"network: github.com:443 unreachable ({type(e).__name__}: {e}) — "
-            "first ingest fetches the attractor engine bundle and will fail offline"
-        )
-
-    if ATTRACTOR_PIPELINE_LOCAL:
-        pipeline_bundle = Path(ATTRACTOR_PIPELINE_LOCAL)
-        if pipeline_bundle.is_file():
-            _ok(f"attractor-pipeline bundle found: {pipeline_bundle}")
-        else:
-            _warn(
-                f"WIKI_WEAVER_ATTRACTOR_PIPELINE set but path missing ({pipeline_bundle});"
-                " will fall back to git URL"
-            )
-    else:
-        _warn(
-            "WIKI_WEAVER_ATTRACTOR_PIPELINE not set; will load attractor-pipeline from git URL"
-        )
-
-    # context-intelligence hook.
-    # The hook's LoggingHandler is ALWAYS-ON: it writes per-session events.jsonl
-    # locally regardless of config. Unconfigured = local-only = normal default.
-    _ok("context-intelligence: logging locally (per-session events.jsonl) — normal")
-    ci_cfg = load_ci_config()
-    destinations = ci_cfg.get("destinations") or {}
-    if destinations:
-        for dest_name, dest in destinations.items():
-            dest_url = dest.get("url", "") if isinstance(dest, dict) else ""
-            if not dest_url:
+    staged = _run_git(root, "diff", "--staged", "--name-status", "--", wiki_dir_name)
+    if staged.returncode == 0:
+        for line in staged.stdout.splitlines():
+            if not line.strip():
                 continue
-            _ok(f"context-intelligence: remote destination '{dest_name}' → {dest_url}")
-            # Probe the destination (non-fatal info -- local logging continues regardless).
-            try:
-                import urllib.request
+            parts = line.split("\t")
+            status, name = parts[0], parts[-1]
+            base = Path(name).name
+            (created if status.startswith("A") else updated).add(base)
 
-                with urllib.request.urlopen(dest_url, timeout=3) as resp:  # noqa: S310
-                    _ok(
-                        f"context-intelligence: '{dest_name}' server UP (HTTP {resp.status})"
-                    )
-            except Exception as e:  # noqa: BLE001
-                _ok(
-                    f"context-intelligence: '{dest_name}' server DOWN/unreachable"
-                    f" ({type(e).__name__}) — OK, local events.jsonl still written"
-                )
-    else:
-        _ok(
-            "context-intelligence: no remote destinations configured (local-only) — normal"
-        )
+    modified = _run_git(root, "diff", "--name-only", "--", wiki_dir_name)
+    if modified.returncode == 0:
+        for p in modified.stdout.splitlines():
+            if p.strip():
+                updated.add(Path(p).name)
 
-    if wiki:
-        wiki_path = Path(wiki).resolve()
-        missing = [
-            d for d in (INBOX, SOURCES, ".ai/feedback") if not (wiki_path / d).is_dir()
-        ]
-        if wiki_path.is_dir() and not missing:
-            _ok(f"wiki structure OK: {wiki_path}")
-        else:
-            _fail(f"wiki structure incomplete at {wiki_path} (missing: {missing})")
-            ok = False
-
-        # Policy echo: show the resolved paths + model knobs for this wiki so the
-        # user can verify that project overrides are being picked up correctly.
-        if wiki_path.is_dir():
-            try:
-                from wiki_weaver.policy import load_policy
-
-                policy = load_policy(wiki_path)
-                _ok(f"  policy.schema:          {policy.schema_path}")
-                _ok(f"  policy.rubric:          {policy.convergence_rubric_path}")
-                _ok(f"  policy.inner_dot:       {policy.inner_dot_path}")
-                _ok(
-                    f"  policy.validator_cfg:   "
-                    f"{policy.validator_config_path or '(built-in defaults)'}"
-                )
-                _ok(f"  policy.provider:        {policy.provider}")
-                _ok(f"  policy.models:          {policy.models}")
-                _ok(f"  policy.max_cycles:      {policy.max_cycles}")
-                _warn(
-                    f"  policy.parallelism:     {policy.parallelism}"
-                    " (RESERVED \u2014 within-wiki ingest is sequential;"
-                    " parallelism key accepted but always honored as 1)"
-                )
-            except Exception as e:  # noqa: BLE001
-                _warn(f"  could not resolve policy for {wiki_path}: {e}")
-
-    # Resolved @main commits — the "what am I running" record that replaces
-    # the committed uv.lock (absent intentionally; see .gitignore).
-    # Reads from local cache only (no ls-remote) so doctor stays fast offline.
-    # Run `wiki-weaver update --check` to compare against remote.
-    try:
-        from wiki_weaver.updater import local_layer2_commits, wheel_dep_commits
-
-        print()
-        print(
-            "Resolved @main commits (local — run 'wiki-weaver update --check' to compare remote):"
-        )
-        for rec in wheel_dep_commits():
-            sha = rec.local_short
-            _ok(f"  {rec.label:<44s} {sha}")
-        for rec in local_layer2_commits():
-            if rec.local_sha:
-                _ok(f"  {rec.label:<44s} {rec.local_short}")
-            else:
-                _warn(f"  {rec.label:<44s} (not cached — will clone on first ingest)")
-    except Exception as e:  # noqa: BLE001
-        _warn(f"could not read resolved @main commits: {e}")
-
-    # Attractor engine routing-contract floor: pipeline/synthesize.dot's assess
-    # node reports its verdict as a flat bare-JSON final message (spawn path,
-    # PR #41). Verdict routing is only fail-safe when the resolved
-    # attractor-bundle commit is at or beyond ATTRACTOR_ROUTING_FLOOR_SHA
-    # (attractor #89, transitively #88): older engines leave a stale
-    # preferred_label in context across loop_restart, so a verdict from one
-    # cycle/source can leak into the next and silently false-converge it.
-    # Read-only diagnostic;
-    # degrades to WARN (never blocks doctor) when inconclusive — e.g. offline,
-    # not yet cloned, or the GitHub compare API is unreachable.
-    try:
-        import asyncio
-
-        from wiki_weaver.updater import (
-            ATTRACTOR_ROUTING_FLOOR_SHA,
-            check_attractor_routing_floor,
-        )
-
-        floor_result = asyncio.run(check_attractor_routing_floor())
-        floor_short = ATTRACTOR_ROUTING_FLOOR_SHA[:8]
-        if floor_result.ok is True:
-            _ok(
-                f"attractor routing-contract floor: {floor_result.message}"
-                f" (>= {floor_short})"
-            )
-        elif floor_result.ok is False:
-            _fail(
-                f"attractor routing-contract floor: {floor_result.message}"
-                f" (>= {floor_short})"
-            )
-            _warn(
-                "  upgrade the attractor engine (amplifier-module-loop-pipeline /"
-                f" attractor bundle) to a commit at or past {floor_short}"
-                " \u2014 run `wiki-weaver update`"
-            )
-            ok = False
-        else:
-            _warn(
-                f"attractor routing-contract floor: {floor_result.message}"
-                f" (>= {floor_short})"
-            )
-    except Exception as e:  # noqa: BLE001
-        _warn(f"could not check attractor routing-contract floor: {e}")
-
-    print()
-    if ok:
-        _ok("doctor: all required checks passed")
-        return 0
-    _fail("doctor: one or more checks failed")
-    return 1
+    updated -= created  # each page counts once; new-page wins over "also modified"
+    return created, updated
 
 
-# ---------------------------------------------------------------------------
-# update — refresh @main sources
-# ---------------------------------------------------------------------------
+def count_pages_touched_detail(root: Path, wiki_dir: Path) -> dict:
+    """``{"created": n, "updated": n, "total": n}`` for the current working tree."""
+    created, updated = git_changed_wiki_files_detail(root)
+    return {"created": len(created), "updated": len(updated), "total": len(created) + len(updated)}
 
 
-def update(*, check_only: bool = False) -> int:
-    """Refresh wiki-weaver's @main sources to latest.
+def summarize_ledger_touches(ledger_path: Path) -> dict:
+    """Run-level ``touches_per_source`` summary from ``ledger.jsonl``'s accept rows.
 
-    Tracks @main, fix-forward — no SHA pinning.
-
-    Two layers:
-      Layer 1 — ``uv tool install --reinstall`` to update wiki-weaver itself
-                and its wheel deps (amplifier-foundation, amplifier-unified-llm-client).
-                Uses verify+ladder+fail-loud: if stale uv-cached packages are
-                detected, escalates to ``--no-cache`` then ``uv cache clean``.
-      Layer 2 — Calls foundation's ``GitSourceHandler.update()`` on the
-                attractor-bundle and context-intelligence engine bundles in
-                ``~/.amplifier/cache/bundles`` (rmtree+reclone).
-
-    ``check_only=True`` — detect and report without modifying anything.
+    DESIGN.md's headline metric: mean wiki pages touched per ingested source,
+    plus the created/updated split -- the number that shows whether a source
+    is being decomposed into the several pages it is actually about (weave's
+    per-entity placement decision), rather than one binary create-vs-fold
+    call per source. A pure read of durable ledger state, so it can be
+    recomputed after every accept and is always consistent with the ledger
+    on disk -- no counter of its own to drift out of sync.
     """
-    try:
-        from wiki_weaver.updater import (  # noqa: F401
-            Layer1Result,
-            SourceRecord,
-            check_layer1,
-            check_layer2,
-            update_layer1,
-            update_layer2,
-        )
-    except Exception as e:  # noqa: BLE001
-        _fail(f"could not load updater module: {e}")
-        return 1
+    if not ledger_path.is_file():
+        return {"sources": 0, "mean_touched": 0.0, "total_created": 0, "total_updated": 0}
 
-    if check_only:
-        return _update_check(check_layer1, check_layer2)
-    return _update_real(update_layer1, update_layer2)
-
-
-def _update_check(check_l1_fn, check_l2_fn) -> int:  # type: ignore[no-untyped-def]
-    """--check mode: ls-remote all sources, report drift, no side effects."""
-    print("Checking @main sources for drift (ls-remote only — no changes made)…")
-    any_update = False
-    any_error = False
-
-    print()
-    print("Layer 1 — wheel deps (amplifier-foundation, amplifier-unified-llm-client):")
-    try:
-        for rec in check_l1_fn():
-            if rec.error:
-                _warn(f"  {rec.label}: {rec.error}")
-                any_error = True
-            elif rec.needs_update:
-                _warn(
-                    f"  {rec.label}: UPDATE AVAILABLE  "
-                    f"{rec.local_short} -> {rec.target_short}"
-                )
-                any_update = True
-            elif rec.needs_update is False:
-                _ok(f"  {rec.label}: up to date ({rec.local_short})")
-            else:
-                _warn(f"  {rec.label}: unknown (local={rec.local_short} remote=?)")
-    except Exception as e:  # noqa: BLE001
-        _fail(f"  layer-1 check failed: {e}")
-        any_error = True
-
-    print()
-    print("Layer 2 — engine bundles (~/.amplifier/cache/bundles):")
-    try:
-        for rec in check_l2_fn():
-            if rec.error:
-                _warn(f"  {rec.label}: {rec.error}")
-                any_error = True
-            elif rec.needs_update:
-                _warn(
-                    f"  {rec.label}: UPDATE AVAILABLE  "
-                    f"{rec.local_short} -> {rec.target_short}"
-                )
-                any_update = True
-            elif rec.needs_update is False:
-                _ok(f"  {rec.label}: up to date ({rec.local_short})")
-            else:
-                _warn(
-                    f"  {rec.label}: not yet cached (will clone fresh on first ingest)"
-                )
-    except Exception as e:  # noqa: BLE001
-        _fail(f"  layer-2 check failed: {e}")
-        any_error = True
-
-    print()
-    if any_update:
-        _warn("Updates are available.  Run `wiki-weaver update` to apply.")
-    elif any_error:
-        _warn("Some checks failed; could not determine update status for all sources.")
-    else:
-        _ok("All @main sources are up to date.")
-    return 1 if any_error else 0
-
-
-def _update_real(update_l1_fn, update_l2_fn) -> int:  # type: ignore[no-untyped-def]
-    """Real update: Layer 1 reinstall + Layer 2 re-clone."""
-    print("Updating wiki-weaver to latest @main…")
-    overall_ok = True
-
-    # --- Layer 1 ---
-    print()
-    print("Layer 1 — uv tool install --reinstall (wiki-weaver + wheel deps)…")
-    res = None
-    try:
-        res = update_l1_fn(verbose=True)
-    except Exception as e:  # noqa: BLE001
-        _fail(f"Layer 1 update raised: {e}")
-        overall_ok = False
-
-    if res is not None:
-        for name in res.before:
-            b = (res.before.get(name) or "?")[:8]
-            a = (res.after.get(name) or "?")[:8]
-            if b != a:
-                _ok(f"  {name}: {b} -> {a}")
-            else:
-                _ok(f"  {name}: {a} (already at latest)")
-        for err in res.errors:
-            _fail(f"  error: {err}")
-        if res.stale:
-            _fail(
-                f"  FAIL: after {res.rung_reached} rung(s), {res.stale} still didn't update. "
-                f"uv is serving a stale cache.  Manual fix:\n"
-                f"    uv cache prune && "
-                f"uv tool install --reinstall "
-                f"git+https://github.com/microsoft/amplifier-app-wiki-weaver"
-            )
-            overall_ok = False
-        elif not res.success and res.errors:
-            overall_ok = False
-
-    # --- Layer 2 ---
-    print()
-    print("Layer 2 — engine bundle re-clone (~/.amplifier/cache/bundles)…")
-    try:
-        for rec in update_l2_fn():
-            if rec.skipped:
-                _warn(f"  {rec.label}: skipped ({rec.error})")
-            elif rec.error:
-                _fail(f"  {rec.label}: ERROR — {rec.error}")
-                overall_ok = False
-            elif rec.needs_update:
-                _ok(f"  {rec.label}: {rec.local_short} -> {rec.target_short}")
-            else:
-                _ok(f"  {rec.label}: {rec.target_short} (already at latest)")
-    except Exception as e:  # noqa: BLE001
-        _fail(f"Layer 2 update raised: {e}")
-        overall_ok = False
-
-    # --- Summary ---
-    print()
-    if overall_ok:
-        _ok("Update complete.")
-        print("  Run `wiki-weaver doctor` to confirm resolved commits.")
-    else:
-        _fail("Update completed with errors (see above).")
-        print("  Run `wiki-weaver doctor` for diagnostics.")
-    return 0 if overall_ok else 1
-
-
-# ---------------------------------------------------------------------------
-# migrate -- move corpus from OLD layout to NEW layout
-# ---------------------------------------------------------------------------
-#
-# OLD layout (pre-0.5.0):
-#   <corpus>/.processed.jsonl   ledger at corpus root
-#   <corpus>/.sources.json      registry at corpus root
-#   <corpus>/_archive/          archived source files (visible)
-#   <corpus>/_failed/           failed-ingest files (visible)
-#   <corpus>/.runs/             run logs (hidden but at root)
-#   <corpus>/policy/            per-wiki schema overrides (visible)
-#   <corpus>/.wiki-dashboard/   dashboard theme (hidden but at root)
-#
-# NEW layout (0.5.0+):
-#   <corpus>/.wiki/.processed.jsonl   ledger under hidden subtree
-#   <corpus>/.wiki/.sources.json      registry under hidden subtree
-#   <corpus>/_sources/                archived sources (renamed, stays visible)
-#   <corpus>/.wiki/failed/            failed-ingest files
-#   <corpus>/.wiki/runs/              run logs
-#   <corpus>/.wiki/policy/            per-wiki schema overrides
-#   <corpus>/.wiki/dashboard/         dashboard theme
-#
-# Ledger field rewrites (absolute paths in the entries):
-#   archived_to:  /<wiki>/_archive/…  →  /<wiki>/_sources/…
-#   logs_dir:     /<wiki>/.runs/…     →  /<wiki>/.wiki/runs/…
-
-MIGRATION_LOCK_NAME = ".wiki-migration.lock"
-MIGRATION_SENTINEL = ".migration-complete"
-
-
-def _migration_plan(wiki: Path) -> list[tuple[str, Path, Path, bool]]:
-    """Return ``(description, old_path, new_path, is_dir)`` for OLD paths that exist."""
-    candidates: list[tuple[str, Path, Path, bool]] = [
-        ("ledger", wiki / ".processed.jsonl", wiki_ledger(wiki), False),
-        ("registry", wiki / ".sources.json", wiki_registry(wiki), False),
-        ("archive", wiki / "_archive", wiki_sources(wiki), True),
-        ("failed", wiki / "_failed", wiki_failed(wiki), True),
-        ("runs", wiki / ".runs", wiki_runs(wiki), True),
-        ("policy", wiki / "policy", wiki_policy_dir(wiki), True),
-        ("dashboard", wiki / ".wiki-dashboard", wiki_dashboard(wiki), True),
-    ]
-    return [item for item in candidates if item[1].exists()]
-
-
-def _rewrite_ledger_keys(ledger_path: Path, wiki: Path) -> tuple[int, int]:
-    """Rewrite path-valued fields in the NEW ledger after it has been copied.
-
-    Rewrites:
-    - ``archived_to``: replaces the ``<wiki>/_archive`` prefix with
-      ``<wiki>/_sources`` (the new visible sources dir).
-    - ``logs_dir``: replaces the ``<wiki>/.runs`` prefix with
-      ``<wiki>/.wiki/runs``.
-
-    Returns ``(changed, path_field_lines)``:
-    - ``changed``: number of lines actually rewritten (prefix matched this corpus).
-    - ``path_field_lines``: number of non-empty lines that carry a non-empty
-      ``archived_to`` or ``logs_dir`` field at all (whether or not the prefix
-      matched).  The caller uses this for the C1 mismatch guard: a ledger that
-      HAS path fields but rewrote NONE means its absolute paths point at a
-      different corpus location (moved/copied since processing).
-
-    Writes atomically via a temp file + rename.  Raises ``RuntimeError`` if the
-    line count changes.
-    """
-    if not ledger_path.exists():
-        return 0, 0
-
-    old_archive = str(wiki / "_archive")
-    new_sources_str = str(wiki_sources(wiki))
-    old_runs = str(wiki / ".runs")
-    new_runs_str = str(wiki_runs(wiki))
-
-    raw = ledger_path.read_text(encoding="utf-8")
-    lines_in = raw.splitlines(keepends=True)
-    lines_out: list[str] = []
-    changed = 0
-    path_field_lines = 0
-
-    for line in lines_in:
-        stripped = line.rstrip("\n").rstrip("\r")
-        if not stripped:
-            lines_out.append(line)
+    sources = 0
+    total_touched = 0
+    total_created = 0
+    total_updated = 0
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
             continue
         try:
-            entry = json.loads(stripped)
+            record = json.loads(line)
         except json.JSONDecodeError:
-            lines_out.append(line)
             continue
+        if record.get("decision") != "accept":
+            continue
+        sources += 1
+        total_touched += int(record.get("pages_touched", 0) or 0)
+        total_created += int(record.get("pages_created", 0) or 0)
+        total_updated += int(record.get("pages_updated", 0) or 0)
 
-        at = entry.get("archived_to")
-        ld = entry.get("logs_dir")
-
-        # Does this line carry ANY non-empty path field? (C1 denominator.)
-        if (isinstance(at, str) and at) or (isinstance(ld, str) and ld):
-            path_field_lines += 1
-
-        modified = False
-        if isinstance(at, str) and at.startswith(old_archive):
-            entry["archived_to"] = new_sources_str + at[len(old_archive) :]
-            modified = True
-
-        if isinstance(ld, str) and ld.startswith(old_runs):
-            entry["logs_dir"] = new_runs_str + ld[len(old_runs) :]
-            modified = True
-
-        if modified:
-            changed += 1
-
-        ending = "\n" if line.endswith("\n") else ""
-        lines_out.append(json.dumps(entry) + ending)
-
-    if len(lines_out) != len(lines_in):
-        raise RuntimeError(
-            f"ledger line count changed during rewrite: "
-            f"{len(lines_in)} → {len(lines_out)}"
-        )
-
-    tmp = ledger_path.with_suffix(".jsonl.tmp")
-    tmp.write_text("".join(lines_out), encoding="utf-8")
-    tmp.replace(ledger_path)
-    return changed, path_field_lines
+    return {
+        "sources": sources,
+        "mean_touched": round(total_touched / sources, 2) if sources else 0.0,
+        "total_created": total_created,
+        "total_updated": total_updated,
+    }
 
 
-def _write_migration_sentinel(sentinel: Path) -> None:
-    """Write the completion sentinel with a timestamp."""
-    sentinel.parent.mkdir(parents=True, exist_ok=True)
-    sentinel.write_text(
-        json.dumps(
-            {
-                "migrated_at": datetime.now().isoformat(timespec="seconds"),
-                "from_layout": "pre-0.5.0",
-                "to_layout": "0.5.0",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
+def git_clean_and_checkout(root: Path, relpath: str) -> None:
+    """Revert working-tree edits under ``relpath``: discard tracked
+    modifications and remove newly created untracked files. Best-effort --
+    a wiki with no prior commit has nothing to revert to, which is fine."""
+    _run_git(root, "checkout", "--", relpath)
+    _run_git(root, "clean", "-fd", "--", relpath)
+
+
+def git_add_all(root: Path) -> None:
+    _run_git(root, "add", "-A")
+
+
+def git_has_staged_changes(root: Path) -> bool:
+    result = _run_git(root, "diff", "--staged", "--quiet")
+    return result.returncode != 0
+
+
+def git_commit(root: Path, message: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-m", message],
+        capture_output=True,
+        text=True,
+        check=True,
     )
 
 
-def _safe_rel(path: Path, base: Path) -> str:
-    """Return *path* relative to *base*, or the absolute string if not under it."""
-    try:
-        return str(path.relative_to(base))
-    except ValueError:
-        return str(path)
+def commit_if_staged(root: Path, message: str) -> bool:
+    """``git add -A && git commit`` guarded by ``git diff --staged --quiet``.
 
-
-def _files_differ(a: Path, b: Path) -> bool:
-    """Return True when *a* and *b* differ in content (or comparison fails).
-
-    Used by the no-clobber copy guard (M1): a differing existing target must be
-    preserved, never silently overwritten with OLD content.  On any OS error we
-    conservatively report "differ" so the target is preserved rather than lost.
+    No-op (no phantom commit) when there is nothing to commit. Returns
+    whether a commit was made.
     """
-    try:
-        return not filecmp.cmp(str(a), str(b), shallow=False)
-    except OSError:
+    git_add_all(root)
+    if git_has_staged_changes(root):
+        git_commit(root, message)
         return True
-
-
-def _guarded_copytree(old: Path, new: Path, wiki: Path) -> list[str]:
-    """Copy *old* → *new* file-by-file, preserving any newer/differing target (M1).
-
-    Unlike ``shutil.copytree(dirs_exist_ok=True)``, this never overwrites an
-    existing target file whose content differs from the OLD source — that target
-    may be post-upgrade content (e.g. a ``build-dashboard``-written
-    ``theme.json``) that the user does not want clobbered with OLD data.  Such
-    files are skipped with a WARN and their relative paths returned.
-
-    Identical existing targets are skipped silently (idempotent re-run).
-    Missing targets are copied with ``copy2`` (preserves mtime).  Raises
-    ``OSError`` on a real copy failure (e.g. ENOSPC) — handled by the caller.
-    """
-    new.mkdir(parents=True, exist_ok=True)
-    preserved: list[str] = []
-    for src in sorted(old.rglob("*")):
-        rel = src.relative_to(old)
-        dst = new / rel
-        if src.is_dir():
-            dst.mkdir(parents=True, exist_ok=True)
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists() and _files_differ(src, dst):
-            preserved.append(_safe_rel(dst, wiki))
-            _warn(
-                f"    preserved existing {_safe_rel(dst, wiki)} "
-                f"(differs from OLD; not overwritten)"
-            )
-            continue
-        shutil.copy2(str(src), str(dst))
-    return preserved
-
-
-def migrate(wiki_dir: str | Path, *, dry_run: bool = False, force: bool = False) -> int:
-    """Migrate a corpus from the OLD (pre-0.5.0) layout to the NEW layout.
-
-    Safety invariants (all non-negotiable):
-
-    * **PID lock** — ``<corpus>/.wiki-migration.lock`` prevents concurrent runs.
-      A stale lock whose PID is gone is silently removed and migration proceeds.
-    * **Idempotency sentinel** — ``<corpus>/.wiki/.migration-complete`` makes a
-      second run a clean no-op.  ``--force`` bypasses the sentinel.
-    * **Copy → rewrite → verify → delete** — old data is never removed before
-      the new data has been copied and verified.  A failed verification aborts
-      before any deletion occurs.
-    * **``--dry-run``** — prints the full migration plan and exits without
-      touching the filesystem.
-
-    Ledger rewrites (in ``.wiki/.processed.jsonl`` after copying):
-
-    * ``archived_to``: ``/_archive/…`` → ``/_sources/…``
-    * ``logs_dir``:    ``/.runs/…``    → ``/.wiki/runs/…``
-
-    ``sources.json`` filenames are bare identifiers — no path rewrite.
-    """
-    wiki = Path(wiki_dir).expanduser().resolve()
-
-    if not wiki.is_dir():
-        _fail(f"corpus directory not found: {wiki}")
-        return 1
-
-    lock_path = wiki / MIGRATION_LOCK_NAME
-    sentinel = wiki_hidden_dir(wiki) / MIGRATION_SENTINEL
-
-    # ── PID lock (atomic, TOCTOU-free) ──────────────────────────────────────
-    # Create the lock with O_EXCL so the existence check and the write are a
-    # single atomic syscall — two concurrent migrations cannot both win the
-    # race. Only on FileExistsError do we inspect the holder's PID to decide
-    # whether it is a live run (abort) or a stale lock to reclaim.
-    if not _acquire_migration_lock(lock_path):
-        return 1
-
-    try:
-        return _run_migration(wiki, sentinel, dry_run=dry_run, force=force)
-    finally:
-        lock_path.unlink(missing_ok=True)
-
-
-def _acquire_migration_lock(lock_path: Path) -> bool:
-    """Atomically acquire the migration PID lock; return True on success.
-
-    Uses ``open(path, "x")`` (O_EXCL) so creation is atomic. If the lock already
-    exists, inspects the recorded PID: a live process means a real concurrent
-    migration (return False, do NOT touch its lock); a gone/invalid PID is a
-    stale lock that is reclaimed, after which we re-attempt the atomic create
-    once (losing that second race also returns False).
-    """
-
-    def _try_create() -> bool:
-        try:
-            with open(lock_path, "x", encoding="utf-8") as f:
-                f.write(str(os.getpid()))
-            return True
-        except FileExistsError:
-            return False
-
-    if _try_create():
-        return True
-
-    # Lock exists — inspect the holder.
-    raw_pid = ""
-    try:
-        raw_pid = lock_path.read_text(encoding="utf-8").strip()
-        existing_pid = int(raw_pid)
-    except (ValueError, OSError):
-        _warn(f"stale migration lock (invalid PID {raw_pid!r}); removing: {lock_path}")
-        lock_path.unlink(missing_ok=True)
-    else:
-        alive = False
-        try:
-            os.kill(existing_pid, 0)
-            alive = True
-        except ProcessLookupError:
-            pass  # process gone → stale lock
-        except PermissionError:
-            alive = True  # process exists, different user
-        except OSError:
-            pass  # other error → assume stale
-
-        if alive:
-            _fail(
-                f"migration already in progress (PID {existing_pid}); "
-                f"remove {lock_path} if the process is gone and retry."
-            )
-            return False
-        _warn(f"stale migration lock (PID {existing_pid} gone); removing: {lock_path}")
-        lock_path.unlink(missing_ok=True)
-
-    # Stale lock cleared — re-attempt the atomic create once. Losing this race
-    # means another process grabbed it in the gap, so we yield to it.
-    if _try_create():
-        return True
-    _fail(
-        f"migration lock contention at {lock_path}; another run won the race — retry."
-    )
     return False
-
-
-def _run_migration(
-    wiki: Path,
-    sentinel: Path,
-    *,
-    dry_run: bool,
-    force: bool,
-) -> int:
-    """Inner migration logic (called inside the PID lock context)."""
-    # ── Idempotency ────────────────────────────────────────────────────────
-    if sentinel.exists() and not force:
-        try:
-            info = json.loads(sentinel.read_text(encoding="utf-8"))
-            migrated_at = info.get("migrated_at", "unknown")
-        except Exception:  # noqa: BLE001
-            migrated_at = "unknown"
-        print(f"corpus already migrated at {migrated_at}. Use --force to re-run.")
-        return 0
-
-    # ── Build plan ─────────────────────────────────────────────────────────
-    plan = _migration_plan(wiki)
-
-    if not plan:
-        if dry_run:
-            print("Nothing to migrate (no OLD-layout paths found).")
-            return 0
-        # Mark as clean even if already on the new layout
-        wiki_hidden_dir(wiki).mkdir(parents=True, exist_ok=True)
-        _write_migration_sentinel(sentinel)
-        _ok("Nothing to migrate (no OLD-layout paths found); sentinel written.")
-        return 0
-
-    # ── Dry-run report ─────────────────────────────────────────────────────
-    if dry_run:
-        print(f"Migration plan for: {wiki}")
-        print()
-        for desc, old, new, is_dir in plan:
-            kind = "dir " if is_dir else "file"
-            print(f"  [{kind}] {_safe_rel(old, wiki)}  →  {_safe_rel(new, wiki)}")
-        print()
-        print("Ledger rewrites (after copy):")
-        print("  archived_to : /_archive/…  →  /_sources/…")
-        print("  logs_dir    : /.runs/…     →  /.wiki/runs/…")
-        print()
-        print("No changes made (--dry-run).")
-        return 0
-
-    # ── Create hidden subtree root ─────────────────────────────────────────
-    wiki_hidden_dir(wiki).mkdir(parents=True, exist_ok=True)
-
-    # ── Phase 1: Copy OLD → NEW ────────────────────────────────────────────
-    # H4: a copy failure (e.g. ENOSPC) must leave OLD intact and exit non-zero;
-    # re-running resumes because every copy is idempotent (guarded file-by-file
-    # copy for dirs; existence check for the single files).
-    print(f"Migrating {wiki} …")
-    print()
-    print("Phase 1/4  copy OLD → NEW")
-    try:
-        for desc, old, new, is_dir in plan:
-            old_rel = _safe_rel(old, wiki)
-            new_rel = _safe_rel(new, wiki)
-            if is_dir:
-                # M1: never clobber a newer/differing target inside the dir.
-                _guarded_copytree(old, new, wiki)
-            else:
-                new.parent.mkdir(parents=True, exist_ok=True)
-                # M1: preserve an existing target file that differs from OLD.
-                if new.exists() and _files_differ(old, new):
-                    _warn(
-                        f"  preserved existing {new_rel} "
-                        f"(differs from OLD {old_rel}; not overwritten)"
-                    )
-                    continue
-                shutil.copy2(str(old), str(new))
-            _ok(f"  {old_rel}  →  {new_rel}")
-    except OSError as e:
-        _fail(f"copy failed: {e}; OLD paths are intact, re-run to resume")
-        return 1
-
-    # ── Phase 2: Ledger key rewrite ────────────────────────────────────────
-    print()
-    print("Phase 2/4  rewrite ledger keys")
-    new_ledger_path = wiki_ledger(wiki)
-    if new_ledger_path.exists():
-        changed, path_field_lines = _rewrite_ledger_keys(new_ledger_path, wiki)
-        _ok(
-            f"  {_safe_rel(new_ledger_path, wiki)}: {changed} line(s) rewritten"
-            f" (archived_to + logs_dir)"
-        )
-        # C1: if the ledger HAS absolute-path fields but NONE matched this
-        # corpus's location, the prefixes are stale (corpus moved/copied since
-        # processing). Deleting _archive/ now would orphan the ledger forever.
-        # Abort BEFORE Phase 3/4 — nothing has been deleted yet; the lock is
-        # still released by migrate()'s finally.
-        if path_field_lines > 0 and changed == 0:
-            _fail(
-                f"Ledger path fields do not match this corpus location "
-                f"(0 of {path_field_lines} rewritten) — aborting to avoid "
-                f"corrupting the ledger. Inspect with --dry-run."
-            )
-            return 1
-    else:
-        _warn("  no ledger found; skipping key rewrite")
-
-    # ── Phase 3: Verify ────────────────────────────────────────────────────
-    print()
-    print("Phase 3/4  verify")
-    failures: list[str] = []
-    for desc, old, new, is_dir in plan:
-        old_rel = _safe_rel(old, wiki)
-        new_rel = _safe_rel(new, wiki)
-        if is_dir:
-            old_count = sum(1 for p in old.rglob("*") if p.is_file())
-            new_count = sum(1 for p in new.rglob("*") if p.is_file())
-            # C2: runs/ holds run-LOGS, not user data. A post-upgrade `weave`
-            # may have already written NEW run-logs into the destination, so the
-            # target legitimately holds MORE files than OLD .runs/. Accept >= for
-            # runs/ only; keep STRICT equality for _sources/, policy, failed.
-            ok = (
-                (new_count >= old_count) if desc == "runs" else (new_count == old_count)
-            )
-            if not ok:
-                failures.append(f"{old_rel}: file count {old_count} ≠ {new_count}")
-            else:
-                _ok(f"  {new_rel}: {new_count} file(s)")
-        elif desc == "ledger":
-            # The ledger is intentionally rewritten (path values change so byte
-            # size differs).  Verify by non-empty entry count instead.
-            old_entries = [
-                ln for ln in old.read_text(encoding="utf-8").splitlines() if ln.strip()
-            ]
-            new_text = new.read_text(encoding="utf-8") if new.exists() else ""
-            new_entries = [ln for ln in new_text.splitlines() if ln.strip()]
-            if len(old_entries) != len(new_entries):
-                failures.append(
-                    f"{old_rel}: entry count {len(old_entries)} ≠ {len(new_entries)}"
-                )
-            else:
-                _ok(f"  {new_rel}: {len(new_entries)} entries")
-        else:
-            old_size = old.stat().st_size
-            new_size = new.stat().st_size if new.exists() else -1
-            if old_size != new_size:
-                failures.append(f"{old_rel}: size {old_size} B ≠ {new_size} B")
-            else:
-                _ok(f"  {new_rel}: {new_size} B")
-
-    if failures:
-        _fail("Verification failed — aborting before any deletion:")
-        for msg in failures:
-            _fail(f"  {msg}")
-        return 1
-
-    # ── Phase 4: Delete OLD ────────────────────────────────────────────────
-    print()
-    print("Phase 4/4  delete OLD paths")
-    for desc, old, new, is_dir in plan:
-        old_rel = _safe_rel(old, wiki)
-        if is_dir:
-            shutil.rmtree(str(old))
-        else:
-            old.unlink()
-        _ok(f"  deleted {old_rel}")
-
-    # ── Sentinel ───────────────────────────────────────────────────────────
-    _write_migration_sentinel(sentinel)
-    print()
-    _ok(f"Migration complete. Sentinel: {_safe_rel(sentinel, wiki)}")
-    ensure_obsidian_ready(wiki)
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# ask -- read the compiled wiki and answer a question (Phase B)
-# ---------------------------------------------------------------------------
-#
-# MECHANISM (structural, not instructional): the spawned agent's tools are
-# constrained in engine_runner.make_ask_spawn_fn so it structurally cannot
-# write files or fetch from the web — only read within the wiki directory.
-# This forces grounding in wiki content and makes fail-loud-on-absent the
-# natural outcome (the agent can't pull from elsewhere).
-
-
-def ask(
-    wiki: str | Path = ".",
-    question: str = "",
-    *,
-    json_out: bool = False,
-) -> int:
-    """Answer a question by reading the compiled wiki (no embeddings)."""
-    import json as _json
-
-    wiki_path = Path(wiki).resolve()
-    if not wiki_path.is_dir():
-        _fail(f"wiki dir not found: {wiki_path}")
-        return 1
-
-    from wiki_weaver.engine_runner import run_ask
-
-    _warn(f"asking wiki at {wiki_path!r}: {question!r}")
-    try:
-        result = run_ask(wiki_path, question)
-    except Exception as e:  # noqa: BLE001
-        _fail(f"ask error: {type(e).__name__}: {e}")
-        return 1
-
-    if json_out:
-        print(
-            _json.dumps(
-                {
-                    "answer": result.answer,
-                    "pages_used": result.pages_used,
-                    "refused": result.refused,
-                },
-                indent=2,
-            )
-        )
-    else:
-        print(result.answer)
-        if result.pages_used:
-            print(f"\nPages consulted: {', '.join(result.pages_used)}")
-    return 0

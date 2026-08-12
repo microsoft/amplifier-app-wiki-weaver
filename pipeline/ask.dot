@@ -1,12 +1,225 @@
-digraph ask_wiki {
-    graph [goal="Answer question from compiled wiki", default_fidelity="compact"]
-    start [shape=Mdiamond, label="Start"]
-    answer [
-        label="Read wiki and answer",
-        llm_provider="anthropic",
-        llm_model="claude-sonnet-4-6",
-        prompt="You are a wiki reader. Answer the question ONLY from the compiled wiki.\n\nWIKI DIRECTORY: $wiki_dir\nQUESTION: $question\n\nPROCEDURE — follow in order:\n1. Read $wiki_dir/index.md to find pages relevant to the question.\n2. Read $wiki_dir/overview.md to understand the wiki scope.\n3. Read the 2-3 most relevant pages from the index.\n4. Follow [[wikilinks]] in those pages (up to 2 hops) for related content.\n5. Read $sources_json to resolve source IDs to author+URL for citations.\n\nANSWER RULES:\n  COVERED: Write a direct cited answer. Name every wiki page used.\n  Cite as [Author, URL] from .sources.json; cite by page name if no\n  author/URL is available.\n  NOT COVERED: Say EXACTLY: \"The wiki does not cover '$question'. Pages consulted: [list pages you read].\"\n  Do NOT use training knowledge. Do NOT refuse silently. FAIL LOUD.\n  PARTIAL: State clearly what IS and what IS NOT covered.\n  Ground EVERY claim in wiki content you actually read. No fabrication.\n\nREQUIRED OUTPUT STEP (mandatory — do this last, after your reasoning):\nWrite a JSON file to exactly this path: $answer_file\nThe file content must be a single JSON object:\n{\"answer\": \"<full answer text>\", \"pages_used\": [\"page.md\"], \"refused\": false}\nFor refused: set refused=true, list examined pages in the answer field.\nThe file MUST be written before you finish — this is how your answer is captured."
-    ]
-    done [shape=Msquare, label="Done"]
-    start -> answer -> done
+// =============================================================================
+// ask.dot -- wiki-weaver v2 : read-only question answering
+// =============================================================================
+//
+// PURPOSE
+//   Answer a question against the existing wiki, index-first, with citations,
+//   and refuse loudly rather than guess when the index does not cover the
+//   question.
+//
+// DOES NOT
+//   - Files good answers back into the wiki BY DEFAULT (gist L52, bolded:
+//     "good answers can be filed back into the wiki as new pages"). This was
+//     previously an OFF-BY-DEFAULT branch, citing a measurement that filing
+//     answers back "produced no measurable benefit." That measurement was
+//     n=10 fact-retrieval questions on a blind judge, and FINDINGS.md §6
+//     already concedes the method: "We measured fact retrieval and called it
+//     synthesis... Nearly circular." The evidence used to retire the gist's
+//     bolded, primary synthesis-compounding channel came from a test that
+//     admits it was blind to synthesis. Restored to on, with an explicit
+//     opt-OUT (--param enable_file_back=false) for anyone who wants it off.
+//   - Does not fabricate an answer when coverage is thin -- refuse is a
+//     first-class outcome, decided by WHICH FILE the LLM actually wrote
+//     (see coverage_check below), not by an LLM-claimed boolean.
+//
+// REAL INVOCATION
+//   python3 -m wiki_weaver.aitl.run pipeline/ask.dot \
+//     --param wiki_root=/srv/wikis/acme \
+//     --param question="who owns the migration runbook?" \
+//     --cwd /srv/wikis/acme \
+//     --gate-mode console
+//   # file-back is ON by default; pass --param enable_file_back=false to opt out.
+//   # NOTE: `--cwd` is the WIKI ROOT (where tool nodes write), which is
+//   # deliberately NOT this pipeline file's own directory -- see file_back's
+//   # comment below for why dot_file resolution needs `wiki_weaver.aitl.run`
+//   # (or an equivalent caller that supplies `--param dot_source_dir=...`)
+//   # rather than the bare `attractor` CLI.
+//
+// REQUIRED CONTEXT VARS
+//   wiki_root          -- filesystem root of the wiki (REQUIRED)
+//   question           -- the question text (REQUIRED). Safe to substitute
+//                          directly into a PROMPT (an LLM read, not a shell);
+//                          passed to load_index's tool_command via tool_env,
+//                          never inline-substituted into that shell string.
+//   enable_file_back   -- (optional, default: true) opt-OUT flag; set to
+//                          "false" to skip the file-back branch entirely --
+//                          the human/proxy is then never even asked, because
+//                          there is nothing worth asking about. See the
+//                          DOES NOT section above for why the default is on.
+//
+// ARTIFACTS AND GUARDS
+//   .ai/candidate-pages.json -- EPHEMERAL: index-first candidate page set,
+//                                written by load_index, read by answer with
+//                                its own file tools (never $substituted).
+//   .ai/answer.md            -- EPHEMERAL: written ONLY when answer decides
+//                                coverage supports a cited answer.
+//   .ai/refusal.md           -- EPHEMERAL: written ONLY when answer decides
+//                                coverage is too thin. Exactly one of
+//                                answer.md / refusal.md exists after answer
+//                                runs -- coverage_check routes on WHICH FILE
+//                                exists (a deterministic, code-tier check),
+//                                replacing an LLM-set "context.covered"
+//                                boolean that prose alone cannot reliably set.
+//
+//   This pipeline has no resume/idempotency concerns of its own -- it never
+//   mutates the wiki on the default path. The ONE mutating branch
+//   (file_back) delegates entirely to ingest.dot's own resume doctrine: see
+//   pipeline/ingest.dot's header. prepare_injection's only job is to place a
+//   new immutable file under sources/ and scope restrict_to_sources to it.
+// =============================================================================
+
+digraph wiki_weaver_v2_ask {
+  graph [
+    goal="Answer a question from the existing wiki, index-first, with citations, refusing loudly on thin coverage",
+    label="ask.dot -- read-only",
+    params="wiki_root, question, enable_file_back",
+    max_pipeline_duration="5m",
+    default_max_retry=1,
+    default_fidelity="full"
+  ]
+  rankdir=LR
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
+
+  start [shape=Mdiamond, label="question asked"]
+  exit  [shape=Msquare,  label="answered or refused"]
+
+  // Free text -> env var, never inline shell substitution.
+  load_index [
+    shape=parallelogram,
+    label="load_index\n(index-first read:\ncandidate pages + coverage estimate)",
+    tool_env="question,py",
+    tool_command="$py -m wiki_weaver.ask.load_index --wiki-root \"$wiki_root\" --out .ai/candidate-pages.json"
+  ]
+
+  // $question is a plain --param key: safe and correct to expand directly in
+  // a PROMPT (an LLM read, not a shell command) -- the shell-injection
+  // concern only applies to tool_command strings.
+  answer [
+    shape=box,
+    label="answer\n(hybrid: wiki for orientation,\nsources for the words;\nrefuse rather than guess)",
+    prompt="Answer \"$question\" using the HYBRID method. Read .ai/candidate-pages.json with your file tools to locate the wiki pages most relevant to the question, then read those pages -- this is your orientation layer: it reliably tells you WHERE something lives and THAT it happened. Each candidate entry also lists cited_sources (source files that page cites, already extracted for you); also check the page's own frontmatter sources: field and any inline NNN-Name.md citations in its body in case a citation was missed. Then read those cited files under sources/ -- this is your source of truth: it reliably preserves WHY, EXACTLY HOW, and IN WHAT WORDS, which the wiki compresses away. Do not answer from the wiki alone; follow its citations into the raw transcripts before writing anything. WARNING -- quiet omission: a wiki page reading as complete is NOT evidence its source has nothing more. A page has been observed to state nothing false while dropping the one sentence that changes the meaning (e.g. a page said only 'as X requested'; the cited source's actual line was an explicit instruction not to build something at all). Always check the source for the operative clause the wiki may have summarized away. WARNING -- anonymized speakers: if a page attributes a position to an anonymized label (e.g. '@1', '@2'), you MUST confirm the real name from the cited source before naming anyone in your answer -- never name someone the source doesn't. The cited-source set is a STARTING POINT, NOT A BOUNDARY: the wiki's citations reflect what it happened to record, not everything the corpus holds on your question. If the cited sources do not settle the question, SEARCH sources/ MORE BROADLY (grep for the key names, phrases, and dates) before you conclude anything. NEVER assert a negative -- 'the sources do not record X', 'no such instruction exists' -- on the strength of a partial search; either search the whole of sources/ for it, or say plainly that you did not find it in the sources you read and name which ones those were. Every claim in your answer must cite BOTH the wiki page and the source file(s) it came from. If neither the candidate pages nor the sources they cite actually cover what is being asked, do NOT guess or extrapolate. ANTI-INVENTION CONTRACT: once you have settled on what your answer is going to conclude, do not manufacture the connective tissue to justify it. Only assert what a named source ACTUALLY SAYS, in its own words or a faithful paraphrase of them -- a claim that is merely CONSISTENT WITH a source is not a claim that source MAKES, and presenting the former as the latter is fabrication even when every individual fact you cite is real. A real audited failure asserted a source argued its point 'regardless of model version' -- that exact phrase was absent from the source, and the source never mentioned models at all; it was not a guess about something unknown, it was invented support bolted onto a conclusion already reached. 'The sources do not say X' and 'X is a plausible detail I can supply so the answer reads as complete' are not the same move, and only the first is allowed: if a mechanism, qualifier, or elaborating detail is not in the sources you read, say plainly that it is not there rather than supplying one. ANCHOR CONTRACT: content being real is only half of a citation -- the other half is that it belongs to the source, speaker, and date you attach it to. Before you attribute a quote, a framing, a decision, or a position, confirm it in the specific source you are about to cite, not merely somewhere in the corpus: open that source and find it there. Two real failures, both of which passed a content check and still misinformed the reader: a framing that genuinely exists in one meeting was attributed to a different meeting on a different date, and a verbatim quote by one named person was attributed to a different named person who also appears in the corpus. In both the words were real and the anchor was wrong, which is worse than vagueness because it manufactures a false record of who said what and when. When several sources cover the same material, cite the one you actually read it in. If you cannot confirm which source, speaker, or date a claim belongs to, state the claim without the attribution and say the anchor is unconfirmed rather than choosing the most plausible candidate. An answer with an honest, visible gap beats a complete-looking answer with one fabricated detail -- that failure is not scored by how small or plausible the invented detail looks, it is a hard failure regardless of size. As your final action, write to EXACTLY ONE of these two files (never both): .ai/answer.md if you can answer with citations, or .ai/refusal.md (explaining what was searched and why it falls short) if coverage is too thin."
+  ]
+
+  // Deterministic, code-tier: routes on WHICH FILE exists, not on an
+  // LLM-claimed "covered" flag that prose cannot reliably set.
+  coverage_check [
+    shape=parallelogram,
+    label="coverage_check\n(routes on which file answer\nactually wrote, and whether\nit has CONTENT)",
+    tool_command="test -s .ai/answer.md && printf covered || { test -s .ai/refusal.md && printf thin || printf broken; }"
+  ]
+
+  // Reads the file directly -- the answer text never transits a
+  // $substitution token.
+  present [
+    shape=parallelogram,
+    label="present\n(format answer + citations,\nreads .ai/answer.md directly)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ask.present --answer-file .ai/answer.md"
+  ]
+
+  // Neither artifact written -- the answer node violated its own
+  // write-to-exactly-one-file contract. Loud stop, never a silent pass.
+  answer_broken [
+    shape=parallelogram,
+    label="answer_broken\n(LOUD: answer node wrote\nneither artifact)",
+    tool_command="echo 'FATAL: answer node wrote neither .ai/answer.md nor .ai/refusal.md (or wrote an empty file). This is a contract violation, not thin coverage.' >&2; exit 1"
+  ]
+
+  refuse [
+    shape=parallelogram,
+    label="refuse\n(loud: state what was\nsearched and why it's thin)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ask.refuse --loud --refusal-file .ai/refusal.md"
+  ]
+
+  // THE FIX (see the task that commissioned this node): file_back_gate has
+  // been reachable since this pipeline was built, but has never once been
+  // exercised -- it carried NOTHING but a bare node label, the exact
+  // vacuum every other gate in this project had before it got a brief
+  // (review_gate, takeaways_gate, collect_guidance). An agent proxy
+  // answering cold has no grounds to judge whether THIS answer is worth
+  // filing back, and correctly refuses rather than fabricate a judgment.
+  // Deterministic (no model call): reads the question and the answer
+  // present.py just formatted, states plainly what [A] actually does.
+  prepare_file_back_brief [
+    shape=parallelogram, penwidth=2,
+    label="prepare_file_back_brief\n(self-contained brief for\nfile_back_gate: question + answer gist)",
+    parse_json="true",
+    tool_env="question,py",
+    tool_command="$py -m wiki_weaver.ask.file_back_brief --wiki-root \"$wiki_root\" --answer-file .ai/answer.md"
+  ]
+
+  // file_back_gate is reached BY DEFAULT (enable_file_back unset resolves to
+  // "" which is != "false") -- routing directly on the operator-supplied
+  // param, no diamond no-op needed. Pass enable_file_back=false to opt out.
+  file_back_gate [
+    shape=hexagon,
+    label="file_back_gate\n(human or proxy --\nskipped only if opted out)",
+    description="$file_back_brief"
+  ]
+
+  // Deterministic: registers the answer as a new immutable file under
+  // sources/, and scopes restrict_to_sources to just that id via parse_json
+  // (a full context clone -- see ingest.dot's header -- makes this key
+  // visible inside the child pipeline automatically).
+  prepare_injection [
+    shape=parallelogram,
+    label="prepare_injection\n(write answer as a new\nsources/ file; scope\nrestrict_to_sources to it)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ask.prepare_file_back --wiki-root \"$wiki_root\" --answer-file .ai/answer.md"
+  ]
+
+  // THE FIX (measured defect): a bare relative dot_file resolves against
+  // whatever the ENGINE'S root graph.source_dir happens to be -- which is
+  // NEVER set for the top-level pipeline by either the `attractor` CLI or
+  // amplifier_module_pipeline_runner.runner.run_pipeline (only CHILD graphs
+  // get one, derived from their own resolved path -- confirmed by reading
+  // amplifier_module_loop_pipeline.handlers.pipeline.resolve_dot_path and
+  // PipelineHandler.execute). With no source_dir, resolution falls back to
+  // context.target_dir (== --cwd) -- but --cwd here is deliberately the
+  // WIKI ROOT (see header), not this pipeline file's own directory, so a
+  // bare "ingest.dot" 404s the moment --cwd != the pipeline/ directory
+  // (i.e. always, in real use). This is a defect in the vendored engine's
+  // public API (no seam exists to set the root graph's source_dir from
+  // outside it) -- not fixable without editing amplifier-bundle-attractor.
+  // `$dot_source_dir` is a bare $var (never the shell-default brace form,
+  // per this project's own substitution convention) that `wiki_weaver.aitl.run`
+  // injects automatically, set to THIS FILE's own resolved directory --
+  // resolve_dot_path expands it BEFORE the source_dir/cwd fallback and
+  // returns an absolute path as-is, bypassing the broken fallback
+  // entirely. Run via `python3 -m wiki_weaver.aitl.run`, never the bare
+  // `attractor` CLI, for this to resolve (see header's REAL INVOCATION).
+  file_back [
+    shape=folder,
+    dot_file="$dot_source_dir/ingest.dot",
+    label="file_back\n(ingest.dot, answer\ntreated as a synthetic source)"
+  ]
+
+  start -> load_index
+  load_index -> answer
+  answer -> coverage_check
+
+  coverage_check -> present [condition="context.tool.last_line=covered"]
+  coverage_check -> refuse  [condition="context.tool.last_line=thin"]
+  // PIPELINE_DESIGN_PRINCIPLES.md S6: distinguish "confident FAIL" (evidence
+  // supports refusal) from "could not determine" (node wrote nothing). Conflating
+  // them tells the user "sources are thin" when the truth is "the node produced
+  // no output this pass". EXTENSIONS.md: fail loud, do not proceed in a lesser state.
+  coverage_check -> answer_broken [condition="context.tool.last_line=broken"]
+
+  refuse -> exit
+
+  present -> prepare_file_back_brief [condition="context.enable_file_back!=false"]
+  present -> exit                    [condition="context.enable_file_back=false"]
+
+  prepare_file_back_brief -> file_back_gate
+
+  // Hexagon multiple-choice: unconditional edges, distinct targets.
+  file_back_gate -> prepare_injection [label="[A] File this answer back into the wiki"]
+  file_back_gate -> exit              [label="[B] No, just answered"]
+
+  prepare_injection -> file_back
+  file_back -> exit
 }

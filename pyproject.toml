@@ -4,71 +4,25 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wiki-weaver"
-version = "0.1.0"
-description = "LLM-wiki ingest pipeline driven by the attractor engine."
+version = "2.0.0"
+description = "wiki-weaver v2 -- deterministic ingest pipeline for the attractor engine"
+readme = "docs/DESIGN.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
-authors = [{name = "Microsoft Corporation"}]
-# Runtime libraries are declared as git deps so `uv tool install git+...` resolves
-# them into the isolated tool venv (uv tool venvs do NOT share another tool's site
-# packages). Tracked at @main ON PURPOSE: wiki-weaver is a COMPANION to an installed
-# Amplifier ecosystem and must stay in lockstep with it, not pinned to a stale commit.
-#
-# RUNTIME PREREQUISITE (not satisfied by these deps): an Amplifier installation
-# (amplifier-app-cli) for ~/.amplifier config + API keys + the warm bundle cache the
-# attractor engine loads on first ingest. `wiki-weaver doctor` verifies all of this.
-dependencies = [
-    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
-    "amplifier-unified-llm-client @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/unified-llm-client",
-    # Shared engine-driving library (drive_engine/run_pipeline + spawn wiring)
-    # that engine_runner.py delegates to -- see wiki_weaver/engine_runner.py's
-    # module docstring for the split of responsibilities.
-    "amplifier-module-pipeline-runner @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/pipeline-runner",
-    "tinycss2>=1.0",
-    "markdown>=3.0",
-]
+dependencies = []
 
-[project.urls]
-Repository = "https://github.com/microsoft/amplifier-app-wiki-weaver"
-
-# Dev-only tooling (PEP 735 dependency group). Installed by default with
-# `uv sync` / `uv run`, so the project venv has the test runner alongside the
-# real runtime deps (tinycss2 + markdown). The canonical test command is:
-#
-#     uv run pytest eval/ -q
-#
-# which runs the FULL deterministic eval suite with tinycss2 ACTIVE (the CSS
-# sanitizer's dependency). pytest-asyncio is declared because parts of the
-# broader eval suite use async tests.
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "pyyaml>=6",
-    # Not a runtime dep -- needed only so eval/test_hatch_build.py can import
-    # the real hatchling.builders.hooks.plugin.interface.BuildHookInterface
-    # that hatch_build.py's build hook subclasses.
-    "hatchling>=1.28.0",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["eval"]
-asyncio_mode = "auto"
-
-[project.scripts]
-wiki-weaver = "wiki_weaver.cli:main"
-
-[tool.hatch.metadata]
-# Required so hatchling will build a wheel whose dependencies use direct git URLs.
-allow-direct-references = true
-
-[tool.hatch.build.hooks.custom]
-# Bakes a git-derived version (commit date + short SHA) into
-# wiki_weaver/_version.py at wheel-build time -- see hatch_build.py.
-path = "hatch_build.py"
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["wiki_weaver"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"pipeline" = "wiki_weaver_pipeline"
+[tool.pytest.ini_options]
+testpaths = ["eval"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pyright]
+include = ["wiki_weaver", "eval"]
+pythonVersion = "3.11"

@@ -1,0 +1,95 @@
+// wiki-weaver — BEFORE vs AFTER, and what we tried and rejected.
+// Every number here is blind-graded, 10 cross-source questions, 110 real transcripts.
+digraph wiki_weaver_diff {
+  rankdir=LR
+  fontname="Helvetica"
+  labelloc="t"
+  label=<<b>wiki-weaver — before / after / rejected</b><br/>
+         <font point-size="11">9 arms measured. The 2 that won were prompt-only.<br/>
+         Every structural intervention did nothing or backfired.</font><br/> >
+  node [fontname="Helvetica", fontsize=10, style=filled, shape=box]
+  edge [fontname="Helvetica", fontsize=9]
+
+  // ============================================================ BEFORE
+  subgraph cluster_before {
+    label="BEFORE (v1)   rubric 2.40 · +0.30 over raw"
+    style=filled fillcolor="#f7eaea" color="#a04040" fontname="Helvetica-Bold" fontsize=12
+
+    b_route [fillcolor="#f0d0d0", color="#a04040",
+             label="BM25 strength gate\ncreate page only if\ntop_score <= 0.0"]
+    b_weave [fillcolor="#f0d0d0", color="#a04040",
+             label="weave\nsees only top-k slice.\nno knowledge of what exists"]
+    b_ask   [fillcolor="#f0d0d0", color="#a04040",
+             label="ask\n'using ONLY the pages listed…\ndo not read any other page'"]
+    b_out   [shape=note, fillcolor="#e8c0c0", color="#a04040",
+             label="14 pages · 1.56 MB\nmax page 319 KB\n100 sources → 3 new pages"]
+
+    b_route -> b_weave -> b_out
+    b_ask -> b_out [style=invis]
+  }
+
+  verdict_b [shape=plaintext, fontsize=11, fontcolor="#a04040",
+             label=<<b>barely better than<br/>having no wiki at all</b>>]
+  b_out -> verdict_b [style=invis]
+
+  // ============================================================ AFTER
+  subgraph cluster_after {
+    label="AFTER (now)   rubric 3.60 · +1.80 over raw"
+    style=filled fillcolor="#eaf7ea" color="#2d7a2d" fontname="Helvetica-Bold" fontsize=12
+
+    a_cat  [fillcolor="#c4e8c4", color="#2d7a2d",
+            label="build_catalog\nweave sees EVERY page.\ncreate/update is its call"]
+    a_dis  [fillcolor="#ffd9a0", color="#cc7a00", penwidth=3,
+            label=<<b>DISAGREEMENT CONTRACT</b><br/>
+                   <font point-size="9">record who objected +<br/>resolved / dropped / open</font><br/>
+                   <font point-size="10" color="#008000"><b>+1.20</b></font>>]
+    a_hyb  [fillcolor="#ffd9a0", color="#cc7a00", penwidth=3,
+            label=<<b>HYBRID ASK</b><br/>
+                   <font point-size="9">wiki locates → follow citations<br/>→ answer from transcripts</font><br/>
+                   <font point-size="10" color="#008000"><b>+1.80</b></font>>]
+    a_out  [shape=note, fillcolor="#c4e8c4", color="#2d7a2d",
+            label="16 pages · 2.22 MB\nmax page 431 KB\nscale penalty 1.10 → 0.10"]
+
+    a_cat -> a_dis -> a_out -> a_hyb
+  }
+
+  verdict_a [shape=plaintext, fontsize=11, fontcolor="#2d7a2d",
+             label=<<b>automated compilation now beats<br/>the hand-scale reference (3.50)</b>>]
+  a_hyb -> verdict_a [style=invis]
+
+  // ============================================================ REJECTED
+  subgraph cluster_rejected {
+    label="TRIED AND REJECTED — measurement said no"
+    style=filled fillcolor="#f2f2f2" color="#888888" fontname="Helvetica-Bold" fontsize=12
+
+    r1 [fillcolor="#e0e0e0", color="#888888", fontcolor="#555555",
+        label="byte-split + siblings\n3.00 · splitting severs a\nposition/counter-position block"]
+    r2 [fillcolor="#e0e0e0", color="#888888", fontcolor="#555555",
+        label="disagreement + split\n3.00 · −0.40 vs disagreement\nalone. levers are NOT additive"]
+    r3 [fillcolor="#e0e0e0", color="#888888", fontcolor="#555555",
+        label="THREADING clause\n3.10 · cannibalized the winner:\nDisagreement headings 1.05→0.47/src"]
+    r4 [fillcolor="#e0e0e0", color="#888888", fontcolor="#555555",
+        label="compounding at scale\nrefuted twice (n=8, n=110)\nquality FALLS as corpus grows"]
+    r1 -> r2 [style=invis]
+    r3 -> r4 [style=invis]
+  }
+
+  // ============================================================ TRANSITIONS
+  b_route -> a_cat [label="  DELETED the gate\n  −1 node, −1 edge  ",
+                    color="#2d7a2d", penwidth=2, fontcolor="#2d7a2d"]
+  b_weave -> a_dis [label="  + 1 paragraph\n  in the prompt  ",
+                    color="#cc7a00", penwidth=3, fontcolor="#cc7a00"]
+  b_ask   -> a_hyb [label="  the design error:\n  wiki-only was never\n  what the gist describes  ",
+                    color="#cc0000", penwidth=3, fontcolor="#cc0000"]
+
+  // ============================================================ LESSON
+  lesson [shape=note, fillcolor="#fff8d0", color="#b08a00", fontsize=11,
+          label=<<b>What generalizes</b><br align="left"/>
+                 <br align="left"/>
+                 1. The loss was at <b>WRITE</b> time, not retrieval.<br align="left"/>
+                 2. Sources are truth — the wiki <b>navigates</b>, it does not replace.<br align="left"/>
+                 3. Prompt contracts beat structure, every time we measured.<br align="left"/>
+                 4. Two winning levers <b>fought</b> each other. Test combinations.<br align="left"/>
+                 5. Pre-commit the rollback bar <i>before</i> the run.<br align="left"/> >]
+  verdict_a -> lesson [style=invis]
+}

@@ -1,12 +1,149 @@
-digraph init_wiki {
-    graph [goal="Design a domain-adaptive schema for a new wiki"]
-    start [shape=Mdiamond, label="Start"]
-    design_schema [
-        label="Design Domain Schema",
-        llm_provider="anthropic",
-        llm_model="claude-sonnet-4-6",
-        prompt="You are designing the SCHEMA for a domain-specific, LLM-maintained wiki — the\nconfiguration file that makes an LLM a disciplined wiki maintainer for THIS domain\n(the Karpathy \"LLM wiki\" pattern). You design STRUCTURE, not content. Do NOT invent\nfacts about the domain.\n\nPURPOSE OF THIS WIKI (its intended use and the outcomes it must serve):\n$purpose\n\nSAMPLE OF REAL SOURCE MATERIAL that will be ingested (may be empty — if empty, design\nfrom the purpose alone):\n$source_sample\n\nGENERIC DEFAULT SCHEMA (the domain-agnostic baseline — adapt it: keep what works,\nchange what this domain and these outcomes actually need):\n$default_schema\n\nDesign a schema TAILORED to this wiki's purpose and desired outcomes. Write the\ncomplete schema to `$wiki_dir/.wiki/policy/schema.md`. It MUST define:\n1. PAGE TYPES — a domain-fit `type:` taxonomy chosen to serve the stated outcomes.\n   Do NOT reflexively keep concept/entity/comparison/synthesis if this domain wants\n   different page types (e.g. a team-decisions wiki may want decision/workstream/owner\n   pages; a tool-landscape wiki may want tool/technique/comparison pages).\n2. FRONTMATTER CONTRACT — required fields (MUST include title, type, sources) plus any\n   domain-useful optional fields that serve the outcomes (e.g. decision_date, owner,\n   status, confidence).\n3. CONVENTIONS — [[wikilink]] linking, how to record contradictions / \"open tensions\",\n   no-orphan and no-dangling-link rules.\n4. NAV PAGES — KEEP `index.md` and `overview.md` as the required navigation pages (do\n   NOT rename them). Describe what each should contain for THIS domain.\n5. INGEST & QUERY GUIDANCE — how a new source should be integrated, and how the wiki\n   should be queried, both oriented to the desired outcomes.\n\nMake it specific: a reader should see what THIS wiki does better than a generic one.\nOutput ONLY the schema file content to the path above."
-    ]
-    done [shape=Msquare, label="Done"]
-    start -> design_schema -> done
+// =============================================================================
+// init.dot -- wiki-weaver v2 : interview loop (NOT a one-shot form)
+// =============================================================================
+//
+// PURPOSE
+//   Establish a brand-new wiki instance by interviewing the human (or proxy)
+//   until there is enough signal to (a) write the AGENTS.md schema and
+//   (b) seed lens/persona.md + lens/canon/. Same shape as attractor's
+//   conversational-gate pattern: ask -> evaluate -> enough? -> loop OR proceed.
+//
+// DOES NOT
+//   - Does not write a single word of AGENTS.md or lens/ content until the
+//     interviewer has actually converged (or the bound is hit).
+//   - Does not validate ingest-time behavior -- that is ingest.dot's job.
+//   - Does not require an imported prior lens -- optional input, not a
+//     precondition.
+//
+// REAL INVOCATION
+//   attractor run pipeline/init.dot \
+//     --param wiki_root=/srv/wikis/acme \
+//     --param max_interview_rounds=5 \
+//     --cwd /srv/wikis/acme \
+//     --on-human-gate console
+//
+// REQUIRED CONTEXT VARS
+//   wiki_root             -- filesystem root where AGENTS.md and lens/ will
+//                             be written (REQUIRED, no sensible default)
+//   import_lens_from      -- (optional) path to a prior wiki instance's
+//                             lens/ directory, read directly by write_schema
+//                             with its own file tools -- never substituted
+//   max_interview_rounds  -- (optional, default: 5) loop bound
+//
+// ARTIFACTS AND GUARDS
+//   .ai/interview-notes.md  -- EPHEMERAL: accumulating record of every round's
+//                              answer, appended by capture_notes. Deleted by
+//                              persist once AGENTS.md/lens/ are durable.
+//   .ai/init-verdict.txt    -- EPHEMERAL: evaluate's one-word verdict file
+//                              ("enough" | "not_enough"), consumed and
+//                              rm -f'd by read_verdict so a stale verdict can
+//                              never leak into the next round.
+//   .ai/bound-hit.flag      -- EPHEMERAL: written only when the interview
+//                              bound is hit before genuine convergence; tells
+//                              write_schema to mark AGENTS.md as best-effort.
+//   AGENTS.md, lens/        -- COMMITTED. The durable product of this pipeline.
+//
+//   interview_rounds is an IN-CONTEXT counter (no disk file): fresh on every
+//   `attractor run` invocation, which is the correct scope for "how many
+//   rounds has THIS init session asked" -- no rewind command needed.
+//
+//   REWIND: to force a fresh interview even though AGENTS.md/lens/ already
+//   exist, just re-run `attractor run pipeline/init.dot` in a wiki_root that
+//   doesn't yet have AGENTS.md -- init.dot has no resume guard of its own
+//   because it is a one-shot setup pipeline, not a repeating drain loop.
+// =============================================================================
+
+digraph wiki_weaver_v2_init {
+  graph [
+    goal="Interview until there is enough signal to write AGENTS.md and seed lens/, then stop",
+    label="init.dot -- interview loop",
+    params="wiki_root, import_lens_from, max_interview_rounds",
+    max_pipeline_duration="30m",
+    default_max_retry=2,
+    default_fidelity="full"
+  ]
+  rankdir=LR
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
+
+  start [shape=Mdiamond, label="init requested"]
+  exit  [shape=Msquare,  label="wiki initialized"]
+
+    // FAIL-LOUD GUARD (verified defect, 2026-07-25): attractor's
+    // AutoApproveInterviewer.ask() on a FREEFORM question falls through and returns
+    // the literal string "auto-approved". This gate's text flows into a
+    // human-authored layer, so accepting that stub would poison it. The capture
+    // tool downstream MUST reject the literal "auto-approved" and exit non-zero
+    // (hard pipeline failure) rather than persist it. A gate that cannot be
+    // answered must STOP the run, never invent an answer.
+  ask [
+    shape=hexagon, penwidth=2,
+    mode="freeform",
+    label="ask\n(freeform: purpose,\nsample sources,\noptional prior lens)",
+    prompt="A brand-new wiki is being established. Answer, in your own words: (1) What is this wiki for -- what question should it answer for its reader? (2) What kinds of sources will it draw from? Name a few representative examples. (3) If a prior wiki instance exists whose lens/persona should be imported, name it; otherwise say none. Answer only what you can ground; say so plainly for any part you cannot."
+  ]
+
+  // Free text -> file via tool_env, never inline shell substitution.
+  capture_notes [
+    shape=parallelogram,
+    label="capture_notes\n(append this round's answer\nto the accumulating notes file)",
+    tool_env="human.gate.text,py",
+    tool_command="$py -m wiki_weaver.init.capture_notes --out .ai/interview-notes.md"
+  ]
+
+  // Tier 2 verdict pattern: the LLM writes a plain-word verdict to a file;
+  // a downstream tool greps it and emits the routing sentinel. Prose like
+  // "set context.enough to true" sets nothing -- this is what actually works.
+  evaluate [
+    shape=box,
+    label="evaluate\n(enough to write\nschema + lens seed?)",
+    prompt="Read .ai/interview-notes.md (and, if $import_lens_from is set, the prior lens directory at that path) with your file tools. Decide whether there is enough information to (a) write an AGENTS.md schema and (b) seed lens/persona.md and lens/canon/. Write your verdict, as your final action, to exactly one file .ai/init-verdict.txt containing exactly one word: enough or not_enough. If enough, also write draft content to .ai/draft-schema.md and .ai/draft-persona.md so write_schema does not have to re-derive them from scratch."
+  ]
+
+  read_verdict [
+    shape=parallelogram,
+    label="read_verdict\n(grep the verdict file,\nfail-closed to not_enough,\nrm -f the file)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.init.read_verdict --verdict-file .ai/init-verdict.txt"
+  ]
+
+  check_bound [
+    shape=parallelogram,
+    label="check_bound\n(in-context round counter,\nno disk file)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.init.check_bound --count \"$interview_rounds\" --max-rounds \"$max_interview_rounds\""
+  ]
+
+  write_schema [
+    shape=box,
+    label="write_schema\n(AGENTS.md +\nlens/persona.md +\nlens/canon/ skeleton)",
+    prompt="Read .ai/interview-notes.md, .ai/draft-schema.md, and .ai/draft-persona.md if present (and $import_lens_from if set) with your file tools. Write: (1) the AGENTS.md schema describing what this wiki tracks and how it is organized, (2) lens/persona.md describing the proxy persona for this wiki's human-or-proxy gates -- it MUST use exactly these five '##' headings, each with real content grounded in the interview notes (this exact structure is checked deterministically by wiki_weaver.aitl.persona before the proxy will ever answer a gate from it): '## Identity' (who the proxy stands in for; this wiki's purpose), '## Capability floor' (what it may decide vs. what it must refuse), '## Hard constraints' (things it must always/never do), '## Refusal script' (when and how it declines rather than guesses), '## What \"done\" means' (how it knows an answer is grounded enough to act on); (3) a starter lens/canon/ skeleton (empty canon docs with headings, ready for the human to fill in). If .ai/bound-hit.flag exists, note explicitly at the top of AGENTS.md that this schema is a best-effort draft because the interview bound was reached before genuine convergence, then delete that file."
+  ]
+
+  // Strategy SF: write_schema already did the actual file edits with its own
+  // file tools. persist's only job is the deterministic, idempotent part --
+  // git init if needed, commit if there is anything staged, clean up the
+  // ephemeral .ai/ breadcrumbs that are no longer needed once AGENTS.md and
+  // lens/ are durable.
+  persist [
+    shape=parallelogram,
+    label="persist\n(git init + commit if needed;\nclean up ephemeral .ai/ files)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.init.persist --wiki-root \"$wiki_root\""
+  ]
+
+  start -> ask
+  ask -> capture_notes
+  capture_notes -> evaluate
+  evaluate -> read_verdict
+
+  read_verdict -> write_schema [condition="context.tool.last_line=enough"]
+  read_verdict -> check_bound  [condition="context.tool.last_line=not_enough"]
+
+  check_bound -> write_schema [label="bound hit -- proceed\nwith best-available info", condition="context.bound_status=hit"]
+  check_bound -> ask          [label="loop", condition="context.bound_status=ok", loop_restart="true"]
+
+  write_schema -> persist
+  persist -> exit
 }

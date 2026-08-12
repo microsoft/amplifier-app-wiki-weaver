@@ -1,0 +1,161 @@
+// =============================================================================
+// correct.dot -- wiki-weaver v2 : natural-language correction -> targeted
+//                 reprocess (the retroactive-steering loop)
+// =============================================================================
+//
+// PURPOSE
+//   Let a human (or proxy) correct something the wiki got wrong, in plain
+//   language, and have that correction (a) actually rewrite the affected
+//   pages from their real sources under the correction, and (b) PERSIST so
+//   a future ingest cannot silently reintroduce the same mistake.
+//
+// DOES NOT
+//   - Does not treat the correction as a one-time patch to the wiki text.
+//     A correction that only edits the current pages and is not written into
+//     lens/corrections/ gets silently re-broken the next time ingest.dot
+//     re-weaves a source that repeats the original (wrong) framing. This is
+//     the entire point of persist_lens -- see that node below.
+//   - Does not re-run ingestion against every source -- only the specific
+//     sources traced as having fed the corrected claims are re-derived.
+//
+// REAL INVOCATION
+//   attractor run pipeline/correct.dot \
+//     --param wiki_root=/srv/wikis/acme \
+//     --param correction_provided=true \
+//     --param correction_text="Alice, not Bob, led the migration" \
+//     --cwd /srv/wikis/acme \
+//     --on-human-gate console
+//   (Omit correction_provided/correction_text to be asked interactively.)
+//
+// REQUIRED CONTEXT VARS
+//   wiki_root            -- filesystem root of the wiki (REQUIRED)
+//   correction_provided  -- (optional, default: unset/false) "true" when
+//                            correction_text was supplied externally; skips
+//                            the freeform intake gate when set
+//   correction_text      -- (optional) the correction, if supplied
+//                            programmatically. NEVER shell-interpolated --
+//                            read via tool_env into capture_correction.
+//
+// ARTIFACTS AND GUARDS
+//   .ai/correction-text.md   -- EPHEMERAL: the correction, in exactly ONE
+//                                canonical location regardless of whether it
+//                                arrived via --param or the freeform gate.
+//                                Every downstream node reads this FILE with
+//                                its own tools -- never via ${correction_text}
+//                                shell substitution (the highest-risk
+//                                injection site identified in the prior
+//                                review: multi-line free text unquoted into
+//                                a shell command).
+//   .ai/affected-pages.json  -- EPHEMERAL: pages located as making the claim.
+//   .ai/affected-sources.json -- EPHEMERAL: source ids that fed those pages
+//                                (via existing provenance).
+//   .ai/validation-report.md -- EPHEMERAL: structural check findings.
+//   lens/corrections/         -- COMMITTED. THE load-bearing artifact -- see
+//                                persist_lens below.
+//
+//   IDEMPOTENCY: persist_lens checks whether this exact correction is already
+//   recorded in lens/corrections/ before appending (no duplicate corrections
+//   on re-run), and guards its commit with `git diff --staged --quiet` (a
+//   re-run that changes nothing stages nothing and commits nothing).
+//
+//   REWIND: to re-apply a correction from scratch, remove its entry from
+//   lens/corrections/ (the file is named by a deterministic hash of the
+//   claim text -- see pipeline/CLI-CONTRACT.md) and re-run. To abandon an
+//   in-flight correction before persist_lens: rm -f .ai/correction-text.md
+//   .ai/affected-pages.json .ai/affected-sources.json
+// =============================================================================
+
+digraph wiki_weaver_v2_correct {
+  graph [
+    goal="Apply a natural-language correction, re-derive only the affected pages from their real sources, and persist the correction so it cannot silently regress",
+    label="correct.dot -- correction -> targeted reprocess",
+    params="wiki_root, correction_provided, correction_text",
+    max_pipeline_duration="15m",
+    default_max_retry=1,
+    default_fidelity="full"
+  ]
+  rankdir=LR
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
+
+  start [shape=Mdiamond, label="correction requested"]
+  exit  [shape=Msquare,  label="corrected + persisted"]
+
+  // Fork directly on the operator-supplied param -- no diamond no-op needed,
+  // since correction_provided is set (or not) before the graph ever runs.
+    // FAIL-LOUD GUARD (verified defect, 2026-07-25): attractor's
+    // AutoApproveInterviewer.ask() on a FREEFORM question falls through and returns
+    // the literal string "auto-approved". This gate's text flows into a
+    // human-authored layer, so accepting that stub would poison it. The capture
+    // tool downstream MUST reject the literal "auto-approved" and exit non-zero
+    // (hard pipeline failure) rather than persist it. A gate that cannot be
+    // answered must STOP the run, never invent an answer.
+  intake [
+    shape=hexagon, penwidth=2,
+    mode="freeform",
+    label="intake\n(freeform correction,\nhuman or proxy)",
+    prompt="Describe, in plain language, what the wiki got wrong and what the correct statement of fact is. Be as specific as you can about which claim(s) this concerns."
+  ]
+
+  // Single convergence point for BOTH intake paths (external --param or the
+  // freeform gate above). tool_env carries whichever of the two is non-empty
+  // as an environment variable -- never inline-substituted into the shell.
+  capture_correction [
+    shape=parallelogram,
+    label="capture_correction\n(free text -> file,\nnever shell-interpolated)",
+    tool_env="correction_text,human.gate.text,py",
+    tool_command="$py -m wiki_weaver.correct.capture --out .ai/correction-text.md"
+  ]
+
+  locate_pages [
+    shape=parallelogram,
+    label="locate_pages\n(search wiki for\nthe corrected claim)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.correct.locate_pages --wiki-root \"$wiki_root\" --claim-file .ai/correction-text.md --out .ai/affected-pages.json"
+  ]
+
+  trace_sources [
+    shape=parallelogram,
+    label="trace_sources\n(use existing provenance\nto find which source ids\nfed those claims)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.correct.trace_sources --wiki-root \"$wiki_root\" --pages-file .ai/affected-pages.json --out .ai/affected-sources.json"
+  ]
+
+  re_derive [
+    shape=box,
+    label="re_derive\n(rewrite affected pages\nfrom their real sources,\nUNDER the correction)",
+    prompt="Read .ai/affected-pages.json, .ai/affected-sources.json, and .ai/correction-text.md with your file tools. Rewrite ONLY the pages listed, from ONLY the sources listed, under the correction in .ai/correction-text.md -- the correction is now part of the lens and outranks the original framing of those sources. Preserve everything in the affected pages that the correction does not touch: this is a targeted re-derivation, not a rewrite of the whole page. Do not write to lens/ yourself and do not make any git commit -- those are the next node's job."
+  ]
+
+  validate [
+    shape=parallelogram,
+    label="validate\n(structural checks,\ndeterministic)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.correct.validate --wiki-root \"$wiki_root\" --out .ai/validation-report.md"
+  ]
+
+  // EMPHASIZED: this is the step that makes the correction stick. A
+  // correction that only changes today's wiki text and is not written here
+  // gets silently re-broken by the next ingest that re-weaves a source
+  // repeating the original framing. IDEMPOTENT: checks membership in
+  // lens/corrections/ before appending (no duplicate on re-run) and guards
+  // its own commit with `git diff --staged --quiet` (nothing to commit ->
+  // no-op, not a phantom commit).
+  persist_lens [
+    shape=parallelogram, penwidth=4, color="#cc0000",
+    label="persist_lens\n*** WRITE TO lens/corrections/ ***\n(a correction that doesn't persist\ngets re-broken -- then commit\nwiki + lens together, idempotent)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.correct.persist_lens --wiki-root \"$wiki_root\" --claim-file .ai/correction-text.md --pages-file .ai/affected-pages.json"
+  ]
+
+  start -> capture_correction [condition="context.correction_provided=true"]
+  start -> intake              [condition="context.correction_provided!=true"]
+  intake -> capture_correction
+
+  capture_correction -> locate_pages
+  locate_pages -> trace_sources
+  trace_sources -> re_derive
+  re_derive -> validate
+  validate -> persist_lens
+  persist_lens -> exit
+}

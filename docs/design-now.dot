@@ -1,0 +1,110 @@
+// wiki-weaver v2 — current design (as of 2026-07-29)
+// Measured: 3.60 rubric / 0.60 coverage @ 110 sources, +1.80 over raw-sources-only.
+//
+// Shape rule for this diagram:
+//   box            = AGENT node (an LLM writes/judges here)   — only 3 in the whole system
+//   parallelogram  = CODE node (deterministic, no model call)
+//   hexagon        = routing gate
+//   folder         = durable artifact on disk
+digraph wiki_weaver_now {
+  rankdir=TB
+  fontname="Helvetica"
+  labelloc="t"
+  label=<<b>wiki-weaver v2 — current design</b><br/>
+         <font point-size="11">3 layers. Sources are truth. The wiki sits between.<br/>
+         84% of nodes are deterministic code — agents only where judgment is required.</font><br/> >
+  node [fontname="Helvetica", fontsize=10, style=filled]
+  edge [fontname="Helvetica", fontsize=9, color="#555555"]
+
+  // ---------------------------------------------------------------- layer 1
+  subgraph cluster_sources {
+    label="LAYER 1 — RAW SOURCES  (immutable · the source of truth)"
+    style=filled fillcolor="#f5f0e8" color="#8a7a5a" fontname="Helvetica-Bold" fontsize=11
+    sources [shape=folder, fillcolor="#e8dcc0", color="#8a7a5a",
+             label="sources/\n110 transcripts · 7.2 MB\nnever modified"]
+  }
+
+  // ---------------------------------------------------------------- ingest
+  subgraph cluster_ingest {
+    label="INGEST PIPELINE — ingest.dot  (23 nodes / 44 edges · 2 agent nodes)"
+    style=filled fillcolor="#eef4fa" color="#4a7ab0" fontname="Helvetica-Bold" fontsize=11
+
+    select   [shape=parallelogram, fillcolor="#d6e6f5", label="select_source\n+ dedup"]
+    kind     [shape=parallelogram, fillcolor="#d6e6f5", label="detect_kind\ncode-first, LLM only\nwhen code can't decide"]
+    wmark    [shape=parallelogram, fillcolor="#d6e6f5", label="watermark\nstreams: delta | full | reset"]
+    segment  [shape=parallelogram, fillcolor="#d6e6f5", label="segment_source\n80 KB budget, cut at\nturn / day / heading"]
+    slice    [shape=parallelogram, fillcolor="#d6e6f5", label="retrieve_slice (BM25)\nbounds what may be READ"]
+    catalog  [shape=parallelogram, fillcolor="#c4e8c4", color="#2d7a2d", penwidth=2,
+              label="build_catalog  ★NEW\nevery page: name + 1-line\nbounds what is KNOWN to exist"]
+
+    weave    [shape=box, fillcolor="#ffd9a0", color="#cc7a00", penwidth=3,
+              label=<<b>weave</b>  ⟵ AGENT<br/>
+                     <font point-size="9">writes the wiki. carries 2 contracts:</font><br/>
+                     <font point-size="9" color="#804000"><b>RETENTION</b> — absence ≠ stale</font><br/>
+                     <font point-size="9" color="#804000"><b>DISAGREEMENT</b> ★ — record who<br/>
+                     objected + resolved/dropped/open</font>>]
+
+    validate [shape=parallelogram, fillcolor="#d6e6f5", label="validate\nstructure + links + size"]
+    rebound  [shape=hexagon, fillcolor="#f5e6b8", color="#b08a00", label="reweave_bound\nattempt cap"]
+    review   [shape=box, fillcolor="#ffd9a0", color="#cc7a00", label="review ⟵ AGENT\nsteering on retry"]
+    commit   [shape=parallelogram, fillcolor="#d6e6f5", label="commit\nledger + git"]
+    skip     [shape=parallelogram, fillcolor="#e8d0d0", label="commit_skip\nquarantine source"]
+
+    select -> kind -> wmark -> segment -> slice -> catalog -> weave -> validate
+    validate -> commit  [label="ok", color="#2d7a2d"]
+    validate -> rebound [label="structural_bad", color="#b08a00"]
+    rebound  -> review  [label="retry", color="#b08a00"]
+    review   -> weave   [style=dashed, color="#b08a00"]
+    rebound  -> skip    [label="give_up", color="#a04040"]
+    weave -> rebound [label="★NEW  fallback_retry_target\nprovider 529 → retry, not death",
+                      style=dashed, color="#cc0000", fontcolor="#cc0000", constraint=false]
+  }
+
+  // ---------------------------------------------------------------- layer 2
+  subgraph cluster_wiki {
+    label="LAYER 2 — THE WIKI  (navigation + synthesis · sits BETWEEN)"
+    style=filled fillcolor="#f0f7f0" color="#2d7a2d" fontname="Helvetica-Bold" fontsize=11
+    wiki [shape=folder, fillcolor="#c4e8c4", color="#2d7a2d",
+          label="wiki/\n16 pages · every page cites\nits sources (frontmatter + inline)"]
+  }
+
+  // ---------------------------------------------------------------- ask
+  subgraph cluster_ask {
+    label="ASK PIPELINE — ask.dot  (10 nodes / 12 edges · 1 agent node)"
+    style=filled fillcolor="#f7f0f7" color="#8a4a8a" fontname="Helvetica-Bold" fontsize=11
+
+    loadidx [shape=parallelogram, fillcolor="#ecd9ec",
+             label="load_index\ncandidate pages\n+ their cited_sources ★NEW"]
+    answer  [shape=box, fillcolor="#ffd9a0", color="#cc7a00", penwidth=3,
+             label=<<b>answer</b>  ⟵ AGENT · <font color="#cc0000">HYBRID ★</font><br/>
+                    <font point-size="9">1. wiki → locate (WHERE / THAT)</font><br/>
+                    <font point-size="9">2. follow citations → sources (WHY / EXACT WORDS)</font><br/>
+                    <font point-size="9" color="#cc0000">3. cited set is a START, not a boundary</font><br/>
+                    <font point-size="9" color="#cc0000">4. never assert a negative from partial search</font>>]
+    cover   [shape=hexagon, fillcolor="#f5e6b8", color="#b08a00", label="coverage_check"]
+    present [shape=parallelogram, fillcolor="#ecd9ec", label="present\nanswer + citations"]
+    refuse  [shape=parallelogram, fillcolor="#e8d0d0", label="refuse (loud)\nrather than guess"]
+
+    loadidx -> answer -> cover
+    cover -> present [label="covered", color="#2d7a2d"]
+    cover -> refuse  [label="thin", color="#a04040"]
+  }
+
+  out [shape=note, fillcolor="#fff8d0", color="#b08a00",
+       label="answer with citations\nto BOTH page and source"]
+
+  // ---------------------------------------------------------------- wiring
+  sources -> select  [lhead=cluster_ingest, color="#8a7a5a", penwidth=2]
+  commit  -> wiki    [ltail=cluster_ingest, color="#2d7a2d", penwidth=2]
+  wiki    -> loadidx [lhead=cluster_ask, color="#2d7a2d", penwidth=2]
+  sources -> answer  [label="  ★NEW: follow citations\n  back to the transcripts",
+                      color="#cc0000", penwidth=3, fontcolor="#cc0000", constraint=false]
+  present -> out
+  out -> sources [label="  file answers back\n  as new sources", style=dotted, color="#999999", constraint=false]
+
+  legend [shape=note, fillcolor="#ffffff", color="#666666", fontsize=9,
+          label=<<b>★ = changed this cycle</b><br align="left"/>
+                 <font color="#cc7a00">orange box</font> = agent (3 total)<br align="left"/>
+                 blue parallelogram = code (39 total)<br align="left"/>
+                 <b>84% deterministic</b><br align="left"/> >]
+}

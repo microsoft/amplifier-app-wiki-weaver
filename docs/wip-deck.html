@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Compiling Wiki — WIP</title>
+<style>
+:root {
+    --accent: #5E5CE6;
+    --accent-dim: #8A88F0;
+
+    --surface-1: rgba(255,255,255,0.06);
+    --surface-2: rgba(255,255,255,0.10);
+    --border-subtle: rgba(255,255,255,0.12);
+    --border-visible: rgba(255,255,255,0.20);
+
+    --text-primary: #ffffff;
+    --text-secondary: rgba(255,255,255,0.72);
+    --text-tertiary: rgba(255,255,255,0.62);
+
+    --pos: #30D158;
+    --neg: #FF6B6B;
+
+    --fs-label: clamp(12px, 1.6vw, 15px);
+    --fs-headline: clamp(34px, 6.5vw, 76px);
+    --fs-medium: clamp(28px, 4.6vw, 54px);
+    --fs-statement: clamp(19px, 2.6vw, 30px);
+    --fs-body: clamp(16px, 2.1vw, 22px);
+    --fs-small: clamp(14px, 1.7vw, 18px);
+    --fs-hero-num: clamp(88px, 22vw, 230px);
+    --fs-stat-num: clamp(40px, 7vw, 88px);
+
+    --pad-x: clamp(24px, 6vw, 110px);
+    --gap: clamp(18px, 3vw, 44px);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+    height: 100%;
+    background: #000;
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-font-smoothing: antialiased;
+}
+
+.slide {
+    display: none;
+    width: 100vw;
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding: clamp(56px, 9vw, 120px) var(--pad-x) clamp(84px, 11vw, 110px);
+    flex-direction: column;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+.slide.active { display: flex; }
+
+.center {
+    text-align: center;
+    align-items: center;
+    justify-content: center;
+}
+
+.mid { justify-content: center; }
+
+/* --- Type --- */
+.label {
+    font-size: var(--fs-label);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 2.5px;
+    color: var(--accent-dim);
+    margin-bottom: clamp(18px, 3vw, 34px);
+}
+.headline {
+    font-size: var(--fs-headline);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+    max-width: 20ch;
+}
+.headline.wide { max-width: 26ch; }
+.medium {
+    font-size: var(--fs-medium);
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    line-height: 1.1;
+    max-width: 22ch;
+}
+.statement {
+    font-size: var(--fs-statement);
+    font-weight: 400;
+    line-height: 1.4;
+    color: var(--text-secondary);
+    max-width: 34ch;
+    margin-top: clamp(20px, 3vw, 36px);
+}
+.statement.narrow { max-width: 28ch; }
+.statement strong { color: var(--text-primary); font-weight: 600; }
+.subhead {
+    font-size: var(--fs-statement);
+    color: var(--text-secondary);
+    margin-top: clamp(16px, 2.5vw, 28px);
+    max-width: 30ch;
+    line-height: 1.35;
+}
+.foot {
+    font-size: clamp(16px, 2vw, 22px);
+    color: rgba(255,255,255,0.7);
+    margin-top: clamp(28px, 4.5vw, 56px);
+    line-height: 1.5;
+    max-width: 52ch;
+}
+.mono { font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace; }
+
+/* --- Hero number --- */
+.hero-num {
+    font-size: var(--fs-hero-num);
+    font-weight: 700;
+    letter-spacing: -0.05em;
+    line-height: 0.9;
+    color: var(--accent);
+}
+.hero-num.white { color: var(--text-primary); }
+.hero-caption {
+    font-size: var(--fs-statement);
+    color: var(--text-secondary);
+    margin-top: clamp(14px, 2vw, 26px);
+    max-width: 26ch;
+    line-height: 1.35;
+}
+
+/* --- Stat rows --- */
+.stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+    gap: var(--gap);
+    margin-top: clamp(28px, 5vw, 56px);
+    width: 100%;
+}
+.stat-num {
+    font-size: var(--fs-stat-num);
+    font-weight: 700;
+    letter-spacing: -0.04em;
+    line-height: 1;
+    color: var(--accent);
+}
+.stat-num.white { color: var(--text-primary); }
+.stat-num.pos { color: var(--pos); }
+.stat-label {
+    font-size: clamp(15px, 1.9vw, 20px);
+    color: var(--text-secondary);
+    margin-top: clamp(8px, 1.2vw, 14px);
+    line-height: 1.4;
+    max-width: 22ch;
+}
+.arrow { color: var(--text-tertiary); font-weight: 400; }
+
+/* --- Two column --- */
+.two-col {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+    gap: var(--gap);
+    margin-top: clamp(40px, 6vw, 76px);
+    width: 100%;
+}
+.col {
+    background: var(--surface-1);
+    border: 1px solid var(--border-subtle);
+    border-radius: clamp(12px, 1.6vw, 18px);
+    padding: clamp(20px, 3vw, 34px);
+}
+.col.win { border-color: rgba(94,92,230,0.55); background: rgba(94,92,230,0.12); }
+.col-kicker {
+    font-size: var(--fs-label);
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    margin-bottom: clamp(10px, 1.4vw, 16px);
+}
+.col-big {
+    font-size: clamp(30px, 4.6vw, 54px);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+}
+.col-body {
+    font-size: clamp(17px, 2.2vw, 23px);
+    color: var(--text-secondary);
+    margin-top: clamp(10px, 1.4vw, 16px);
+    line-height: 1.45;
+}
+
+/* --- Corpus table --- */
+.rows {
+    width: 100%;
+    margin-top: clamp(24px, 4vw, 48px);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.row {
+    display: grid;
+    grid-template-columns: minmax(120px, 1.1fr) minmax(90px, 0.7fr) minmax(150px, 1.6fr);
+    gap: clamp(10px, 2vw, 28px);
+    align-items: baseline;
+    background: var(--surface-2);
+    border-radius: clamp(8px, 1vw, 12px);
+    padding: clamp(18px, 2.8vw, 30px) clamp(16px, 2.5vw, 30px);
+}
+.row.head {
+    background: transparent;
+    padding-bottom: clamp(4px, 0.8vw, 8px);
+}
+.row.head span {
+    font-size: var(--fs-label);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-weight: 600;
+    color: var(--accent-dim);
+}
+.r-name { font-size: var(--fs-body); font-weight: 600; color: var(--text-primary); }
+.r-val {
+    font-size: clamp(20px, 3vw, 34px);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+}
+.r-val.pos { color: var(--pos); }
+.r-val.neg { color: var(--neg); }
+.r-note { font-size: clamp(16px, 2vw, 21px); color: var(--text-secondary); line-height: 1.35; }
+
+/* --- Simple list (max 4) --- */
+.tight-list {
+    list-style: none;
+    margin-top: clamp(24px, 4vw, 44px);
+    display: flex;
+    flex-direction: column;
+    gap: clamp(12px, 1.8vw, 20px);
+}
+.tight-list li {
+    font-size: var(--fs-statement);
+    color: var(--text-secondary);
+    line-height: 1.3;
+    padding-left: clamp(18px, 2.5vw, 28px);
+    border-left: 2px solid var(--border-visible);
+}
+.tight-list li strong { color: var(--text-primary); font-weight: 600; }
+
+.badge {
+    display: inline-block;
+    font-size: var(--fs-small);
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--accent-dim);
+    border: 1px solid rgba(94,92,230,0.6);
+    background: rgba(94,92,230,0.14);
+    border-radius: 100px;
+    padding: clamp(6px, 1vw, 9px) clamp(14px, 2vw, 20px);
+    margin-bottom: clamp(24px, 4vw, 44px);
+}
+
+.spacer { height: clamp(16px, 3vw, 36px); }
+
+/* --- Nav --- */
+.nav {
+    position: fixed;
+    bottom: clamp(20px, 3vw, 32px);
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 9px;
+    z-index: 100;
+}
+.nav-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.25);
+    cursor: pointer;
+    transition: background 0.2s, transform 0.2s;
+}
+.nav-dot:hover { background: rgba(255,255,255,0.5); }
+.nav-dot.active { background: var(--accent); transform: scale(1.4); }
+.counter {
+    position: fixed;
+    bottom: clamp(18px, 3vw, 30px);
+    right: clamp(20px, 4vw, 44px);
+    font-size: var(--fs-small);
+    color: var(--text-tertiary);
+    z-index: 100;
+    font-variant-numeric: tabular-nums;
+}
+.wip-tag {
+    position: fixed;
+    top: clamp(16px, 3vw, 30px);
+    left: var(--pad-x);
+    font-size: clamp(11px, 1.3vw, 13px);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.3);
+    z-index: 100;
+}
+
+@media (max-height: 520px) and (orientation: landscape) {
+    .slide { padding: 44px var(--pad-x) 56px; }
+    .slide.center { justify-content: flex-start; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .slide, .slide *, .nav-dot { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="wip-tag">Work in progress</div>
+
+<!-- 1 — TITLE -->
+<div class="slide active center">
+    <div class="badge">WIP &middot; measured, not finished</div>
+    <h1 class="headline wide">Compiling a wiki instead of retrieving from documents</h1>
+    <p class="subhead">Nine variations measured. Two worked. Then it stopped generalizing.</p>
+</div>
+
+<!-- 2 — PREMISE -->
+<div class="slide mid">
+    <div class="label">The premise</div>
+    <h2 class="headline">Don't re-derive the knowledge on every query. Compile it once.</h2>
+    <p class="statement">Karpathy's <span class="mono">llm-wiki</span> gist: have the LLM build a persistent, interlinked wiki from a corpus &mdash; and keep it current as the corpus grows.</p>
+    <div class="foot">We built it. Then we measured whether it beats just reading the sources.</div>
+</div>
+
+<!-- 3 — BASELINE -->
+<div class="slide center">
+    <div class="label">Where we started</div>
+    <div class="hero-num">+0.30</div>
+    <p class="hero-caption">v1 rubric lift over just reading the raw sources</p>
+    <p class="statement narrow">That's inside noise. Measured honestly, the wiki was barely better than not having one.</p>
+</div>
+
+<!-- 4 — METHOD -->
+<div class="slide mid">
+    <div class="label">How we measured</div>
+    <h2 class="medium">One corpus, one blind grader, nine arms.</h2>
+    <div class="stats">
+        <div>
+            <div class="stat-num white">110</div>
+            <div class="stat-label">real meeting transcripts, 7.2&nbsp;MB</div>
+        </div>
+        <div>
+            <div class="stat-num white">10</div>
+            <div class="stat-label">cross-source questions, authored before any wiki existed</div>
+        </div>
+        <div>
+            <div class="stat-num white">9</div>
+            <div class="stat-label">variations tested</div>
+        </div>
+    </div>
+    <div class="foot">Blind-graded on a 1&ndash;5 rubric against attributed ground-truth facts.</div>
+</div>
+
+<!-- 5 — THE SURPRISE -->
+<div class="slide mid">
+    <div class="label">The surprise</div>
+    <h2 class="headline wide">Both winning changes were one paragraph of prompt text.</h2>
+    <div class="two-col">
+        <div class="col win">
+            <div class="col-kicker">Won</div>
+            <div class="col-big">2 prompt changes</div>
+            <div class="col-body">One to the writer. One to the answerer.</div>
+        </div>
+        <div class="col">
+            <div class="col-kicker">Nothing, or worse</div>
+            <div class="col-big">5 structural changes</div>
+            <div class="col-body">Page splitting. Routing. Sibling cross-links. Cross-episode threading.</div>
+        </div>
+    </div>
+</div>
+
+<!-- 6 — WIN ONE -->
+<div class="slide mid">
+    <div class="label">Win one &mdash; preserve disagreement</div>
+    <div class="hero-num">+1.20</div>
+    <p class="hero-caption">rubric, on its own &mdash; the single biggest quality gain in the project</p>
+    <p class="statement">Summarizers smooth. <strong>"The team converged on X"</strong> erases who objected and why. Tell the writer to record who held which position &mdash; and whether it resolved, was dropped, or was left open.</p>
+</div>
+
+<!-- 7 — WIN TWO -->
+<div class="slide mid">
+    <div class="label">Win two &mdash; follow the citations</div>
+    <div class="hero-num">+1.70</div>
+    <p class="hero-caption">rubric vs raw sources</p>
+    <p class="statement">The wiki is not a replacement for the sources. <strong>It's an index into them.</strong> Every page cites where it came from &mdash; let the answering agent open them.</p>
+    <div class="foot"><strong style="color:#fff">9 of 10 questions</strong> gained a fact the wiki had compressed away.</div>
+</div>
+
+<!-- 8 — RESULT -->
+<div class="slide mid">
+    <div class="label">Result &mdash; transcripts</div>
+    <h2 class="medium">Where the two paragraphs landed us.</h2>
+    <div class="stats">
+        <div>
+            <div class="stat-num">2.4 <span class="arrow">&rarr;</span> 3.6</div>
+            <div class="stat-label">answer quality, 1&ndash;5 rubric</div>
+        </div>
+        <div>
+            <div class="stat-num">+0.3 <span class="arrow">&rarr;</span> +1.7</div>
+            <div class="stat-label">lift over raw sources &mdash; 6x</div>
+        </div>
+        <div>
+            <div class="stat-num">1.10 <span class="arrow">&rarr;</span> 0.10</div>
+            <div class="stat-label">scale penalty &mdash; big wiki vs small wiki</div>
+        </div>
+    </div>
+</div>
+
+<!-- 9 — DOESN'T GENERALIZE -->
+<div class="slide mid">
+    <div class="label">Negative result</div>
+    <h2 class="headline">Then we tested whether it generalizes. It doesn't.</h2>
+    <div class="rows">
+        <div class="row head">
+            <span>Corpus</span><span>Wiki lift</span><span></span>
+        </div>
+        <div class="row">
+            <span class="r-name">Blog articles</span>
+            <span class="r-val pos">+0.20</span>
+            <span class="r-note">50 titled, well-structured essays</span>
+        </div>
+        <div class="row">
+            <span class="r-name">AI coding sessions</span>
+            <span class="r-val neg">&minus;0.10</span>
+            <span class="r-note">60 structured session renders</span>
+        </div>
+        <div class="row">
+            <span class="r-name">Code repos over time</span>
+            <span class="r-val neg">&minus;0.20</span>
+            <span class="r-note">27 snapshots, predictable headers</span>
+        </div>
+    </div>
+    <div class="foot">Same pipeline. Same grader. Neutral to slightly negative.</div>
+</div>
+
+<!-- 10 — WHY -->
+<div class="slide mid">
+    <div class="label">The real lesson</div>
+    <h2 class="headline wide">The wiki's value scales inversely with how searchable the corpus already is.</h2>
+    <div class="two-col">
+        <div class="col win">
+            <div class="col-kicker">Raw transcripts</div>
+            <div class="col-big">1.90</div>
+            <div class="col-body">Nearly unusable. Compilation did real work.</div>
+        </div>
+        <div class="col">
+            <div class="col-kicker">Raw articles</div>
+            <div class="col-big">3.90</div>
+            <div class="col-body">Grep already wins. Nothing left to add.</div>
+        </div>
+    </div>
+    <div class="foot">It was never "compilation beats retrieval." It was <strong style="color:#fff">compilation beats retrieval when retrieval is hard.</strong></div>
+</div>
+
+<!-- 11 — THE BUG -->
+<div class="slide mid">
+    <div class="label">The compounding bug</div>
+    <h2 class="headline">A fixed retrieval cap meant the writer could read six pages. Ever.</h2>
+    <div class="stats">
+        <div>
+            <div class="stat-num">13%</div>
+            <div class="stat-label">of a 45-page wiki visible to the writer</div>
+        </div>
+        <div>
+            <div class="stat-num">3.03 <span class="arrow">&rarr;</span> 2.19</div>
+            <div class="stat-label">pages touched per source, first quarter to last</div>
+        </div>
+    </div>
+    <div class="foot">You cannot merge into a page you haven't read. Invisible in every quality metric for weeks.</div>
+</div>
+
+<!-- 12 — FIXED -->
+<div class="slide mid">
+    <div class="label">Fixed</div>
+    <div class="stats">
+        <div>
+            <div class="stat-num pos">1.96 <span class="arrow">&rarr;</span> 5.33</div>
+            <div class="stat-label">pages touched per source</div>
+        </div>
+        <div>
+            <div class="stat-num pos">5.08 <span class="arrow">&rarr;</span> 5.56</div>
+            <div class="stat-label">trajectory &mdash; declining, now rising</div>
+        </div>
+    </div>
+    <div class="spacer"></div>
+    <ul class="tight-list">
+        <li>Writer <strong>decomposes each source into typed entities</strong>, and places each one.</li>
+        <li>Retrieval budgeted <strong>by bytes, not page count</strong>.</li>
+    </ul>
+    <div class="foot">The wiki now gets richer as it grows.</div>
+</div>
+
+<!-- 13 — WHERE WE ARE -->
+<div class="slide mid">
+    <div class="label">Where we are</div>
+    <h2 class="medium">Working and measured &mdash; for one shape of corpus.</h2>
+    <ul class="tight-list">
+        <li><strong>Works:</strong> large unstructured conversational corpora, where raw search is hard.</li>
+        <li><strong>Open:</strong> nothing forms a whole-corpus view. One theme, ten unconnected pages.</li>
+        <li><strong>Caveat:</strong> n=10 questions per corpus. Directional, not tight.</li>
+    </ul>
+    <div class="foot">Data as of 2026-07-30 &middot; blind-graded evals across four corpora.</div>
+</div>
+
+<div class="nav" id="nav"></div>
+<div class="counter" id="counter"></div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+let currentSlide = 0;
+
+function showSlide(n) {
+    slides[currentSlide].classList.remove('active');
+    currentSlide = (n + slides.length) % slides.length;
+    slides[currentSlide].classList.add('active');
+    slides[currentSlide].scrollTop = 0;
+    updateNav();
+}
+
+function updateNav() {
+    const nav = document.getElementById('nav');
+    const counter = document.getElementById('counter');
+    nav.innerHTML = '';
+    slides.forEach((_, i) => {
+        const dot = document.createElement('div');
+        dot.className = 'nav-dot' + (i === currentSlide ? ' active' : '');
+        dot.onclick = (e) => { e.stopPropagation(); showSlide(i); };
+        nav.appendChild(dot);
+    });
+    counter.textContent = (currentSlide + 1) + ' / ' + slides.length;
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); showSlide(currentSlide + 1); }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); showSlide(currentSlide - 1); }
+    if (e.key === 'Home') showSlide(0);
+    if (e.key === 'End') showSlide(slides.length - 1);
+});
+
+document.addEventListener('click', (e) => {
+    if (e.target.closest('.nav')) return;
+    if (e.clientX > window.innerWidth / 2) showSlide(currentSlide + 1);
+    else showSlide(currentSlide - 1);
+});
+
+let touchStartX = 0;
+const SWIPE_THRESHOLD = 50;
+document.addEventListener('touchstart', (e) => {
+    touchStartX = e.changedTouches[0].screenX;
+}, { passive: true });
+document.addEventListener('touchend', (e) => {
+    const diff = touchStartX - e.changedTouches[0].screenX;
+    if (Math.abs(diff) > SWIPE_THRESHOLD) {
+        if (diff > 0) showSlide(currentSlide + 1);
+        else showSlide(currentSlide - 1);
+    }
+}, { passive: true });
+
+updateNav();
+</script>
+</body>
+</html>

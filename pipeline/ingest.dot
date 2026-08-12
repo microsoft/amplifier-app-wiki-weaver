@@ -1,142 +1,681 @@
-// ingest.dot -- Full inbox DRAIN loop via synthesize.dot.
+// =============================================================================
+// ingest.dot -- THE production ingest pipeline (index-first: see
+// evals/compounding/PRECOMMIT-INDEX.md for the full rationale and the
+// pre-committed decision rule that landed this change).
+// =============================================================================
 //
-// Drains the _inbox/ in a single run: picks one source, synthesizes it,
-// tamper-checks it, archives or fails it, then loops back to setup until
-// the inbox is empty.
+// THE DEFECT THIS REPLACES: the prior production pipeline (promoted from the
+// A/B/C routing-decision eval's arm B, still preserved unchanged as
+// evals/arms/ingest-b.dot) had CODE decide, via a BM25 top-score threshold in
+// retrieve_slice.py's `--emit-strength` (`_classify_strength`), whether a
+// source was a "weak" match (route to a dedicated create_page node) or a
+// "strong" match (route to weave). Measured on 110 real transcripts: N=10 ->
+// 11 pages, N=110 -> 14 pages -- 100 additional sources produced only 3
+// additional pages, because a page was only ever created when a source
+// shared ZERO lexical overlap with EVERY existing page. A bootstrap rule was
+// doing duty as a growth rule.
 //
-// Compile-time tokens substituted by run_ingest() before handing to the engine:
-//   $setup_cmd         -- absolute path command to cli/ingest_setup.py
-//   $synthesize_dot    -- absolute path to pipeline/synthesize.dot
-//   $max_drain_iters   -- safety bound (generous multiple of inbox size);
-//                         if this limit trips the engine fails loud, which is
-//                         the correct behaviour -- a bug would spin forever
-//                         otherwise.
+// THE FIX (gist fidelity -- ../amplifier-app-wiki-weaver/docs/llm-wiki-pattern.md
+// L48/L58/L64): the gist's design is index-FIRST -- "index.md ... a catalog
+// of everything in the wiki ... the LLM reads the index first to find
+// relevant pages, then drills into them" -- with BM25 search as a scale
+// supplement, never a replacement. Two different things had been conflated:
+//   - what weave may READ  -- a real cost bound at scale; retrieve_slice's
+//     BM25 slice still does exactly this, UNCHANGED.
+//   - what weave KNOWS EXISTS -- previously invisible to it (it only ever
+//     saw its own top-k slice), so code had to guess create-vs-fold on its
+//     behalf. weave now also reads a compact whole-wiki catalog
+//     (build_catalog: one title + one-line summary per page, no bodies) and
+//     decides for itself, in the SAME pass it already writes in -- exactly
+//     what a single interactive session would do.
 //
-// Context keys produced by the setup node (via parse_json="true") and consumed
-// by subsequent nodes via $var references:
-//   has_source, source_path, source_id, wiki_dir, validation_report,
-//   schema_path, convergence_rubric, max_cycles,
-//   normalize_cmd, footnotes_cmd, validate_cmd,
-//   archive_cmd, fail_cmd, tamper_check_cmd
+// `slice_strength`, the strength-routing edges, and the `create_page` node
+// are GONE -- one writer node (`weave`) decides and writes. retrieve_slice
+// itself, and its `--emit-strength` flag, are UNCHANGED and still used by
+// evals/arms/ingest-b.dot; only THIS production pipeline stopped calling the
+// flag and stopped routing on it.
 //
-// Drain-loop semantics:
-//   setup emits has_source=false  -> done (inbox drained, clean exit)
-//   setup emits has_source=true   -> synthesize -> tamper_check -> archive or fail_handler
-//   tamper detected               -> fail_handler (source -> _failed/, undo tamper)
-//   archive/fail_handler          -> setup (loop_restart="true")
+// NOT A REPEAT of evals/arms/ingest-c.dot's LOSS: that arm added a SEPARATE,
+// cheaper planner node with LESS context than the writer, emitting a
+// one-shot JSON plan -- it over-decomposed source 1, then defaulted to
+// "update" forever (half the pages, a third of the links, 3.3x the cost per
+// page of arm B). This pipeline adds NO node and NO model call for the
+// decision -- the EXISTING writer, full model, full context, already doing
+// the writing, simply gets the catalog it was missing. Same agent, same
+// act, one decision.
+//
+// SOURCE-KIND SEGMENTATION (DESIGN.md §5, unchanged by this fix):
+// detect_kind determines article|meeting|stream|repo for the current source
+// -- code-first (this project's own A/B/C eval is the reason: deterministic
+// routing beat an LLM planner on every metric, so an LLM is reached for ONLY
+// when detect_kind's signals are genuinely ambiguous, via the cheap
+// classify_kind box). segment_source then deterministically splits an
+// oversized source at safe unit boundaries (turn starts for meeting/stream,
+// heading/paragraph breaks otherwise) so a 200KB+ transcript is never
+// ingested as one giant context. See detect_kind.py/segment_source.py for
+// the full signal/boundary rationale, and the delivery report for the
+// real-corpus investigation (110 Teams transcripts,
+// ~/dev/future-brainstorm/archive/transcripts/) that produced it.
+//
+// Segments iterate through the SAME slice->catalog->weave->validate->
+// retention->commit path as a whole source, one segment per pass;
+// select_segment is the segment-granularity resume gate (identical doctrine
+// to select_source, one level down -- see its own header comment below).
+//
+// DOES NOT DIFFER FROM THE CONTROL ARM (arm A, evals/arms/ -- unchanged):
+//   - NO assess node, NO LLM feedback node, NO convergence loop.
+//   - retention_check remains deterministic, not an LLM judge.
+//   - The resume gate, drain bound, and budget law are unchanged
+//     edge-for-edge from the original design.
+//
+// review_gate RETIRED FROM THE DEFAULT PATH (see delivery report's measurement
+// section): a POST-write review gate cannot change how a write happened --
+// grading a finished weave changes nothing about it. Measured against
+// auto-approve on identical corpora: -0.5pp (n=3 control vs n=2 proxy), a
+// delta smaller than the control arm's own 4pp run-to-run noise (proxy
+// spread: 5pp). An independent audit separately judged its decisions sound
+// (19-20/21 matching a competent human reviewer) -- this is not a quality
+// failure, it is a POSITION failure: reviewing after the fact cannot move
+// anything. By contrast, a PRE-write gate and a standing lens/canon direction
+// both moved measurable quality (-6.4pp) -- position is what mattered, not
+// the reviewer. `budget` now proceeds straight to `commit_accept`; the
+// `prepare_review_brief` node (which existed solely to feed review_gate on
+// this path) is gone.
+//
+// review_gate PRESERVED, quarantine-rescue-only (the one thing that must
+// survive, per the task that retired it): `prepare_quarantine_brief` still
+// routes a source that exhausted its re-weave attempts THREE TIMES to
+// review_gate exactly once, before automatic quarantine -- because silently
+// quarantining a substantive, on-topic source is the worst outcome this
+// system can produce (a live run destroyed three good articles this way,
+// including the most on-thesis piece in the corpus, before this rescue
+// existed). review_gate's own accept/guide/skip choices, prepare_guidance_brief,
+// and the one-shot quarantine latch/termination guarantee are all UNCHANGED --
+// see prepare_quarantine_brief's own comment below. An inert-on-the-default-
+// path gate is the deliberate, explicit trade accepted here: keeping it (for
+// the rescue) over silently reintroducing the destroyed-source failure.
+//
+// curate_gate RETIRED FROM THE DEFAULT PATH (measured harmful -- see the
+// eval below): it was added to fill the gap named by the source gist's
+// four human jobs -- "curate sources, direct the analysis, ask good
+// questions, and think about what it all means": three already had a home
+// -- takeaways_gate (direct the analysis), review_gate/collect_guidance
+// (ask good questions, via the quarantine rescue), ask.dot's answer loop
+// (think about what it all means) -- curation had none. A 3-run
+// comparative eval against the takeaways+direction baseline, under the
+// calibrated metric, measured it net NEGATIVE:
+//
+//   BASELINE   50.4%   [38, 50, 63]
+//   +CURATE    48.6%   [41, 47, 58]
+//   DELTA      -1.9pp
+//
+// It declined 0/2/2 sources across the three runs -- a declined source is
+// permanently lost signal, and the wiki already filters weak material
+// downstream during weave and synthesis, so the checkpoint bought nothing
+// the rest of the pipeline didn't already do, at real cost. Every OTHER
+// site measured in this project was neutral-to-positive; this is the only
+// one measured negative. `prepare_curate_brief` and `curate_gate` are GONE
+// from this default pipeline -- `drain_bound` now proceeds straight to
+// `detect_kind`.
+//
+// EXCISED, not left in-graph-but-unreachable (the judgment call this task
+// asked for): this project has TWICE already been burned by exactly that
+// shape of mistake -- canon.dot and correct.dot both parsed and validated
+// for months while their entire wiki_weaver.canon/wiki_weaver.correct
+// Python packages were missing from src/ (see pipeline/CLI-CONTRACT.md's
+// "Known pre-existing gap"), because nothing ever actually ran them. A
+// node left wired-but-orphaned in this graph would be strictly worse than
+// that: `--gate-mode-for curate_gate=...` selects WHICH INTERVIEWER
+// answers a gate that is already reachable by an edge -- it cannot restore
+// an edge that doesn't exist, so "leave it reachable only via
+// --gate-mode-for" was not actually an available option once `drain_bound`
+// routes straight to `detect_kind` (this task's own requirement). The
+// mechanism is preserved, WIRED AND RUNNABLE (not dead), as
+// `evals/arms/ingest-curate.dot` -- the same pattern this project already
+// uses for retired/alternative routing decisions (see
+// evals/arms/ingest-b.dot, evals/arms/ingest-c.dot) -- so a future
+// re-evaluation (different corpus, revised curate_brief prompt) has a real
+// pipeline to run, not a flag pointing at nothing.
+//
+// `declined` remains a distinct ledger value from `skip`/`quarantine` in
+// wiki_weaver.ingest.commit (used by the preserved arm above) -- untouched
+// by this retirement; only this file's routing to it is gone.
+//
+// REAL INVOCATION:
+//
+//   attractor run pipeline/ingest.dot \
+//     --param wiki_root=/srv/wikis/acme \
+//     --cwd /srv/wikis/acme \
+//     --on-human-gate console
+//
+// ARTIFACTS: sources/ (COMMITTED, immutable raw material -- never written to
+// by this pipeline), wiki/ (LLM-owned markdown), ledger.jsonl, cost.jsonl,
+// log.md, and the ephemeral .ai/ working directory (current_source.txt,
+// current_slice.json, current_catalog.md, curate-brief.json, current_kind.json,
+// segments.json, current_segment.json, current-segment-content.md,
+// reweave-attempts.json, review-guidance.md, quarantine-state.json).
+// =============================================================================
 
-digraph ingest {
-    graph [
-        goal="Drain the inbox: ingest all sources via synthesize.dot",
-        default_max_retry="$max_drain_iters"
-    ]
+digraph wiki_weaver_v2_ingest {
+  graph [
+    goal="Fold each pending source into the wiki: code detects kind and segments; one LLM pass, given the read-bounded slice and the whole-wiki catalog, decides what to write and writes it",
+    label="ingest.dot -- code detects kind, segments, and bounds what may be read; LLM sees the whole-wiki catalog and decides+writes",
+    params="wiki_root, restrict_to_sources, per_source_time_ceiling, max_sources_per_run, segment_max_bytes",
+    default_max_retry=1,
+    default_fidelity="full"
+  ]
+  rankdir=LR
+  node [fontname="Helvetica", fontsize=11]
+  edge [fontname="Helvetica", fontsize=10]
 
-    start [shape=Mdiamond, label="Start"]
+  start [shape=Mdiamond, label="ingest requested"]
+  exit  [shape=Msquare,  label="drained\n(no sources remain,\nledger corrupt, or\nper-run budget exhausted)"]
 
-    // SETUP (deterministic tool): pick next inbox source, assign stable id,
-    // snapshot process state (for tamper detection), emit JSON context keys for
-    // synthesize.dot and the archive/fail/tamper_check commands.
-    // Emits has_source=false (inbox empty) or has_source=true (source ready).
-    // ALWAYS exits 0 -- inbox empty is the normal drain-complete signal.
-    setup [
-        shape=parallelogram,
-        label="Setup: pick source + assign id",
-        tool_command="$setup_cmd",
-        parse_json="true"
-    ]
+  // THE resume gate. pending = sources-on-disk minus ledger.jsonl ids,
+  // recomputed from scratch every pass -- restart-from-start is therefore
+  // automatically correct with zero re-cost and zero duplicate content.
+  // Three-way outcome (not two): an unreadable/corrupt ledger must fail
+  // loud, not be silently treated as "no sources" (which would look like a
+  // successful, empty drain and mask real data loss).
+  select_source [
+    shape=parallelogram,
+    label="select_source\n(THE resume gate --\npending = sources/ - ledger.jsonl)",
+    timeout="2m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.select_source --wiki-root \"$wiki_root\" --restrict \"$restrict_to_sources\""
+  ]
 
-    // RUN_SYNTHESIZE (folder sub-pipeline): runs synthesize.dot with the
-    // context keys produced by the setup node. Child inherits context clone,
-    // so $source_path/$wiki_dir/etc. resolve directly inside the child.
-    run_synthesize [
-        shape=folder,
-        label="Synthesize source",
-        dot_file="$synthesize_dot"
-    ]
+  // Per-invocation drain cap. See header "THE DRAIN BOUND".
+  drain_bound [
+    shape=parallelogram,
+    label="drain_bound\n(per-invocation source cap,\nin-context counter, no disk file)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.drain_bound --count \"$drain_count\" --max-sources \"$max_sources_per_run\""
+  ]
 
-    // TAMPER_CHECK (deterministic tool): reads the before-synthesis snapshot
-    // written by setup (path embedded in $tamper_check_cmd), calls
-    // _detect_and_undo_tamper from cli/lib.py, and emits {"tampered":"false"}
-    // or {"tampered":"true"}.
-    //
-    // Invariant: the ledger (.processed.jsonl) and _archive/ are CLI-exclusive.
-    // The LLM is FORBIDDEN from writing either during synthesis.  If it did,
-    // _detect_and_undo_tamper undoes the damage (truncates fabricated ledger
-    // lines, returns falsely-archived files to the inbox), prints a loud error
-    // to stderr, and emits tampered=true so the router sends this source to
-    // _failed/ instead of _archive/.
-    //
-    // Only fires on the converged path (outcome=success from run_synthesize).
-    // Non-converged sources go directly to fail_handler -- tamper check is
-    // irrelevant when synthesis did not complete.
-    tamper_check [
-        shape=parallelogram,
-        label="Tamper check",
-        tool_command="$tamper_check_cmd",
-        parse_json="true"
-    ]
+  // ===========================================================================
+  // DESIGN.md §5 -- source-kind detection + deterministic segmentation.
+  // Runs once per freshly-selected SOURCE (not per segment -- see
+  // select_segment below for the per-segment loop-back).
+  // ===========================================================================
 
-    // ARCHIVE (deterministic tool): move source -> _archive/, append ledger,
-    // mark ingested in .sources.json. Uses $archive_cmd from context (set by
-    // setup for the current source).
-    archive [
-        shape=parallelogram,
-        label="Archive source",
-        tool_command="$archive_cmd"
-    ]
+  // Code-first (LANGUAGE_PHILOSOPHY / this project's own A/B/C eval): decides
+  // article|meeting|stream|repo from header fields + turn-format density.
+  // NEVER silently defaults to article on ambiguity -- prints kind_unknown
+  // and routes to the cheap classify_kind box instead. See detect_kind.py's
+  // module docstring for the full signal priority order and the real-corpus
+  // investigation behind it.
+  detect_kind [
+    shape=parallelogram, penwidth=2,
+    label="detect_kind\n(code-first article|meeting|stream|repo\ndetection, DESIGN.md §5)",
+    parse_json="true",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.detect_kind --wiki-root \"$wiki_root\""
+  ]
 
-    // FAIL_HANDLER (deterministic tool): move non-converged or tampered source
-    // -> _failed/ so the inbox shrinks and the drain loop continues cleanly.
-    // Uses $fail_cmd from context (set by setup for the current source).
-    fail_handler [
-        shape=parallelogram,
-        label="Route to _failed/",
-        tool_command="$fail_cmd"
-    ]
+  // Reached ONLY when detect_kind's signals were genuinely ambiguous.
+  // Deliberately cheap: low reasoning effort, fast/small model -- this is
+  // the "only reach for an LLM where code genuinely cannot answer" arm, not
+  // the main routing decision (AP-2, DESIGN.md §12.1: this box NEVER routes
+  // the graph directly -- read_kind_verdict below does that deterministically).
+  classify_kind [
+    shape=box, penwidth=2,
+    label="classify_kind\n(LLM: closed-vocabulary kind verdict,\nreached only on kind_unknown)",
+    llm_model="claude-haiku-*",
+    reasoning_effort="low",
+    prompt="detect_kind's code-based signals were ambiguous for this source (see .ai/current_kind.json for what it found). Read .ai/current_source.txt for the source id, then read the first ~200 lines of sources/<that id> -- no more, this is meant to be cheap. Decide which ONE of these four words best describes it, using DESIGN.md's definitions: 'article' (a one-shot, immutable document/prose), 'meeting' (a one-shot recording transcript, may have Duration:/Speakers: fields and timestamped speaker turns), 'stream' (an append-only chat/channel export, may have Lookback:/Downloaded: fields and repeats across many days), 'repo' (a mutable code/file snapshot). Write EXACTLY one of these four words, lowercase, nothing else -- no punctuation, no explanation -- to .ai/kind-verdict.txt."
+  ]
 
-    done [shape=Msquare, label="Done"]
+  // THE AP-2 gate (DESIGN.md §12.1: never route on LLM token output).
+  // Validates classify_kind's verdict against the closed vocabulary before
+  // anything routes on it. An invalid or missing verdict routes to
+  // kind_invalid -> exit rather than silently guessing.
+  read_kind_verdict [
+    shape=parallelogram, penwidth=2,
+    label="read_kind_verdict\n(closed-vocabulary check;\ninvalid -> exit, never a guess)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.detect_kind --wiki-root \"$wiki_root\" --from-verdict .ai/kind-verdict.txt"
+  ]
 
-    start -> setup
+  // DESIGN.md §5's actual fix for the live stream-source defect: a
+  // kind=stream source (Teams group-chat export) gaining new turns arrives
+  // under a NEW filename (verified in the real corpus -- the filename
+  // encodes a growing export date range), so select_source's ledger-by-
+  // filename resume gate sees it as a brand-new source and would otherwise
+  // re-ingest ~95% duplicate content whole. watermark tracks a durable,
+  // per-CHAT-ID watermark (never filename, never a content hash -- see
+  // watermark.py's module docstring) and bounds THIS pass to only the
+  // delta beyond it (+ a small overlap window), before segment_source ever
+  // runs. Reached ONLY for kind=stream -- every other kind goes straight
+  // to segment_source, unchanged.
+  watermark [
+    shape=parallelogram, penwidth=2,
+    label="watermark\n(stream-only: durable per-identity\nwatermark -- delta|no_delta|full|\nwatermark_reset, DESIGN.md §5)",
+    parse_json="true",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.watermark --wiki-root \"$wiki_root\""
+  ]
 
-    // SETUP routes EXHAUSTIVELY (no dead-end).
-    // Conditional edges are tried first; the single unconditional fallback
-    // (else) is the safety net for any unexpected state.
-    setup -> done          [label="inbox empty",          condition="context.has_source=false"]
-    setup -> run_synthesize [label="source ready",         condition="context.has_source=true"]
-    setup -> done          [label="else (unexpected -> done)"]
+  // no_delta's clean-skip target: identical ledger mechanics to commit_skip
+  // (nothing was woven -- there is nothing to revert), but loops back to
+  // select_source, NOT select_segment -- this pass never ran segment_source,
+  // so there is no per-segment manifest for this source to resume from.
+  commit_no_delta [
+    shape=parallelogram,
+    label="commit_no_delta\n(no new content beyond watermark --\nledger as skip, NO LLM call)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.commit --wiki-root \"$wiki_root\" --decision skip --append-ledger ledger.jsonl --append-log log.md"
+  ]
 
-    // RUN_SYNTHESIZE routes:
-    //   converged  -> tamper_check (verify LLM did not write process state)
-    //   everything else -> fail_handler (non-convergence, error, unset)
-    // The unconditional fallback is the fail-safe direction -- more drain,
-    // never premature done.
-    //
-    // NOTE on condition value: the assess node in synthesize.dot reports its
-    // verdict as a FLAT bare-JSON final message, e.g.
-    // {"status": "success", "preferred_label": "converged"}. wiki-weaver runs
-    // exclusively on the engine's spawn execution path, where the verdict is
-    // extracted by parsing the model's final text message (_parse_outcome,
-    // with last-{...} embedded-JSON recovery) -- report_outcome tool-call
-    // arguments are never captured on this path, so the final message is the
-    // ONLY channel that routes. The engine propagates the parsed
-    // preferred_label as the folder node's preferred_label, and
-    // conditions.py _resolve_key("outcome") returns preferred_label if set,
-    // falling back to status.value only when preferred_label is null.
-    // Therefore the condition must match "converged" (the actual resolved
-    // value), NOT "outcome=success" (which is shadowed by preferred_label).
-    run_synthesize -> tamper_check [label="converged",           condition="outcome=converged"]
-    run_synthesize -> fail_handler [label="else (non-converged)"]
+  // THE split step. Deterministically re-derived every time this source is
+  // (re)selected (cheap, DESIGN.md §14) -- never trusts a stale on-disk
+  // manifest across a crash/resume. Splits ONLY at safe unit boundaries
+  // (turn starts for meeting/stream, heading/paragraph breaks otherwise);
+  // a source under budget still produces exactly one segment (one uniform
+  // code path). For kind=stream this reads the BOUNDED delta watermark
+  // wrote, never the raw (possibly ~95%-duplicate) file -- see
+  // segment_source.py's content-override read. See segment_source.py's
+  // module docstring for the byte budget's justification against the real
+  // corpus.
+  segment_source [
+    shape=parallelogram, penwidth=2,
+    label="segment_source\n(deterministic split at safe\nboundaries; DESIGN.md §5)",
+    timeout="2m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.segment_source --wiki-root \"$wiki_root\" --max-bytes \"$segment_max_bytes\""
+  ]
 
-    // TAMPER_CHECK routes EXHAUSTIVELY.
-    // Clean path: archive (write process state, then loop back).
-    // Tamper path: fail_handler (source goes to _failed/, tamper already undone).
-    tamper_check -> archive      [label="clean",               condition="context.tampered=false"]
-    tamper_check -> fail_handler [label="tampered",            condition="context.tampered=true"]
-    tamper_check -> fail_handler [label="else (unexpected -> fail)"]
+  // THE segment-granularity resume gate -- identical doctrine to
+  // select_source, one level down: pending = {1..total} MINUS ledgered
+  // segment indices for THIS source, recomputed fresh from ledger.jsonl on
+  // every pass. Reused for both the first pick (right after segment_source)
+  // and every subsequent pick (looped back from commit_accept/commit_skip).
+  select_segment [
+    shape=parallelogram, penwidth=2,
+    label="select_segment\n(THE segment resume gate --\npending = {1..total} - ledgered)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.segment_source --wiki-root \"$wiki_root\" --select"
+  ]
 
-    // Loop back to drain the next source.
-    // Both edges use loop_restart="true" so the engine restarts the outer
-    // loop counter cleanly on each successful or failed source.
-    archive      -> setup [loop_restart="true"]
-    fail_handler -> setup [loop_restart="true"]
+  // ===========================================================================
+
+  // Deterministic candidate-page assembly -- the READ bound (DESIGN.md §3,
+  // S7 BM25 result). UNCHANGED retrieval logic. `--emit-strength` is
+  // deliberately NOT passed here anymore (see header) -- this production
+  // pipeline no longer routes on slice_strength; build_catalog next gives
+  // weave what it needs to decide create-vs-fold for itself, so there is
+  // nothing to parse_json here either. Queries .ai/current-segment-content.md
+  // (written by select_segment) when present -- see retrieve_slice.py's
+  // content_path handling.
+  retrieve_slice [
+    shape=parallelogram, penwidth=2,
+    label="retrieve_slice\n(deterministic candidate pages --\nthe READ bound, no strength routing)",
+    timeout="2m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.retrieve_slice --wiki-root \"$wiki_root\" --strategy index+link-graph+lexical"
+  ]
+
+  // THE fix (see header / evals/compounding/PRECOMMIT-INDEX.md): a compact,
+  // whole-wiki catalog -- filename, title, one-line summary, no bodies --
+  // giving weave what it KNOWS EXISTS, as distinct from retrieve_slice's
+  // slice (what it may READ). Purely deterministic bookkeeping, no model
+  // call -- the decision itself still happens in weave, same agent, same
+  // act, one pass. Never truncates silently; see build_catalog.py.
+  build_catalog [
+    shape=parallelogram, penwidth=2,
+    label="build_catalog\n(whole-wiki catalog: title + one-line\nsummary per page, no bodies --\nwhat weave KNOWS EXISTS)",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.build_catalog --wiki-root \"$wiki_root\""
+  ]
+
+  // THE fix this pipeline never built (see delivery report / the task that
+  // commissioned it): the source gist itself (../amplifier-bundle-llm-wiki/
+  // docs/llm-wiki-pattern.md L50) describes ingest as "the LLM reads the
+  // source, discusses key takeaways with you, writes a summary page" --
+  // the discussion sits BETWEEN reading and writing. review_gate (below)
+  // sits AFTER weave writes -- measured inert (-0.5pp single-source ratio,
+  // n=3 vs n=2). The lens/canon PRE-write direction measured -6.4pp and is
+  // proven effective. This is that same pre-write site, built the same way
+  // prepare_review_brief/prepare_guidance_brief already prove twice: a
+  // deterministic node (no model call) assembling a self-contained brief --
+  // source id, kind, segment position, a deterministic (non-LLM) gist of
+  // the source's opening content, the read-bounded candidate pages, and
+  // build_catalog's own already-computed "Predicted merge targets" section,
+  // read verbatim. FAIL LOUD (never fabricate) if current_source.txt is
+  // missing/unreadable -- identical contract to prepare_review_brief.
+  prepare_takeaways_brief [
+    shape=parallelogram, penwidth=2,
+    label="prepare_takeaways_brief\n(self-contained PRE-write brief:\nsource gist, candidate pages,\npredicted merge targets; FAIL LOUD)",
+    parse_json="true",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.takeaways_brief --wiki-root \"$wiki_root\""
+  ]
+
+  // The gate itself: human or agent proxy, freeform (same mode as
+  // collect_guidance below) -- describe what to emphasize while weaving
+  // this source in, or say nothing/leave blank if there is no particular
+  // emphasis needed. Each site's ANSWERER is selectable independently via
+  // --gate-mode-for takeaways_gate=<fail|auto-approve|console|proxy> (see
+  // wiki_weaver.aitl.run) -- auto-approve here is a legitimate, intended
+  // "no particular emphasis" answer, not a refusal (see persist_takeaways.py).
+  takeaways_gate [
+    shape=hexagon,
+    mode="freeform",
+    label="takeaways_gate\n(human or agent -- discuss what this\nsource is about BEFORE it is woven in)",
+    description="$takeaways_brief",
+    prompt="Using the brief above (what this source looks like it's about, the candidate pages weave may read, and the pages this source is predicted to touch), describe what should be emphasized while weaving this source into the wiki -- or say nothing in particular if no special emphasis is needed."
+  ]
+
+  // Reads .ai/takeaways-answer.json (stamped, freshness-checked), NOT an
+  // environment variable -- a verified platform defect means dotted env
+  // var names (tool_env would produce HUMAN.GATE.TEXT from the engine's
+  // own "human.gate.text" context key) do not reliably survive subprocess
+  // dispatch on this platform. See wiki_weaver.aitl.freeform_bridge's
+  // module docstring for the full story and wiki_weaver.ingest
+  // .persist_takeaways's module docstring for this node's own contract.
+  // Never shell-interpolate the free text itself either way.
+  persist_takeaways [
+    shape=parallelogram,
+    label="persist_takeaways\n(write emphasis to file, if any --\nnever shell-interpolate free text)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.persist_takeaways --wiki-root \"$wiki_root\" --out .ai/takeaways-guidance.md"
+  ]
+
+  // THE one LLM pass: fuse the source into the wiki. The READ bound is
+  // still explicit and structural (retrieve_slice's slice) -- but weave now
+  // also reads the whole-wiki catalog build_catalog wrote, so it knows what
+  // pages EXIST beyond its own read-bounded slice, and decides for itself
+  // whether this source belongs in an existing page or warrants a new one --
+  // exactly what a single interactive session would do (see header). It may
+  // create new pages (linking them from an appropriate page, e.g. index.md)
+  // or fold into existing ones; the slice bounds what it may READ, never
+  // what it may WRITE.
+  weave [
+    shape=box, penwidth=2,
+    label="weave\n(THE one LLM pass: read the catalog,\ndecide create-vs-fold, write, under lens)",
+    prompt="Read .ai/current_source.txt for the ORIGINAL id of the source you are folding in, and .ai/current_slice.json for the candidate pages you MAY read with your file tools -- this is an access boundary, not an assignment: do not read files outside this slice, but you are not required to read everything inside it either. Consult the catalog to decide which entities this source is about and which existing pages they may belong to, then read only the candidate pages relevant to those entities. Every wiki page lives under wiki/ relative to your working directory: both .ai/current_slice.json and .ai/current_catalog.md list pages as wiki/<filename> (e.g. wiki/index.md) -- always read and write pages at that exact wiki/-relative path, never a bare filename, so a page you create cannot land outside wiki/. Read .ai/current_catalog.md for a compact listing of EVERY page that EXISTS in the wiki (path, title, source count, one-line summary, no bodies) -- this tells you what already exists, even pages outside your read slice; it does not grant permission to read them. The catalog ends with a short 'Predicted merge targets' section naming the pages this source is predicted to touch, ranked before you ever read it -- treat each one as a falsifiable guess to confirm or reject as you place each entity, not as an instruction: if an entity actually belongs on a different page, or on none of them, place it there instead. Read .ai/current-segment-content.md for the exact passage of the source to fold in -- this may be the full source, or one bounded segment of a larger one (DESIGN.md §5); do not read the file under sources/ directly, current-segment-content.md is authoritative for this pass. In addition to the entity decomposition below, write or update exactly one page capturing what this source AS A WHOLE says and argues -- its own thesis, scope, and conclusions -- linked from an appropriate page; this source-level page is additive to the per-entity updates, never a substitute for them, and it is the only page shaped to hold the source's argument rather than a fact about one thing it mentions. Before deciding what else to write, extract the distinct entities this source is about: the named things and named ideas it discusses. As a rough calibration, not a quota: comparable sources average a handful of entities each, and a source genuinely about one thing should yield exactly one. Type each entity as exactly one of 'concept' (an abstraction or named idea, e.g. 'context engineering', 'retrieval-augmented generation'), 'tool' (a proper noun: a product, protocol, model, company, or framework), 'person' (an author or named figure), or 'claim' (a thesis that multiple sources take a position on, owned by no single concept, tool, or person) -- keep concept and tool separate even when they share a name: an article about a named thing and an article about the kind of idea it represents are different pages, and collapsing that distinction is exactly how a hub page ends up swallowing its neighbors. A concept, tool, or person page answers 'what is this thing'; a claim page answers 'what do these sources contend, and do they agree' -- so type an entity 'claim' only when the catalog already shows another source taking a position on the same thesis (an existing claim page, or a concept/tool/person page's summary arguing it); this source being the first to raise it is not yet a claim, it is supporting content on whichever concept/tool/person page it belongs to until a second source agrees, extends, or pushes back. A claim page is where the DISAGREEMENT CONTRACT below does its most important work: record each source's position on the claim by name, not folded into whichever entity happened to raise it first. Then, for EACH entity in turn, consult the catalog and decide for yourself whether it belongs on one of the slice's existing pages (update that page with what this source adds about it) or whether it warrants a brand-new page -- one decision per entity, so a single source may touch several pages in addition to the source-level page above. When you create a new page, add a wikilink to it from an appropriate page (e.g. wiki/index.md) and update wiki/index.md accordingly. Also update wiki/overview.md -- the wiki's evolving synthesis of the corpus as a whole -- to reflect what this source adds: strengthen it where this source supports the existing synthesis, and note explicitly where this source challenges or complicates it. When citing this material in page frontmatter/citations, cite the ORIGINAL source id from .ai/current_source.txt, never a segment filename. Beyond that page-level citation, attribute individual claims as you write them: after a sentence or claim you drew from this source, cite the same original source id inline (a short slug of it is fine) so a specific claim on a merged page can be traced back to the specific source that contributed it, not just the page as a whole -- this is what makes a merged page auditable rather than an unattributable blend. Work under the lens at lens/: canon docs in lens/canon/ outrank this source, and standing corrections in lens/corrections/ must not be silently reintroduced. RETENTION CONTRACT: absence of mention of a fact in this source is NOT evidence that the fact is stale or should be removed -- only remove or downgrade a claim if this source, or the lens, explicitly contradicts it. DISAGREEMENT CONTRACT: when this source contains a disagreement, two competing framings of the same thing, an objection, or a thread that was left open, record WHO held WHICH position and how it ended -- resolved, dropped, or still open. Do NOT collapse a two-sided exchange into a settled conclusion: phrases like 'the team converged on X', 'X and Y aligned on', or 'it was decided' erase who objected and why, and that is exactly the information a reader later needs. If a question was left unresolved, say so in those words rather than writing the winning side as settled fact. If .ai/takeaways-guidance.md exists, read it first: it carries emphasis requested during a discussion of this source's key takeaways that happened before you started writing (human or agent proxy, at takeaways_gate) -- weight your entity and placement decisions accordingly, then delete that file so it is never re-applied to a later pass; its absence simply means no special emphasis was requested, which is normal. If .ai/review-guidance.md exists, this is a second attempt at the same source: read it, apply the steering, and then delete that file so it is never re-applied to a later source. Your work will be validated by code after this node -- do not attempt to grade it yourself.",
+    fallback_retry_target="reweave_bound"
+  ]
+
+  // Validates weave's output -- the only writer now, so there is no second
+  // fork to converge here.
+  validate [
+    shape=parallelogram, penwidth=2,
+    label="validate\n(structural checks, deterministic;\nROUTES: structural_ok | structural_bad)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.validate --wiki-root \"$wiki_root\" --out .ai/validation-report.md && printf structural_ok || printf structural_bad"
+  ]
+
+  // Attempt cap for THIS source: `weave` is the only writer now (see
+  // header), so retry always re-runs it directly; give_up routes to
+  // prepare_quarantine_brief below (NOT straight to commit_skip -- see
+  // that node's comment for why, and pipeline/ingest.dot's header for the
+  // defect this fixes and the termination argument). UNCHANGED module,
+  // UNCHANGED contract -- evals/arms/ingest-b.dot and ingest-c.dot also
+  // call this exact CLI and are completely unaffected by this fix.
+  reweave_bound [
+    shape=parallelogram,
+    label="reweave_bound\n(attempt cap for THIS source;\nprintf retry | give_up)",
+    tool_env="max_reweave,py",
+    tool_command="$py -m wiki_weaver.ingest.reweave_bound --wiki-root \"$wiki_root\" --max \"$max_reweave\""
+  ]
+
+  // THE fix for "quarantine bypasses the reviewer entirely" (see header /
+  // delivery report): reweave_bound's give_up used to route straight to
+  // commit_skip -- a human/proxy reviewer NEVER saw a source that
+  // exhausted its re-weave attempts, even though the underlying weave was
+  // often substantive and on-topic (real losses: an "arguably the single
+  // most central-to-thesis article in the whole corpus" case). This node
+  // builds an unmissable review_gate brief -- validate's actual findings,
+  // quoted, plus how many attempts were spent -- and routes to review_gate
+  // exactly ONCE per source (a one-shot latch, .ai/quarantine-state.json,
+  // separate from and never mutating reweave_bound's own attempts file).
+  // A SECOND give_up for the SAME source (e.g. a guided re-weave that
+  // fails validation again) routes straight to commit_quarantine instead --
+  // no second chance, no possibility of an unbounded reviewer<->reweave
+  // cycle. See wiki_weaver.ingest.quarantine_brief's module docstring for
+  // the full termination argument.
+  prepare_quarantine_brief [
+    shape=parallelogram, penwidth=2,
+    label="prepare_quarantine_brief\n(ONE-TIME review offer on exhaustion:\nvalidate findings + attempt count,\nnever a second chance)",
+    parse_json="true",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.quarantine_brief --wiki-root \"$wiki_root\""
+  ]
+
+  // Unchanged from ingest.dot -- deterministic, not an LLM judge.
+  retention_check [
+    shape=parallelogram, penwidth=2,
+    label="retention_check\n(deterministic shrinkage /\nheading-loss detector +\nsnapshot-on-suspicion)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.retention_check --wiki-root \"$wiki_root\" --snapshot-on-suspicion --out .ai/retention-report.md"
+  ]
+
+  // Unchanged from ingest.dot -- FAIL LOUD is this tool's exit behavior.
+  budget [
+    shape=parallelogram,
+    label="budget\n(append duration/pages/tokens\nto cost.jsonl; FAIL LOUD\nover per-source ceiling)",
+    tool_env="per_source_time_ceiling,py",
+    tool_command="$py -m wiki_weaver.ingest.budget --wiki-root \"$wiki_root\" --append cost.jsonl"
+  ]
+
+  // review_gate is now reached from EXACTLY ONE place: reweave_bound's
+  // one-time quarantine offer via prepare_quarantine_brief below (see
+  // header: retired from the normal budget path, measured inert; preserved
+  // ONLY for the quarantine rescue). prepare_quarantine_brief writes the
+  // SAME review_brief_file shape prepare_review_brief used to (reusing
+  // review_brief.build_brief -- see wiki_weaver/ingest/review_brief.py),
+  // so review_gate itself needs no changes to handle this path.
+  review_gate [
+    shape=hexagon, penwidth=2,
+    label="review_gate\n(QUARANTINE RESCUE ONLY --\nhuman or proxy: accept / guide / skip)",
+    description="$review_brief"
+  ]
+
+  // THE fix for "the Guide path has never once worked" (see header /
+  // delivery report): collect_guidance used to carry NOTHING but its
+  // six-word node label -- the same vacuum review_gate had before
+  // prepare_review_brief existed. Both live attempts at [B] Guide hit this gate
+  // with zero grounding and (correctly) refused, crashing the pipeline
+  // with no_matching_edge. This node reuses the SAME weave brief
+  // review_gate just showed, plus (best-effort) the reviewer's own stated
+  // reason for choosing Guide from .ai/gate-decisions.jsonl -- see
+  // src/wiki_weaver/ingest/guidance_brief.py's module docstring.
+  prepare_guidance_brief [
+    shape=parallelogram, penwidth=2,
+    label="prepare_guidance_brief\n(self-contained brief for\ncollect_guidance: weave brief +\nreviewer's own Guide reason if any)",
+    parse_json="true",
+    timeout="1m",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.guidance_brief --wiki-root \"$wiki_root\""
+  ]
+
+  collect_guidance [
+    shape=hexagon,
+    mode="freeform",
+    label="collect_guidance\n(freeform steering text\nfor the re-weave)",
+    description="$guidance_brief",
+    prompt="Using the brief above (what was woven, and why steering was requested if noted), describe what weave should do differently on the next attempt for this source."
+  ]
+
+  persist_guidance [
+    shape=parallelogram,
+    label="persist_guidance\n(write steering to file --\nnever shell-interpolate free text)",
+    tool_env="human.gate.text,py",
+    tool_command="$py -m wiki_weaver.ingest.persist_guidance --out .ai/review-guidance.md"
+  ]
+
+  commit_accept [
+    shape=parallelogram,
+    label="commit_accept\n(archive source, append\nledger + cost + log.md,\none git commit)",
+    parse_json="true",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.commit --wiki-root \"$wiki_root\" --decision accept --append-ledger ledger.jsonl --append-log log.md --ingested-count \"$ingested_count\""
+  ]
+
+  commit_skip [
+    shape=parallelogram,
+    label="commit_skip\n(reviewer's OWN deliberate\n[C] Skip -- revert weave's edits,\nledger as 'skip', commit ledger only)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.commit --wiki-root \"$wiki_root\" --decision skip --append-ledger ledger.jsonl --append-log log.md"
+  ]
+
+  // THE ledger-distinction fix (see header): a source auto-quarantined
+  // after ALREADY being offered its one post-exhaustion review (see
+  // prepare_quarantine_brief above) is ledgered as "quarantine", never
+  // "skip" -- so a reader of ledger.jsonl can tell a reviewer's own
+  // deliberate choice (commit_skip above) apart from an outcome the
+  // reviewer never got a second chance to weigh in on. Same revert/
+  // ledger/commit mechanics as commit_skip otherwise (see commit.py's
+  // _do_skip -- shared implementation, distinct --decision value).
+  commit_quarantine [
+    shape=parallelogram,
+    label="commit_quarantine\n(AUTOMATIC -- second exhaustion after\none review already offered; revert edits,\nledger as 'quarantine', commit ledger only)",
+    tool_env="py",
+    tool_command="$py -m wiki_weaver.ingest.commit --wiki-root \"$wiki_root\" --decision quarantine --append-ledger ledger.jsonl --append-log log.md"
+  ]
+
+  start -> select_source
+
+  select_source -> drain_bound [label="has_source",    condition="context.tool.last_line=has_source"]
+  select_source -> exit        [label="no_source",     condition="context.tool.last_line=no_source"]
+  select_source -> exit        [label="ledger corrupt\n(fail loud)", condition="context.tool.last_line=ledger_corrupt"]
+
+  // STALE-WATERMARK GUARD (see select_source.py's module docstring): an
+  // already-ledgered kind=stream source whose file has grown, on disk,
+  // past its own durable watermark -- e.g. a feed that reuses the SAME
+  // filename on every periodic re-export instead of embedding a growing
+  // date range in a NEW one (verified in KNOWN_ISSUES.md #6's corrected
+  // root cause). Silently reopening it was proven unsafe (segment-ledger
+  // index collision stamps the growth as covered without ever weaving
+  // it -- worse than the original bug), so this fails loud instead of
+  // silently draining the rest of the run while this source falls behind.
+  select_source -> exit        [label="growth_detected\n(ledgered stream source grew\npast its watermark -- fail loud)", condition="context.tool.last_line=growth_detected"]
+
+  // curate_gate retired from this path (see header: measured -1.9pp,
+  // preserved as evals/arms/ingest-curate.dot) -- drain_bound now proceeds
+  // straight to detect_kind, no source-curation checkpoint in between.
+  drain_bound -> detect_kind [label="continue",         condition="context.drain_status=continue"]
+  drain_bound -> exit        [label="budget_exhausted", condition="context.drain_status=budget_exhausted"]
+
+  // detect_kind's routing: meeting/article/repo go straight to segmentation
+  // unchanged. stream routes through watermark FIRST (DESIGN.md §5's fix --
+  // bound the pass to the delta before segment_source ever sees the whole
+  // file). kind_unknown is the only genuinely ambiguous case, and it is the
+  // ONLY path that ever reaches an LLM for the kind decision itself.
+  detect_kind -> segment_source [label="meeting", condition="context.kind=meeting"]
+  detect_kind -> watermark      [label="stream\n(watermark BEFORE segment)", condition="context.kind=stream"]
+  detect_kind -> segment_source [label="article", condition="context.kind=article"]
+  detect_kind -> segment_source [label="repo",    condition="context.kind=repo"]
+  detect_kind -> classify_kind  [label="kind_unknown\n(code could not decide)", condition="context.kind=kind_unknown"]
+
+  classify_kind -> read_kind_verdict
+
+  // Same landing as detect_kind's edges above (stream -> watermark, not
+  // straight to segment_source), plus the AP-2 catch-all: an invalid/
+  // missing verdict is a hard stop, never a guess.
+  read_kind_verdict -> segment_source [label="meeting", condition="context.kind=meeting"]
+  read_kind_verdict -> watermark      [label="stream\n(watermark BEFORE segment)", condition="context.kind=stream"]
+  read_kind_verdict -> segment_source [label="article", condition="context.kind=article"]
+  read_kind_verdict -> segment_source [label="repo",    condition="context.kind=repo"]
+  read_kind_verdict -> exit           [label="kind_invalid\n(fail loud, never guess)", condition="context.kind=kind_invalid"]
+
+  // watermark's four (+1) sentinels (DESIGN.md §5). delta/full/
+  // watermark_reset all bound segment_source's input to whatever
+  // current_source_content_file holds (raw file for full/reset, delta+
+  // overlap for delta) -- same downstream target, different content.
+  // no_delta is the fix's whole point: skip straight to a clean ledger
+  // entry, NO segment_source, NO retrieve_slice, NO LLM call. identity_failed
+  // is the fail-loud arm (missing/unreadable source, or no stable Chat ID/
+  // Call ID field) -- never silently guess an identity.
+  watermark -> segment_source [label="delta\n(new content beyond watermark)", condition="context.mode=delta"]
+  watermark -> segment_source [label="full\n(first sight of this identity)", condition="context.mode=full"]
+  watermark -> segment_source [label="watermark_reset\n(history diverged --\nfall back to full, say so)", condition="context.mode=watermark_reset"]
+  watermark -> commit_no_delta [label="no_delta\n(nothing new -- skip,\nno LLM call)", condition="context.mode=no_delta"]
+  watermark -> exit            [label="identity_failed\n(fail loud, never guess)", condition="context.mode=identity_failed"]
+
+  // no_delta's clean skip loops straight back to select_source -- this
+  // pass never ran segment_source, so select_segment (which needs a
+  // manifest for THIS source) is not the right resume target.
+  commit_no_delta -> select_source [loop_restart="true"]
+
+  // segment_source's split step: "segmented" and "single" both land on the
+  // same resume gate (select_segment) -- see segment_source.py's docstring
+  // for why a single-segment source still takes this exact code path.
+  segment_source -> select_segment [label="segmented", condition="context.tool.last_line=segmented"]
+  segment_source -> select_segment [label="single",    condition="context.tool.last_line=single"]
+  segment_source -> exit           [label="segment_failed\n(fail loud)", condition="context.tool.last_line=segment_failed"]
+
+  // select_segment is reached from TWO places (right after a fresh split,
+  // and looped back from commit_accept/commit_skip below) but has exactly
+  // these same two outcomes either way.
+  select_segment -> retrieve_slice [label="has_segment", condition="context.tool.last_line=has_segment"]
+  select_segment -> select_source  [label="no_segment\n(all segments done)", condition="context.tool.last_line=no_segment", loop_restart="true"]
+
+  // No routing decision here anymore (see header): retrieve_slice bounds
+  // what may be READ, build_catalog reports what EXISTS, and weave alone
+  // decides + writes -- one path, not a fork.
+  retrieve_slice -> build_catalog
+  build_catalog  -> prepare_takeaways_brief
+
+  // THE fix this pipeline never built: the pre-write discussion site (see
+  // prepare_takeaways_brief above). persist_takeaways always runs (whether
+  // the answerer gave real emphasis or none at all) -- weave then reads
+  // .ai/takeaways-guidance.md directly IF persist_takeaways wrote one.
+  prepare_takeaways_brief -> takeaways_gate
+  takeaways_gate          -> persist_takeaways
+  persist_takeaways       -> weave
+
+  weave -> validate
+
+  validate -> retention_check [label="structural_ok",  condition="context.tool.last_line=structural_ok"]
+  validate -> reweave_bound   [label="structural_bad", condition="context.tool.last_line=structural_bad"]
+
+  reweave_bound -> weave                   [label="retry",   condition="context.tool.last_line=retry", loop_restart="true"]
+  reweave_bound -> prepare_quarantine_brief [label="give_up\n(exhausted -- offer ONE review\nbefore quarantine)", condition="context.tool.last_line=give_up"]
+
+  // prepare_quarantine_brief's routing: needs_review is the FIRST
+  // exhaustion for this source (one-time latch not yet set) -- go to
+  // review_gate with the quarantine brief just written. already_reviewed
+  // is a SECOND exhaustion for the SAME source (latch already set) --
+  // auto-quarantine straight to commit_quarantine, no more review. See
+  // that node's comment above and quarantine_brief.py's module docstring
+  // for the termination argument.
+  prepare_quarantine_brief -> review_gate      [label="needs_review\n(first exhaustion -- ask the reviewer)", condition="context.quarantine_status=needs_review"]
+  prepare_quarantine_brief -> commit_quarantine [label="already_reviewed\n(second exhaustion -- auto quarantine)", condition="context.quarantine_status=already_reviewed"]
+
+  retention_check -> budget
+  // review_gate retired from this path (see header): budget proceeds
+  // straight to commit_accept -- no post-write approval. Measured against
+  // auto-approve as statistically indistinguishable (-0.5pp, inside noise).
+  budget -> commit_accept
+
+  review_gate -> commit_accept        [label="[A] Accept"]
+  review_gate -> prepare_guidance_brief [label="[B] Guide (steer and re-weave)"]
+  review_gate -> commit_skip          [label="[C] Skip (log only, do not merge)"]
+
+  // THE fix (see prepare_guidance_brief above): collect_guidance is now
+  // reached via a deterministic brief-building node instead of directly --
+  // same "[B] Guide" edge label the engine matches against the chosen
+  // option, just retargeted so collect_guidance is never asked cold.
+  prepare_guidance_brief -> collect_guidance
+
+  collect_guidance -> persist_guidance
+  persist_guidance -> weave [loop_restart="true"]
+
+  // DESIGN.md §5: loop back to the SEGMENT resume gate, not straight to the
+  // next source -- select_segment itself decides whether more of THIS
+  // source remains (has_segment) or it's time to advance (no_segment).
+  commit_accept     -> select_segment [loop_restart="true"]
+  commit_skip       -> select_segment [loop_restart="true"]
+  commit_quarantine -> select_segment [loop_restart="true"]
 }
