@@ -514,14 +514,14 @@ def _parse_transcript_header(text: str) -> dict:
 
         Source: https://example.com/meetings/...
         Duration: 1:00:50
-        Speakers: Chris Park, Alex Rivera, Samuel Lee
+        Speakers: Nadia Brennan, Oskar Lindqvist, Rune Osgood
         Date: 5/29/2026, 11:07:43 AM
         Chat type: Meeting
-        Attendees: Samuel Lee, Chris Park, Alex Rivera
+        Attendees: Rune Osgood, Nadia Brennan, Oskar Lindqvist
 
         ---
 
-        [0:00:04] Chris Park: ...
+        [0:00:04] Nadia Brennan: ...
 
     Returns a dict with keys ``author``, ``url``, ``date``, ``title`` (all
     default to ``None``). Returns all-None for files that are not recognised

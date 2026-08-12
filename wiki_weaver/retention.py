@@ -1,7 +1,7 @@
 # pyright: reportMissingImports=false
 """Claim-retention backstop gate (Phase 1) -- wired into wiki_weaver/lib.py's ingest().
 
-THE PROBLEM (confirmed on real incident fixtures, not hypothesized): wiki-weaver's
+THE PROBLEM (confirmed by replaying before/after page pairs, not hypothesized): wiki-weaver's
 synthesis prompt genuinely tries to preserve prior content ("FUSE claims, don't
 just append"), but nothing at runtime checks whether prior content actually
 SURVIVED a re-write. ``wiki_weaver.grading.grade_claim_retention`` (relocated

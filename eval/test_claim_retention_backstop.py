@@ -6,9 +6,11 @@ wiki_weaver.grading.grade_claim_retention() into the real ingest path as an
 independent, LLM-judge-backed re-check of whether a page re-write silently
 dropped grounded claims.
 
-  1. Real incident-replay (eval/fixtures/incident_2026_07/) -- confirms
-     check_retention() reports has_confirmed_loss for all three real
-     before/after page pairs from an actual 2026-07 production incident,
+  1. Incident-replay (eval/fixtures/incident_2026_07/) -- confirms
+     check_retention() reports has_confirmed_loss for all three synthetic
+     before/after page pairs, each of which reproduces the silent-claim-loss
+     signature this backstop exists to catch (a whole section and its
+     citation entry vanish from the after-page, with no acknowledgement),
      repeated N=5 times each to prove CONSISTENT detection, not a lucky
      single pass.
   2. No-false-alarm -- a genuinely SUPERSEDED claim, and a genuinely MOVED
@@ -113,16 +115,30 @@ _REPLAY_N = 5
 @requires_real_judge
 @pytest.mark.parametrize("page_name", _INCIDENT_PAGES)
 def test_incident_replay_confirms_loss_consistently(tmp_path, page_name):
-    """The real judge must classify SILENTLY_LOST for this real incident page
+    """The real judge must classify SILENTLY_LOST for this fixture page
     on AT LEAST ONE of _REPLAY_N independent repeats -- proving the gate is
     not structurally blind to this incident class -- and this test reports
     (prints) the measured hit-rate across all N so reliability is visible,
     not asserted away.
 
-    HONEST FINDING (measured across multiple real, non-mocked runs during
-    development -- read before loosening or tightening this bar):
+    FIXTURE CONTRACT (read before regenerating eval/fixtures/incident_2026_07/):
+    the fixtures are SYNTHETIC, but each pair must keep the detection problem
+    intact -- the after-page narrows the frontmatter, drops a whole section
+    and its matching citation entry, and (in two of the three) narrows a
+    surviving claim from several things to one, all with no acknowledgement
+    that anything was removed. design-and-promotion.md additionally keeps its
+    dropped section DEEP in the document (starting past ~15_200 chars); that
+    placement is load-bearing, see the _BEFORE_TEXT_CHAR_CAP note in
+    wiki_weaver/grading.py. A fixture rewrite that loses these properties
+    turns this test into theatre.
+
+    HONEST FINDING (measured across multiple real, non-mocked runs -- read
+    before loosening or tightening this bar).
+
+    Measured on the ORIGINAL fixture pages, during the development that built
+    this gate:
       byo-agent-ecosystem-recon.md (~15.9k chars):          5/5, 5/5 clean runs
-      generative-ui-ephemeral-interfaces.md (~12.9k chars): 4/5, 1/5, then 5/5
+      generative-ui-ephemeral-interfaces.md (~13.0k chars): 4/5, 1/5, then 5/5
                                                              (5/5 after the
                                                              context-cap +
                                                              extract-every-
@@ -131,9 +147,19 @@ def test_incident_replay_confirms_loss_consistently(tmp_path, page_name):
                                                              truncation bug),
                                                              1/5, 1/5 (fixed
                                                              but still low)
+    Re-measured on the SYNTHETIC replacements (one real, non-mocked run of
+    this test, all three pages, N=5 each):
+      design-and-promotion.md (~19.1k chars):              5/5  (mean 83.7s)
+      byo-agent-ecosystem-recon.md (~15.9k chars):         5/5  (mean 68.6s)
+      generative-ui-ephemeral-interfaces.md (~13.0k chars): 5/5 (mean 38.1s)
+    CAVEAT, stated plainly: the synthetic design-and-promotion.md pair is
+    EASIER for the judge than the original was (5/5 vs the original's 1/5),
+    even though the deep-loss placement was deliberately preserved. The bar
+    stays at ">= 1 of N" because that is what the original evidence justifies;
+    do NOT tighten it to N/N on the strength of one synthetic-fixture run.
     The 0/5 case was a real structural bug: before_page_text was truncated at
-    8_000 chars in grade_claim_retention, and this page's lost section starts
-    at char ~15_195 -- entirely past that window, so the judge never saw it.
+    8_000 chars in grade_claim_retention, and that page's lost section starts
+    at char ~15_200 -- entirely past that window, so the judge never saw it.
     Fixed by raising _BEFORE_TEXT_CHAR_CAP (see grading.py). A second, distinct
     real bug surfaced during this same testing: on a claim-dense page
     (byo-agent-ecosystem-recon.md), all 5 replays returned status='errored'

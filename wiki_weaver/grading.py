@@ -294,7 +294,7 @@ def _build_judge_fn():
     max_tokens is set explicitly (rather than left at the client default).
     FINDING (from wiki_weaver/retention.py's incident-replay tests): with the
     default (unset) max_tokens, grade_claim_retention's JSON response was
-    observed to cut off mid-string on a real, claim-dense page (byo-agent-
+    observed to cut off mid-string on a claim-dense fixture page (byo-agent-
     ecosystem-recon.md, ~15.9k before-chars) -- "JSON parse error: Expecting
     ',' delimiter" at a truncation point consistent with a small default
     output-token ceiling, not a genuine model-authoring error. Extracting
@@ -424,16 +424,19 @@ BEFORE PAGE (before re-write):
 # ---------------------------------------------------------------------------
 #
 # FINDING (from wiki_weaver/retention.py's incident-replay regression tests,
-# eval/test_claim_retention_backstop.py): grading a real production page
-# (eval/fixtures/incident_2026_07/before/design-and-promotion.md, 19_052
+# eval/test_claim_retention_backstop.py): grading the largest fixture page
+# (eval/fixtures/incident_2026_07/before/design-and-promotion.md, ~19_100
 # chars) against the original before_page_text[:8_000] cap produced ZERO
 # CONFIRMED_LOSS verdicts across 5 replays (0/5) -- not judge inconsistency,
 # a structural miss. The lost section in that page begins at character
-# offset ~15_195, entirely past the 8_000-char window: the judge never saw
+# offset ~15_200, entirely past the 8_000-char window: the judge never saw
 # the deleted content in the BEFORE text at all, so it could not possibly
-# flag it. An 8_000-char cap was a reasonable guess for an eval-only tool of
-# unknown real page sizes; it is not adequate for a real runtime backstop
-# against real wiki pages, which routinely run 15-20k+ chars.
+# flag it. That deep-loss placement is a DELIBERATE property of the fixture
+# and must be preserved if it is ever regenerated -- it is the only thing
+# that exercises this truncation class. An 8_000-char cap was a reasonable
+# guess for an eval-only tool of unknown page sizes; it is not adequate for
+# a runtime backstop against real wiki pages, which routinely run 15-20k+
+# chars.
 #
 # This is a deliberate, evidence-driven WIDENING, distinct from the pure
 # relocation of grade_claim_retention's logic above (that move is
