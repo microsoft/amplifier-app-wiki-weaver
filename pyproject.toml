@@ -18,7 +18,7 @@ authors = [{name = "Microsoft Corporation"}]
 # (amplifier-app-cli) for ~/.amplifier config + API keys + the warm bundle cache the
 # attractor engine loads on first ingest. `wiki-weaver doctor` verifies all of this.
 dependencies = [
-    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
+    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@4490bf5f3cf9e5a7829365e84c318a7fd9db7e3d",
     "amplifier-unified-llm-client @ git+https://github.com/microsoft/amplifier-bundle-attractor@main#subdirectory=modules/unified-llm-client",
     # Shared engine-driving library (drive_engine/run_pipeline + spawn wiring)
     # that engine_runner.py delegates to -- see wiki_weaver/engine_runner.py's
