@@ -13,6 +13,7 @@ from wiki_weaver.lib import (
     atomic_write_text,
     count_pages_touched_detail,
     extract_wikilinks,
+    find_duplicate_sections_in_page,
     git_changed_wiki_files_detail,
     ledgered_segment_indices,
     ledgered_source_ids,
@@ -226,6 +227,7 @@ def test_summarize_ledger_touches_means_only_accept_rows(tmp_path):
     summary = summarize_ledger_touches(path)
     assert summary == {"sources": 2, "mean_touched": 2.0, "total_created": 2, "total_updated": 2}
 
+
 def test_segment_total_takes_the_largest_claim_not_the_last_row(tmp_path):
     """REGRESSION: rows for one source can disagree about segment_total the
     moment a source is ever re-split. Taking the LAST row's value silently
@@ -245,10 +247,7 @@ def test_segment_total_takes_the_largest_claim_not_the_last_row(tmp_path):
     def write(*specs):
         path.write_text(
             "".join(
-                json.dumps(
-                    {"source_id": s, "decision": "accept", "segment_index": i, "segment_total": t}
-                )
-                + "\n"
+                json.dumps({"source_id": s, "decision": "accept", "segment_index": i, "segment_total": t}) + "\n"
                 for s, i, t in specs
             ),
             encoding="utf-8",
@@ -262,3 +261,110 @@ def test_segment_total_takes_the_largest_claim_not_the_last_row(tmp_path):
 
     write(("y.md", 1, 2), ("y.md", 2, 2))
     assert ledgered_source_ids(path) == {"y.md"}  # genuinely complete still reports done
+
+
+# ---------------------------------------------------------------------------
+# find_duplicate_sections_in_page -- the duplicate-section detector (see
+# docs/KNOWN_ISSUES.md's duplicate-section incident and the function's own
+# docstring for the mechanism). Proven in BOTH directions per the task's
+# own standard: it must fire on a page with real duplicates and stay QUIET
+# on a page with none -- a checker that always fires and one that never
+# fires are the same defect.
+# ---------------------------------------------------------------------------
+
+
+def test_find_duplicate_sections_quiet_on_clean_page():
+    """NEGATIVE proof: a normal page with unique headings, including ones
+    that share words or are substrings of one another, must not fire."""
+    text = (
+        "---\ntitle: Clean Page\ntype: concept\n---\n\n"
+        "# Clean Page\n\n"
+        "## Roadmap Revised to 3 Outcomes (2026-08-10)\n\n"
+        "Some text.\n\n"
+        "## Roadmap Revised to 4 Outcomes (2026-08-17)\n\n"
+        "Different text -- deliberately similar heading, must NOT be treated\n"
+        "as a duplicate of the one above: it is a different, later revision.\n\n"
+        "### Roadmap Revised to 3 Outcomes (2026-08-10)\n\n"
+        "A level-3 heading sharing text with the level-2 heading above --\n"
+        "must not be conflated with it (different heading level).\n\n"
+        "## Related\n\n"
+        "- [[other-page|Other Page]]\n"
+    )
+    assert find_duplicate_sections_in_page(text) == {}
+
+
+def test_find_duplicate_sections_fires_on_exact_duplicate():
+    """POSITIVE proof: the same ## heading appearing twice, byte-identical
+    body both times -- the simplest real case (6 of the 10 team-pulse.md
+    pairs were exactly this shape)."""
+    heading = "## Repo-Weaver Design for Team Pulse \u2014 Inbox-Based Architecture (2026-08-11)"
+    text = (
+        "---\ntitle: Team Pulse\ntype: source\n---\n\n# Team Pulse\n\n"
+        f"{heading}\n\nRenata Ossovski described a detailed workflow. (some-source.md)\n\n"
+        "## Some Other Section\n\nUnrelated content.\n\n"
+        f"{heading}\n\nRenata Ossovski described a detailed workflow. (some-source.md)\n"
+    )
+    dupes = find_duplicate_sections_in_page(text)
+    assert dupes == {heading: 2}
+
+
+def test_find_duplicate_sections_fires_on_reworded_duplicate():
+    """POSITIVE proof: same heading, DIFFERENT body -- the renata-ossovski.md
+    shape (two independent write-ups of the same source). Header-only
+    matching must still catch this; body similarity is not the signal."""
+    heading = "## Team Pulse Weekly Planning \u2014 2026-06-19"
+    text = (
+        "---\ntitle: Renata Ossovski\ntype: person\n---\n\n# Renata Ossovski\n\n"
+        f"{heading}\n\nIn a 29-minute weekly planning meeting, Renata committed to X.\n"
+        "(some-meeting.transcript.md)\n\n"
+        f"{heading}\n\nIn the weekly planning meeting, Renata made several commitments, "
+        "including Y.\n(some-meeting.transcript.md)\n"
+    )
+    dupes = find_duplicate_sections_in_page(text)
+    assert dupes == {heading: 2}
+
+
+def test_find_duplicate_sections_handles_spaces_em_dash_and_unicode():
+    """Headers and citation filenames in this corpus routinely contain
+    spaces, em dashes, and non-ASCII text (curly quotes, accents). The
+    detector must never rely on whitespace-splitting or ASCII-only
+    matching -- both failure classes have shipped in this project before
+    (see the function's docstring). Also covers a citation filename WITH
+    SPACES, to guard against a checker that (mis)treats a citation's
+    internal spaces as section boundaries."""
+    heading = "## R\u00e9sum\u00e9 Review \u2014 D\u00e9j\u00e0 Vu \u2014 \u201cQuoted\u201d Title"
+    text = (
+        "---\ntitle: X\ntype: concept\n---\n\n# X\n\n"
+        f"{heading}\n\nBody one. (Team Pulse Workstream chat pulled 2026-08-12.md)\n\n"
+        f"{heading}\n\nBody two, reworded. (Team Pulse Workstream chat pulled 2026-08-12.md)\n"
+    )
+    dupes = find_duplicate_sections_in_page(text)
+    assert dupes == {heading: 2}
+
+
+def test_find_duplicate_sections_ignores_level3_and_trailing_whitespace_variants():
+    """A level-3 heading must never be conflated with a level-2 heading of
+    similar text (## vs ###), and trailing whitespace differences alone
+    are stripped before comparison (a heading with a trailing space is
+    still the same heading)."""
+    text = (
+        "## Same Heading   \n\nBody A\n\n"
+        "## Same Heading\n\nBody B\n\n"
+        "### Same Heading\n\nBody C (level 3, must not count)\n"
+    )
+    dupes = find_duplicate_sections_in_page(text)
+    assert dupes == {"## Same Heading": 2}
+
+
+def test_find_duplicate_sections_real_team_pulse_fixture_fires_ten_times():
+    """Regression proof against the ACTUAL evidence: the real team-pulse.md
+    excerpt (10 duplicated headers, verified by direct inspection of the
+    eval wiki) must be caught in full, with no over-count and no
+    under-count."""
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "team-pulse-duplicate-excerpt.md"
+    text = fixture.read_text(encoding="utf-8")
+    dupes = find_duplicate_sections_in_page(text)
+    assert len(dupes) == 10
+    assert all(count == 2 for count in dupes.values())

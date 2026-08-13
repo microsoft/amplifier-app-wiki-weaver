@@ -1286,8 +1286,63 @@ def split_header(text: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def find_duplicate_sections_in_page(text: str) -> dict[str, int]:
+    """Level-2 (``## ``) headings that appear more than once, VERBATIM, in
+    one page's raw text. Returns ``{header_line: count}`` for only the
+    headers that repeat (count > 1) -- an empty dict means the page is
+    clean.
+
+    THE DEFECT THIS CATCHES (see docs/KNOWN_ISSUES.md / the duplicate-
+    section incident): ``weave`` is a single autonomous LLM pass that both
+    (a) folds per-entity updates into existing pages and (b) is separately
+    instructed to write one page capturing the source's own thesis "as a
+    whole" (see ``pipeline/ingest.dot``'s ``weave`` prompt) -- nothing
+    stops those two mandatory writes from landing on the SAME page, nor
+    stops the model from writing up the same source twice within one pass
+    for any other reason. The observed damage (a real 350-page corpus) is
+    two sections under the identical heading, citing the identical source,
+    with bodies ranging from byte-identical to independently reworded --
+    the header match is the reliable signal; the bodies are not.
+
+    DELIBERATELY EXACT-MATCH, NEVER FUZZY: this project has already
+    shipped checkers broken in both directions -- a pattern so loose it
+    matched everything, and filename handling that split on whitespace and
+    silently mismatched anything with a space in it. A "duplicate section"
+    checker that normalizes/fuzzes header text invites the same failure
+    class (either every near-miss header now "matches", or a legitimate
+    non-duplicate is silently merged). Two headers count as the same
+    heading if and only if they are the same string, including exact
+    unicode content (em dashes, curly quotes, accented characters) and
+    exact whitespace, after stripping only the trailing line terminator --
+    nothing here calls ``.split()`` on anything an author or a source
+    filename controls.
+
+    Only the heading line is compared -- never whether the two sections'
+    bodies also match -- because a genuine duplicate can carry a reworded
+    body (two independent write-ups of the same source) while still being
+    exactly the defect this exists to catch. Whether the two bodies are
+    ALSO byte-identical is a separate, additional fact a caller may want
+    (e.g. to decide whether a duplicate is safe to auto-resolve) -- see
+    the cleanup tooling, not this function.
+    """
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        # .strip() (both ends), same normalization retention_check.py's own
+        # `_headings()` already applies for heading comparison in this
+        # codebase -- insignificant leading/trailing whitespace is not a
+        # different heading, and matching that existing convention means
+        # this check and the shrinkage/heading-loss detector never disagree
+        # about what counts as "the same heading."
+        stripped = line.strip()
+        if not stripped.startswith("## "):
+            continue
+        counts[stripped] = counts.get(stripped, 0) + 1
+    return {header: count for header, count in counts.items() if count > 1}
+
+
 def find_structural_issues(wiki_dir: Path) -> list[str]:
-    """Broken links, missing required frontmatter fields, orphan pages."""
+    """Broken links, missing required frontmatter fields, orphan pages,
+    duplicate ``##`` sections."""
     pages = load_wiki_pages(wiki_dir)
     if not pages:
         return []
@@ -1302,6 +1357,8 @@ def find_structural_issues(wiki_dir: Path) -> list[str]:
         for required in required_fields:
             if not str(meta.get(required, "")).strip():
                 issues.append(f"schema: {pid} missing required frontmatter field '{required}'")
+        for header, count in find_duplicate_sections_in_page(text).items():
+            issues.append(f"duplicate section: {pid} has heading {header!r} {count} times")
         for slug in page.links:
             # A wikilink may target a specific section of a page --
             # [[page-slug#Section Heading]] -- exactly like the file-level

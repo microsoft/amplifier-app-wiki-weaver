@@ -113,6 +113,43 @@ def test_orphan_page_still_fails_validation(wiki_root, capsys):
     assert "orphan: orphan.md has no incoming wikilinks" in report
 
 
+def test_duplicate_section_fails_validation(wiki_root, capsys):
+    """Regression guard for the duplicate-section incident (see
+    lib.find_duplicate_sections_in_page's docstring and
+    docs/KNOWN_ISSUES.md): a page carrying the exact same ``##`` heading
+    twice must fail structural validation and be folded into the SAME
+    exit-code-driving issues list as broken links/orphans -- routing to
+    the existing reweave_bound retry, not a silent pass. This is the
+    fix: before this check existed, a page shaped exactly like this one
+    (a real, byte-for-byte shape pulled from the affected corpus) reported
+    "No structural issues found.\""""
+    duplicate_page = (
+        "---\ntitle: Team Pulse\ntype: source\n---\n\n"
+        "# Team Pulse\n\n"
+        "## Repo-Weaver Design for Team Pulse \u2014 Inbox-Based Architecture (2026-08-11)\n\n"
+        "Renata Ossovski described a detailed workflow. (some-source.md)\n\n"
+        "## Made-Team-App Onboarding \u2014 Repo Access Architecture (2026-08-11 to 2026-08-12)\n\n"
+        "Tomas Berglund validated end-to-end retrieval. (some-source.md)\n\n"
+        "## Repo-Weaver Design for Team Pulse \u2014 Inbox-Based Architecture (2026-08-11)\n\n"
+        "Renata Ossovski described a detailed workflow. (some-source.md)\n"
+    )
+    wiki_root.add_page("index.md", CLEAN_PAGE)
+    wiki_root.add_page("team-pulse.md", duplicate_page)
+    wr = WikiRoot(wiki_root.root)
+
+    code = validate.main(["--wiki-root", str(wr.root), "--out", ".ai/validation-report.md"])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "duplicate section: team-pulse.md" in err
+    assert "Repo-Weaver Design for Team Pulse" in err
+    report = (wr.root / ".ai" / "validation-report.md").read_text(encoding="utf-8")
+    assert "duplicate section: team-pulse.md" in report
+    # The genuinely unique heading in the same page must NOT be flagged as
+    # a duplicate -- only the heading that actually repeats is named.
+    assert not any("Made-Team-App Onboarding" in line for line in err.splitlines() if "duplicate section" in line)
+
+
 def test_oversized_overview_gets_specific_actionable_guidance(wiki_root):
     """The size trip-wire (find_oversized_pages) must stay report-only --
     never fold into the exit code, never auto-split (module docstring's

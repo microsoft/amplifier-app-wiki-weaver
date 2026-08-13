@@ -14,15 +14,17 @@ dependencies = []
 test = ["pytest>=7.4"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["wiki_weaver"]
+packages = ["src/wiki_weaver"]
 
 [tool.pytest.ini_options]
-testpaths = ["eval"]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
 
 [tool.pyright]
-include = ["wiki_weaver", "eval"]
+include = ["src", "tests", "experiments"]
+extraPaths = ["src"]
 pythonVersion = "3.11"

@@ -445,3 +445,108 @@ correctly.
 A detector that never fires and a detector that always fires are the same
 defect. Validate both directions, and validate the third case: **no signal at
 all.**
+
+---
+
+## 9. Weave writes the same section twice into one page
+
+**Status:** root-caused, detector shipped, prevention not available. Found
+2026-08-12 by an overlap experiment that was looking for something else.
+
+Across eight ingest epochs the generator emitted byte-identical `## ` sections
+into the same page. Nothing ever noticed.
+
+```
+pages with repeated ## headers    5 of 350
+duplicate section instances      36    (8 from the newest batch, 28 older)
+```
+
+Worst case, `team-pulse.md`:
+
+```
+L1955  ## Repo-Weaver Design for Team Pulse — Inbox-Based Architecture (2026-08-11)
+L2024  ## Repo-Weaver Design for Team Pulse — Inbox-Based Architecture (2026-08-11)
+```
+
+Byte-identical heading, byte-identical body, **same single source cited by both
+copies** — not two sources merged badly. One source, written twice.
+
+A reader cannot distinguish a re-emitted section from a genuine second
+discussion of the same topic. That is what makes it expensive: the page looks
+longer and better-sourced than it is.
+
+### Root cause — the LLM's own output, not a deterministic code path
+
+Ruled out in order:
+
+| Suspect | Why it is not this |
+|---|---|
+| `write_gap_page` | Full `atomic_write_text` overwrite. Also: none of the affected pages carry `type: theme`, so it never touched them |
+| `persist_lens` (correction pipeline) | `lens/corrections/` is empty — it has never run against this wiki |
+| `retract.py` absorb mode | Tags its output `## Absorbed from <page>`. No such heading exists anywhere |
+| `select_source` re-ingest | Ledger holds exactly one `accept` row per affected source. A re-ingest would show a second row or a `watermark_reset` |
+
+What remains is `weave`'s own prompt (`pipeline/ingest.dot`), which mandates
+**two unconditional writes per source** — per-entity updates, and one page
+capturing what the source says as a whole — with nothing instructing it to check
+whether those two resolve to the *same page*.
+
+When a source's subject matter is also one of its extracted entities — a Team
+Pulse workstream chat whose entity *is* Team Pulse — both mandatory writes land
+on the same page, in the same turn, each narrating the same material under a
+heading derived from the same source.
+
+That mechanism predicts the observed split, which is the strongest evidence for
+it: **6 pairs byte-identical, 12 reworded.** The reworded ones are two
+independent synthesis attempts at one source — different bullet structure,
+different emphasis, occasionally a different claimed meeting duration — under
+the same heading with the same citation.
+
+### The fix — catch it, because prevention is not available
+
+`weave` is a raw LLM box with file-editing tools. Nothing short of removing its
+autonomy makes duplicate output *impossible to attempt*. What is now impossible
+is **committing** it.
+
+`find_duplicate_sections_in_page` joins broken-links, orphans, and zero-touch in
+`validate`'s issues list. A page with a duplicate section fails `structural_bad`
+and routes to the existing bounded reweave retry. No new machinery — the same
+discipline as `retention_check.py`'s shrinkage detector: detect
+deterministically, never trust the LLM to grade itself.
+
+A prompt clarification naming the entity-vs-source-page collision was also
+added. That is best-effort mitigation, explicitly **not** the load-bearing fix.
+
+### Detector proven in both directions
+
+Exact match on the stripped heading. Deliberately not fuzzy, and deliberately
+**not** dependent on body similarity — the 12 reworded pairs prove body-diffing
+alone would miss real duplicates.
+
+```
+fires on    5 pages / 36 instances — matches an independent measurement exactly
+quiet on    345 pages
+near-miss   "3 Outcomes" vs "4 Outcomes", "## X" vs "### X"  -> no false fire
+unicode     'Résumé Review — Déjà Vu — "Quoted" Title'       -> fires on a real dupe
+```
+
+That last row is not decoration. **Three checkers in this project have shipped
+broken in exactly this way** — one split filenames on whitespace, one had an
+unquoted heredoc that mangled `.split("\n")` into `.split("n")`, one used a
+pattern so loose that everything matched. Validate against real inputs
+containing spaces, em-dashes, and non-ASCII, or the detector is theatre.
+
+### What is still open
+
+6 byte-identical pairs were removed after programmatic byte-equality
+verification. **12 reworded pairs remain** and need a human read — deciding
+which of two write-ups is more accurate is a content judgement, not a
+deduplication.
+
+### What could not be settled
+
+Which of the two mandated writes produced which copy. The pipeline logs record
+provider-level chatter, not per-tool-call file paths, so there is no captured
+trace of the two write calls. The account above is the mechanism that fits every
+piece of evidence without contradiction — converging inference, not a
+transcript.
