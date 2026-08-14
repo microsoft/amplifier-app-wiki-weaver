@@ -13,6 +13,58 @@ Path shorthand:
 
 ---
 
+## 0a. What "attractor pipeline" means here — and what it does not
+
+These `.dot` files **run on** the attractor engine. They are not attractors in the
+sense the team uses the word.
+
+The distinction, as drawn on 2026-07-30:
+
+> An attractor defines what the **desired world state** is — outcomes, gates,
+> evidence requirements — and leaves enough room for agents to use their
+> capabilities to get there. It does **not** prescribe the steps.
+
+Measured against `ingest.dot`:
+
+| Attractor property | What this repo actually does |
+|---|---|
+| Define outcomes, let the agent find the path | 32 nodes in a fixed sequence |
+| Room for agent capability | 4 LLM `box` nodes; 28 deterministic |
+| Convergence criteria | Hard-coded routing labels on edges |
+
+The `weave` prompt alone is ~4,000 characters of "read this file, then check
+that, then do X before Y." That is prescription, and it is deliberate — see §1.
+
+**Where this repo *is* attractor-shaped:** `validate` states a desired end state
+(no broken links, no orphans, no duplicate sections, no person-sensitivity
+violations) and routes back to `reweave_bound` until the wiki converges on it.
+That node says *what must be true*, not *how to get there*, and the retry loop
+is a real convergence loop.
+
+That is one node out of thirty-two. Calling the whole thing an attractor
+overstates it.
+
+**Why the prescription is deliberate.** Four measured attempts in this repo to
+achieve an outcome by *asking* the LLM rather than *checking* it:
+
+| Attempt | Outcome |
+|---|---|
+| A human stated a rule twice in the lens | *"It was still there at the end of the run"* |
+| Prompt clarification for duplicate sections | Recorded as *"explicitly not the load-bearing fix"* |
+| Prompt: "always name a page to fold into" | 26 sources committed with `pages_touched: 0` |
+| LLM judge for content loss | Scored 0/3; a 50-line deterministic detector scored 2/3 |
+
+A prompt is not a control. Every defect fixed in this pipeline was fixed by
+adding a deterministic check to `validate`'s issue list, never by wording a
+prompt more carefully. The node ratio — 4 judgment, 28 mechanical — is that
+lesson expressed as structure.
+
+Read the rest of this guide with that framing: it is a guide to building
+**deterministic pipelines that call an LLM at a few well-chosen points**, hosted
+on the attractor engine's runner.
+
+---
+
 ## 0. Verification results (run this yourself first)
 
 ```
