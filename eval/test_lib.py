@@ -295,11 +295,11 @@ def test_find_duplicate_sections_quiet_on_clean_page():
 
 def test_find_duplicate_sections_fires_on_exact_duplicate():
     """POSITIVE proof: the same ## heading appearing twice, byte-identical
-    body both times -- the simplest real case (6 of the 10 team-pulse.md
+    body both times -- the simplest real case (6 of the 10 fixture
     pairs were exactly this shape)."""
-    heading = "## Repo-Weaver Design for Team Pulse \u2014 Inbox-Based Architecture (2026-08-11)"
+    heading = "## Orchard Design for Signal Deck \u2014 Inbox-Based Architecture (2026-08-11)"
     text = (
-        "---\ntitle: Team Pulse\ntype: source\n---\n\n# Team Pulse\n\n"
+        "---\ntitle: Signal Deck\ntype: source\n---\n\n# Signal Deck\n\n"
         f"{heading}\n\nRenata Ossovski described a detailed workflow. (some-source.md)\n\n"
         "## Some Other Section\n\nUnrelated content.\n\n"
         f"{heading}\n\nRenata Ossovski described a detailed workflow. (some-source.md)\n"
@@ -309,10 +309,10 @@ def test_find_duplicate_sections_fires_on_exact_duplicate():
 
 
 def test_find_duplicate_sections_fires_on_reworded_duplicate():
-    """POSITIVE proof: same heading, DIFFERENT body -- the renata-ossovski.md
+    """POSITIVE proof: same heading, DIFFERENT body -- the person-page
     shape (two independent write-ups of the same source). Header-only
     matching must still catch this; body similarity is not the signal."""
-    heading = "## Team Pulse Weekly Planning \u2014 2026-06-19"
+    heading = "## Crew Weekly Planning \u2014 2026-06-19"
     text = (
         "---\ntitle: Renata Ossovski\ntype: person\n---\n\n# Renata Ossovski\n\n"
         f"{heading}\n\nIn a 29-minute weekly planning meeting, Renata committed to X.\n"
@@ -335,8 +335,8 @@ def test_find_duplicate_sections_handles_spaces_em_dash_and_unicode():
     heading = "## R\u00e9sum\u00e9 Review \u2014 D\u00e9j\u00e0 Vu \u2014 \u201cQuoted\u201d Title"
     text = (
         "---\ntitle: X\ntype: concept\n---\n\n# X\n\n"
-        f"{heading}\n\nBody one. (Team Pulse Workstream chat pulled 2026-08-12.md)\n\n"
-        f"{heading}\n\nBody two, reworded. (Team Pulse Workstream chat pulled 2026-08-12.md)\n"
+        f"{heading}\n\nBody one. (Signal Deck Workstream chat pulled 2026-08-12.md)\n\n"
+        f"{heading}\n\nBody two, reworded. (Signal Deck Workstream chat pulled 2026-08-12.md)\n"
     )
     dupes = find_duplicate_sections_in_page(text)
     assert dupes == {heading: 2}
@@ -356,14 +356,14 @@ def test_find_duplicate_sections_ignores_level3_and_trailing_whitespace_variants
     assert dupes == {"## Same Heading": 2}
 
 
-def test_find_duplicate_sections_real_team_pulse_fixture_fires_ten_times():
-    """Regression proof against the ACTUAL evidence: the real team-pulse.md
+def test_find_duplicate_sections_fixture_fires_ten_times():
+    """Regression proof against the ACTUAL evidence: the fixture page
     excerpt (10 duplicated headers, verified by direct inspection of the
     eval wiki) must be caught in full, with no over-count and no
     under-count."""
     from pathlib import Path
 
-    fixture = Path(__file__).parent / "fixtures" / "team-pulse-duplicate-excerpt.md"
+    fixture = Path(__file__).parent / "fixtures" / "duplicate-sections-excerpt.md"
     text = fixture.read_text(encoding="utf-8")
     dupes = find_duplicate_sections_in_page(text)
     assert len(dupes) == 10

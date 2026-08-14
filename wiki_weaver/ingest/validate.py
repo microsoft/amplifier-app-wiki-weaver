@@ -97,6 +97,22 @@ structural checks above, so it fails loud -> structural_bad ->
 reweave_bound, exactly like the zero-touch guard. No warning-only path, no
 new machinery.
 
+PERSON-SENSITIVITY GUARD (KNOWN_ISSUES.md #7 -- the ~40 passages a pre-share
+review found in a 253-page wiki): synthesis re-derives content about named
+people that raw-layer sanitization was supposed to keep out, and in one case
+MANUFACTURED a characterization no source transcript makes. This module is
+the one place both re-deriving paths already meet -- ``pipeline/ingest.dot``'s
+``weave`` runs ``validate`` immediately downstream, and
+``pipeline/synthesize.dot`` calls THIS SAME module by name after
+``write_gap_page`` -- so ``wiki_weaver.ingest.person_check`` folds into the
+SAME ``issues`` list as the structural checks above (unlike the oversized-page
+trip-wire), exits non-zero -> ``structural_bad`` -> the existing bounded
+retry, and terminally reaches review (ingest) or reverts the page
+(synthesize). Scoped to content NEW since HEAD so an already-reviewed page
+cannot wedge every later pass; see that module's docstring for why the check
+is layered and where it is deterministic vs. heuristic. No new machinery, no
+warning-only path, no flag to switch it off.
+
 Usage:
     python3 -m wiki_weaver.ingest.validate --wiki-root <path> --out <report-path>
 """
@@ -107,6 +123,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from wiki_weaver.ingest.person_check import find_person_sensitivity
 from wiki_weaver.lib import (
     NAV_PAGES,
     WikiRoot,
@@ -232,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     issues = find_structural_issues(wr.wiki_dir)
     issues.extend(find_zero_touch(wr.root, wr.wiki_dir))
     issues.extend(find_root_level_leak(wr.root))
+    issues.extend(find_person_sensitivity(wr.root, wr.wiki_dir, wr.sources_dir))
     oversized = find_oversized_pages(wr.wiki_dir, args.page_byte_ceiling)
 
     out_path = resolve_path(wr, args.out)

@@ -93,6 +93,49 @@ meeting transcripts.
 header/context segment 1 carries, or that validation expects a shape only a
 source-opening has. Until that is understood, any threshold change is guesswork.
 
+**RESOLVED (2026-08-06, commit `be3c7dc`) -- this section was never updated
+to say so.** Both likely suspects above were wrong: mid-source segments carry
+byte-identical headers to segment 1, and `validate.py` has no
+segment-awareness at all -- it never reads the segment index.
+
+Two compounding bugs, found by replaying the actual `.ai/` state this run
+left behind:
+
+1. **`find_structural_issues()` appended `.md` to a wikilink slug without
+   stripping a `#Section` anchor.** One stale anchor-link in the wiki
+   bootstrap (`[[amplifier-as-agent#Preset Concept|Preset Concept]]` -- the
+   target page exists, the link is fine) made `validate.py` return exit 1 for
+   **every** source in the entire 73-source run -- accept or quarantine,
+   every validation-report.md read "1 issue(s) found". Validation was never
+   actually passing for anyone; segment content had nothing to do with it.
+2. **`reweave_bound`'s attempt counter and `quarantine_brief`'s one-shot
+   review-gate rescue were keyed by `source_id` alone, not `(source_id,
+   segment_index)`.** Since validate always failed (bug 1), every segment of
+   every source exhausted its retries and reached the one-time quarantine
+   rescue. Whichever segment got there first -- essentially always segment 1
+   -- spent the rescue for the *whole source* and a reviewer/proxy accepted
+   it there. Segment 2+ of the same source then inherited an already-spent
+   attempt counter and an already-burned rescue latch, so it could give up
+   after a single failed validate with no review ever offered. **That is the
+   entire reported skew** -- segment 1 didn't pass validation; it got the
+   source's one rescue. Segment 2+ never had a chance to get one of its own.
+
+Fix: strip the anchor before checking link existence (`lib.py`'s
+`find_structural_issues`), and key both state files by `(source_id,
+segment_index)` via `lib.read_current_segment_index` (defaults to `1` when
+absent, so every unsegmented caller is byte-for-byte unaffected). See
+`reweave_bound.py` and `quarantine_brief.py`'s module docstrings ("SEGMENT-
+SCOPED, NOT JUST SOURCE-SCOPED") for the full mechanism, and
+`tests/test_reweave_bound.py::test_stale_attempts_from_previous_segment_of_same_source_is_reset_not_carried_over`,
+`tests/test_quarantine_brief.py::test_later_segment_of_same_source_gets_its_own_rescue`,
+and `tests/test_structural_validate.py::test_section_anchored_link_to_real_page_is_not_a_broken_link`
+for regression coverage (the last of these three did not exist until this
+correction was written -- checked out against the pre-fix commit, all three
+fail; against the fixed commit, all three pass).
+
+`DEFAULT_SEGMENT_BYTES` stays at 80,000 -- its measured rationale was always
+sound, and the actual cause is now fixed rather than masked by raising it.
+
 ## 4. Segmentation runs before the watermark filters
 
 **Found:** 2026-08-05, same run.
@@ -368,6 +411,145 @@ exists to preserve. The line is criticism of *work* versus characterization of
 **Minimum viable fix:** a gate that flags, per source, whether it contains
 third-party evaluative content, and refuses to synthesize a person page from a
 source so flagged without explicit review. Loud, not silent -- consistent with #6.
+
+### Why the recorded policy failed -- it was content, not a control
+
+The policy lived in `wiki/personal-knowledge-architecture.md`, which is the
+**output** side. `weave`'s only policy channel is the lens (`lens/canon/`,
+`lens/corrections/` -- see `aitl/corrections.py` and the weave prompt's "Work
+under the lens at lens/"). A page the pipeline *writes* is data it produced,
+not a constraint it runs under, so the policy never reached the pipeline at all.
+
+Putting it in the lens would not have been enough either, because in this
+codebase a stated instruction has already failed as a control four separate,
+documented times:
+
+| Where | The instruction | What happened |
+|---|---|---|
+| `ingest/retract.py:5-18` | A human wrote "a page named after a PERSON is never correct in this wiki ... Delete `joe-njenga.md`", then **restated** it as a standing instruction | "It was still there at the end of the run." The fix that worked was a deterministic tool |
+| #9 above | A prompt clarification for the duplicate-section collision | Recorded there as "best-effort mitigation, explicitly **not** the load-bearing fix" |
+| `ingest/validate.py` ZERO-TOUCH GUARD | weave's prompt "always names an existing-or-new page to fold into" | A real run committed 26 sources with `pages_touched: 0` |
+| `ingest/retention_check.py:4-8` | An LLM judge asked to spot content losses | Caught 0/3; the ~50-line deterministic detector caught 2/3 |
+
+Confirmed by grep: **neither** re-deriving prompt -- `weave`
+(`pipeline/ingest.dot:403`) nor `answer_gap` (`pipeline/synthesize.dot:676`) --
+contains a single person-sensitivity term. `weave` is in fact instructed the
+other way, to type entities as `'person' (an author or named figure)` and give
+them pages.
+
+### Where it happens -- both re-deriving paths, one chokepoint
+
+- `weave` (`pipeline/ingest.dot:403`) writes person-typed entity pages and
+  re-argues `overview.md` on every source -- the arm that put performance-review
+  content on an engineer's bio page.
+- `answer_gap` -> `write_gap_page` (`synthesize/write_gap_page.py:200`)
+  compresses across sources into a brand-new claim -- the arm that
+  *manufactured* the "recurring failure pattern" no transcript makes.
+
+Both route through `wiki_weaver.ingest.validate` (`ingest.dot:638`,
+`synthesize.dot:732`). That is the one place a single check covers both.
+
+### The fix -- `ingest/person_check.py`, folded into `validate`'s issues list
+
+Same discipline as #9 and `retention_check.py`: detect deterministically, route
+to the bounded retry that already exists, never ask the LLM to grade itself,
+never edit a page. Terminal behaviour is unchanged machinery -- ingest:
+`reweave_bound` give_up -> `prepare_quarantine_brief` -> review; synthesize:
+`retry_bound` give_up -> `commit_declined`, which reverts the partial page.
+That is #7's "refuses to synthesize ... without explicit review."
+
+Three layers, of **declining** confidence, and the entry is honest about which
+is which:
+
+| Layer | Signal | Confidence |
+|---|---|---|
+| 0 | Source has exactly 2 participants -> any new content citing it stops | **Fully deterministic, no vocabulary.** The load-bearing arm; covers the 26 1:1/planning recordings where the manual review found the harm |
+| 1 | Named person is not a participant of any source the page cites ("participation is consent") | **Fully deterministic** -- roster and attendance come from `Speakers:`/`Attendees:` headers and turn lines |
+| 2 | Predicate attaches to the PERSON, not their WORK | **Enumerated heuristic. Has false negatives.** |
+
+Layer 2 inverts the polarity of the keyword approach that failed. The earlier
+passes enumerated the *unbounded* side (every way a disclosure might be worded);
+an unlisted term there is a silent ship. Layer 2 additionally enumerates the
+*bounded* side -- the corpus's own work vocabulary, read off the wiki's
+non-person page titles -- and uses it as an **exemption**. An unlisted work noun
+costs a false positive, which routes to review. That fails in the safe
+direction. Health/personnel/credential markers are **not** exemptible; nothing
+turns a diagnosis or a comp conversation into criticism of work.
+
+Presence is a mitigation, not a licence: capability language about someone in
+the room is left alone (they can answer back); health/personnel material fires
+whether or not they were present. Self-disclosure is not exempted -- the keep
+requires the person to have made it part of their public work story, which is a
+judgment for the review gate, not for this code.
+
+**Scoped to lines not present in the page's HEAD blob.** A finding on a page
+written 200 sources ago is not fixable by reweaving the current source, so a
+whole-wiki scan would fail every later source forever and the gate would be
+switched off -- which is how this project shipped thirteen broken checkers.
+Diff-scoping also means content a reviewer approves and commits stops firing
+permanently, with no marker mechanism and no state file. Git unavailable ->
+skipped silently, like `find_zero_touch`.
+
+### Proven in both directions
+
+The second direction matters as much as the first: a gate that strips every
+mention of a colleague is not a fix.
+
+```
+fires on    1:1-sourced content (any wording), health, personnel, credentials,
+            interpersonal conflict, absent-party capability characterization
+quiet on    "X's design is wrong", "X was wrong about the retry semantics",
+            "X pushed back and objected", "X's proposal doesn't scale",
+            "X struggled with the schema migration" (work anchor),
+            "X said she has been struggling" (X was in the room)
+real corpus 0 findings on 40KB slabs of both largest real transcripts
+adversarial 16/16 -- em-dashes, "Zoë Ferreira-Lund", "Bjørn Ødegård",
+            "Mei-Lin Cho"; "Amaralyn" does not match "Amara"
+edge cases  empty page, no frontmatter, no citations, unknown source,
+            NUL/BOM/emoji -> 0 findings, no crash
+```
+
+**The adversarial pass caught a real over-redaction bug before it shipped.**
+Bare `backfill` was in the non-exemptible list and fired on 20 sentences of
+ordinary data-backfill discussion across the real fixtures (126 raw hits). It is
+now narrowed to the personnel sense, and `test_no_marker_fires_on_real_corpus_
+technical_prose` is a standing guard that re-runs every marker against both real
+fixtures so the next marker added cannot reintroduce that class.
+
+### What is still open
+
+**This narrows the hole; it does not close it.** Residuals, in order of size:
+
+1. **Layer 2 has false negatives by construction.** A characterization worded
+   outside its vocabulary, about a person who *was* in the room, on a page
+   citing no 1:1 source, passes. Layers 0 and 1 do not depend on the
+   vocabulary; Layer 2 does, and no word list is complete.
+2. **People outside the team are not on the roster.** The roster is built from
+   source participation, so "people outside the team discussed candidly" -- one
+   of the four categories the review found -- is only caught when the material
+   also came from a 1:1 source (Layer 0) or trips an unconditional marker.
+3. **Layer 0 keys on headcount, not on content.** A 3-person planning meeting
+   that is functionally private is not classified private. `Unknown` is
+   deliberately not counted as an extra participant, which errs toward
+   classifying as private -- the safe direction -- but a 1:1 recorded with a
+   third silent attendee still reads as a group source.
+4. **Retroactive content is untouched.** Diff-scoping is what stops the gate
+   wedging, and the cost is that the ~40 passages already in an existing wiki
+   are not found by it. This prevents recurrence; it is not a remediation pass.
+5. **Sentence segmentation is a regex.** A characterization split across two
+   sentences ("Kwabena has been on my mind. He is not ready.") loses the name
+   in the second sentence and does not fire.
+
+### What could not be settled
+
+Whether a *reliable* judgment gate is achievable at all for the semantic part.
+`retention_check.py` measured an LLM judge at 0/3 against a deterministic
+detector's 2/3 on a comparable content-classification task in this same
+codebase, so adding an LLM judge as Layer 3 was rejected rather than tried --
+that is an inference from an adjacent measurement, not a measurement of this
+task. Whether a model scoped only to Layer 1's already-filtered candidate
+sentences would beat the enumerated list is untested and would need its own
+labelled set to answer honestly.
 
 ---
 

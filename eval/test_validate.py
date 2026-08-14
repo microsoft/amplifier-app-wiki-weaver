@@ -124,27 +124,27 @@ def test_duplicate_section_fails_validation(wiki_root, capsys):
     (a real, byte-for-byte shape pulled from the affected corpus) reported
     "No structural issues found.\""""
     duplicate_page = (
-        "---\ntitle: Team Pulse\ntype: source\n---\n\n"
-        "# Team Pulse\n\n"
-        "## Repo-Weaver Design for Team Pulse \u2014 Inbox-Based Architecture (2026-08-11)\n\n"
+        "---\ntitle: Signal Deck\ntype: source\n---\n\n"
+        "# Signal Deck\n\n"
+        "## Orchard Design for Signal Deck \u2014 Inbox-Based Architecture (2026-08-11)\n\n"
         "Renata Ossovski described a detailed workflow. (some-source.md)\n\n"
         "## Made-Team-App Onboarding \u2014 Repo Access Architecture (2026-08-11 to 2026-08-12)\n\n"
         "Tomas Berglund validated end-to-end retrieval. (some-source.md)\n\n"
-        "## Repo-Weaver Design for Team Pulse \u2014 Inbox-Based Architecture (2026-08-11)\n\n"
+        "## Orchard Design for Signal Deck \u2014 Inbox-Based Architecture (2026-08-11)\n\n"
         "Renata Ossovski described a detailed workflow. (some-source.md)\n"
     )
     wiki_root.add_page("index.md", CLEAN_PAGE)
-    wiki_root.add_page("team-pulse.md", duplicate_page)
+    wiki_root.add_page("signal-deck.md", duplicate_page)
     wr = WikiRoot(wiki_root.root)
 
     code = validate.main(["--wiki-root", str(wr.root), "--out", ".ai/validation-report.md"])
 
     assert code == 1
     err = capsys.readouterr().err
-    assert "duplicate section: team-pulse.md" in err
-    assert "Repo-Weaver Design for Team Pulse" in err
+    assert "duplicate section: signal-deck.md" in err
+    assert "Orchard Design for Signal Deck" in err
     report = (wr.root / ".ai" / "validation-report.md").read_text(encoding="utf-8")
-    assert "duplicate section: team-pulse.md" in report
+    assert "duplicate section: signal-deck.md" in report
     # The genuinely unique heading in the same page must NOT be flagged as
     # a duplicate -- only the heading that actually repeats is named.
     assert not any("Made-Team-App Onboarding" in line for line in err.splitlines() if "duplicate section" in line)
