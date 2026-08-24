@@ -78,7 +78,13 @@ def main(argv: list[str] | None = None) -> int:
     context = build_gap_context(wr, gap, args.k)
 
     ensure_dir(wr.ai_dir)
-    atomic_write_text(wr.gap_context_file, json.dumps(context, indent=2) + "\n")
+    # ensure_ascii=False: "term" is real prose (an LLM-authored argument) and
+    # "related_pages" carries real wiki page titles -- both can contain
+    # em-dashes, arrows, or curly quotes. This file is read RAW by answer_gap
+    # (pipeline/synthesize.dot's LLM box) with its own file tools, never
+    # through json.loads -- ensure_ascii=True would leak a literal "\uXXXX"
+    # escape sequence into what answer_gap reads as plain text.
+    atomic_write_text(wr.gap_context_file, json.dumps(context, indent=2, ensure_ascii=False) + "\n")
     print(
         f"gap context for {gap['term']!r}: {len(gap['source_ids'])} source(s), "
         f"{len(context['related_pages'])} related wiki page(s)"

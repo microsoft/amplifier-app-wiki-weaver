@@ -116,7 +116,14 @@ def main(argv: list[str] | None = None) -> int:
 
     chosen = remaining[0]
     ensure_dir(wr.ai_dir)
-    atomic_write_text(wr.current_gap_file, json.dumps(chosen))
+    # ensure_ascii=False: this file's "term"/"claim" fields are real prose
+    # (an LLM-authored argument, possibly containing em-dashes, arrows, or
+    # curly quotes) and are read RAW by answer_gap (pipeline/synthesize.dot's
+    # LLM box) with its own file tools -- never through json.loads. At the
+    # default ensure_ascii=True, a non-ASCII character here is serialized as
+    # a literal "\uXXXX" escape sequence that answer_gap could copy verbatim
+    # into wiki page prose instead of the real character.
+    atomic_write_text(wr.current_gap_file, json.dumps(chosen, ensure_ascii=False))
     print(
         f"selected gap: {chosen.get('term')!r} "
         f"({chosen.get('source_count', 0)} source(s), {len(remaining)} candidate(s) remaining)",

@@ -102,7 +102,13 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = resolve_path(wr, args.out)
     ensure_dir(out_path.parent)
-    atomic_write_text(out_path, json.dumps(payload, indent=2) + "\n")
+    # ensure_ascii=False: "question" is the user's own free-text question and
+    # each candidate's "title" is a real wiki page title -- both can contain
+    # em-dashes, arrows, or curly quotes. This file is read RAW by ask.dot's
+    # "answer" LLM box with its own file tools, never through json.loads --
+    # ensure_ascii=True would leak a literal "\uXXXX" escape sequence into
+    # what the answer node reads as plain text.
+    atomic_write_text(out_path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
     print(
         f"{len(payload['candidates'])} candidate page(s) for question "

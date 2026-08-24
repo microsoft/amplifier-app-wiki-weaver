@@ -199,7 +199,13 @@ def main(argv: list[str] | None = None) -> int:
         "claim": str(chosen.get("claim", "")).strip(),
         "source_ids": list(chosen["source_ids"]),
     }
-    atomic_write_text(wr.current_attribution_candidate_file, json.dumps(candidate, indent=2) + "\n")
+    # ensure_ascii=False: "term"/"claim" are real prose (an LLM-authored
+    # argument, possibly containing em-dashes, arrows, or curly quotes) and
+    # this file is read RAW by attribute_sources (pipeline/synthesize.dot's
+    # LLM box) with its own file tools, never through json.loads --
+    # ensure_ascii=True would leak a literal "\uXXXX" escape sequence into
+    # what attribute_sources reads as plain text.
+    atomic_write_text(wr.current_attribution_candidate_file, json.dumps(candidate, indent=2, ensure_ascii=False) + "\n")
     print(
         f"selected candidate for attribution: {candidate['term']!r} "
         f"({len(candidate['source_ids'])} seed source(s), "
