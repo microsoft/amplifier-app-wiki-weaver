@@ -57,8 +57,11 @@ _LAYER1_WHEEL_DEPS: list[tuple[str, str]] = [
         "https://github.com/microsoft/amplifier-foundation",
     ),
     (
+        # Moved from amplifier-bundle-attractor to amplifier-bundle-dot-runner
+        # in the engine repo split; keep this in lockstep with the matching
+        # pyproject.toml dependency string above (Layer 1 = installed wheel).
         "amplifier-unified-llm-client",
-        "https://github.com/microsoft/amplifier-bundle-attractor",
+        "https://github.com/microsoft/amplifier-bundle-dot-runner",
     ),
 ]
 
