@@ -16,9 +16,26 @@ authors = [{name = "Microsoft Corporation"}]
 #
 # RUNTIME PREREQUISITE (not satisfied by these deps): an Amplifier installation
 # (amplifier-app-cli) for ~/.amplifier config + API keys + the warm bundle cache the
-# attractor engine loads on first ingest. `wiki-weaver doctor` verifies all of this.
+# engine loads on first ingest. `wiki-weaver doctor` verifies all of this.
 dependencies = [
-    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
+    # NOTE (fresh-install fix): declared as a plain named requirement redirected
+    # via [tool.uv.sources] below -- NOT a direct `@ git+...@main` URL. This used
+    # to be a direct reference, but amplifier-module-pipeline-runner's own
+    # published dependency line for amplifier-foundation is a NAMED requirement
+    # redirected via its OWN [tool.uv.sources] (`branch = "main"`). uv identifies
+    # a git requirement by its ref-KIND representation, not just the ref it
+    # resolves to: a `@main`-suffixed direct URL and a `branch = "main"`
+    # sources-redirect are DIFFERENT representations of "the same ref" to uv's
+    # resolver, even though they print identically. `uv tool install
+    # git+<this repo>` failed with "Requirements contain conflicting URLs for
+    # package amplifier-foundation" the instant both shapes were resolved
+    # together (which they always are -- pipeline-runner is a direct dependency
+    # below). Matching pipeline-runner's declaration SHAPE (not just its ref) is
+    # what makes the two co-resolve. See amplifier-bundle-dot-runner/modules/
+    # pipeline-runner/pyproject.toml's own (much longer) comment on this same
+    # line for the full investigation and the shapes that were tried and
+    # rejected.
+    "amplifier-foundation>=1.0.0",
     # NOTE: these two moved from amplifier-bundle-attractor to
     # amplifier-bundle-dot-runner in the engine repo split (module paths are
     # unchanged; only the source repo URL flipped).
@@ -30,6 +47,13 @@ dependencies = [
     "tinycss2>=1.0",
     "markdown>=3.0",
 ]
+
+[tool.uv.sources]
+# Matches amplifier-module-pipeline-runner's own [tool.uv.sources] redirect for
+# the exact same package+ref -- see the long comment on the dependency line
+# above for why the shape (not just the ref) has to match for co-resolution.
+# Still floats on `main` deliberately (wiki-weaver tracks @main on purpose).
+amplifier-foundation = { git = "https://github.com/microsoft/amplifier-foundation", branch = "main" }
 
 [project.urls]
 Repository = "https://github.com/microsoft/amplifier-app-wiki-weaver"

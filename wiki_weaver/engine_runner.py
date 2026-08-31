@@ -93,29 +93,15 @@ RUBRIC_PATH = WIKI_WEAVER_ROOT / "eval" / "scenario-01-llm-wiki" / "rubric.md"
 # one source well integrated?" -- the correct, achievable bar for the inner loop.
 CONVERGENCE_RUBRIC_PATH = PIPELINE_DIR / "CONVERGENCE_RUBRIC.md"
 
-# The attractor-pipeline bundle: composes the loop-pipeline orchestrator,
-# context-simple, the anthropic provider, filesystem/bash/search tools, and the
-# per-provider child agents the engine spawns. Local checkout preferred; the
-# bundle's ``attractor:`` namespace resolves to the cached microsoft repo via
-# the user registry. Falls back to the canonical git URL.
-# Set WIKI_WEAVER_ATTRACTOR_PIPELINE to point at a local checkout of the
-# attractor-pipeline bundle (e.g. the bundles/attractor-pipeline.yaml inside a
-# local clone of amplifier-bundle-attractor). When the env var is absent,
-# run_pipeline's own local-sibling-then-git-URL fallback applies (see the
-# bridge below).
-ATTRACTOR_PIPELINE_LOCAL = os.environ.get("WIKI_WEAVER_ATTRACTOR_PIPELINE")
-
-# Bridge to pipeline-runner's OWN local-bundle override env var. run_pipeline
-# (amplifier_module_pipeline_runner.runner) resolves its base bundle via a
-# local sibling path or the ``ATTRACTOR_PIPELINE_BUNDLE`` env var -- a
-# DIFFERENT name than wiki-weaver's own ``WIKI_WEAVER_ATTRACTOR_PIPELINE``.
-# Forward it here (setdefault -- never override an explicit
-# ATTRACTOR_PIPELINE_BUNDLE the caller already set) so existing wiki-weaver
-# dev workflows that point WIKI_WEAVER_ATTRACTOR_PIPELINE at a local checkout
-# keep working unchanged. doctor() still reports on ATTRACTOR_PIPELINE_LOCAL
-# directly (see lib.py).
-if ATTRACTOR_PIPELINE_LOCAL:
-    os.environ.setdefault("ATTRACTOR_PIPELINE_BUNDLE", ATTRACTOR_PIPELINE_LOCAL)
+# NOTE (engine-020 compat fix): wiki-weaver's engine runs are always BARE --
+# every ``run_pipeline(...)`` call below omits ``bundle=``, so the engine
+# never loads an "attractor-pipeline bundle" (there is no such default to
+# override). This module used to export a ``WIKI_WEAVER_ATTRACTOR_PIPELINE``
+# env var and forward it into pipeline-runner's ``ATTRACTOR_PIPELINE_BUNDLE``
+# env var, but the current engine (amplifier-bundle-dot-runner's
+# pipeline-runner) has zero readers of ``ATTRACTOR_PIPELINE_BUNDLE`` -- it was
+# a silent no-op left over from the pre-split attractor engine. Removed
+# rather than repointed: see doctor()'s equivalent cleanup in lib.py.
 
 # Context-intelligence hook module source (already installed in the amplifier
 # venv; prepare() resolves it from cache).

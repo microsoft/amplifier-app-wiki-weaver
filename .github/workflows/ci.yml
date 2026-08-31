@@ -45,3 +45,13 @@ jobs:
         # the LLM pipeline (via amplifier_foundation) are automatically skipped when
         # that package is not installed — CI runs the deterministic majority.
         run: python -m pytest eval/ -q
+
+      - name: Resolution smoke -- uv tool install (fresh-install regression guard)
+        # The job above installs with `pip install --no-deps`, which cannot see
+        # dependency-resolution regressions (e.g. the "conflicting URLs for
+        # package amplifier-foundation" class of bug). This exercises the SAME
+        # resolution path a real `uv tool install git+https://...` does, against
+        # the checked-out commit via git+file://.
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          "$HOME/.local/bin/uv" tool install "git+file://$GITHUB_WORKSPACE"
