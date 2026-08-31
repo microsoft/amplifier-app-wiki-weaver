@@ -163,7 +163,9 @@ def main(argv: list[str] | None = None) -> int:
     content_path = wr.current_segment_content_file if wr.current_segment_content_file.is_file() else None
     slice_data = build_slice(wr, source_id, args.k, budget_bytes=args.budget_bytes, content_path=content_path)
     ensure_dir(wr.ai_dir)
-    atomic_write_text(wr.current_slice_file, json.dumps(_render_for_disk(slice_data), indent=2) + "\n")
+    atomic_write_text(
+        wr.current_slice_file, json.dumps(_render_for_disk(slice_data), indent=2, ensure_ascii=False) + "\n"
+    )
 
     mode = f"k={args.k} (explicit override)" if args.k is not None else f"budget={args.budget_bytes} bytes"
     print(

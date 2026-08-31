@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = resolve_path(wr, args.out)
     ensure_dir(out_path.parent)
-    atomic_write_text(out_path, json.dumps({"pages": pages}, indent=2) + "\n")
+    atomic_write_text(out_path, json.dumps({"pages": pages}, indent=2, ensure_ascii=False) + "\n")
     print(
         f"located {len(pages)} affected page(s): {', '.join(pages) if pages else '(none)'}",
         file=sys.stderr,

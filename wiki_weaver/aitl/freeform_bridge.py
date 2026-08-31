@@ -183,5 +183,5 @@ class FreeformAnswerRecorder:
 
         atomic_write_text(
             out_file,
-            json.dumps({key_field: key_value, "stage": stage_name, "text": text}, indent=2) + "\n",
+            json.dumps({key_field: key_value, "stage": stage_name, "text": text}, indent=2, ensure_ascii=False) + "\n",
         )

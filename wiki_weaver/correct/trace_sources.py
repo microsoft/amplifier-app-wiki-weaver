@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = resolve_path(wr, args.out)
     ensure_dir(out_path.parent)
-    atomic_write_text(out_path, json.dumps({"sources": sources}, indent=2) + "\n")
+    atomic_write_text(out_path, json.dumps({"sources": sources}, indent=2, ensure_ascii=False) + "\n")
     print(
         f"traced {len(sources)} source id(s) from {len(page_ids)} page(s): "
         f"{', '.join(sources) if sources else '(none)'}",
