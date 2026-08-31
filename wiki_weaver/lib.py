@@ -2208,39 +2208,39 @@ def doctor(*, wiki: str | Path | None = None) -> int:
 
     # Engine runner imports cleanly (local code; needed for the WARN probes).
     try:
-        from wiki_weaver.engine_runner import (
-            ATTRACTOR_PIPELINE_LOCAL,
-            load_ci_config,
-        )
+        from wiki_weaver.engine_runner import load_ci_config
     except Exception as e:  # noqa: BLE001
         _fail(f"could not load engine_runner: {e}")
         return 1
 
-    # Amplifier runtime present: wiki-weaver is a companion tool. The engine's
-    # load_bundle() fetches the attractor-pipeline bundle on first ingest and
-    # reads API keys from ~/.amplifier/settings. A missing or empty cache means
-    # first ingest will cold-fetch from git (needs network + Amplifier install).
+    # Amplifier runtime present: wiki-weaver is a companion tool. Every engine
+    # run is BARE (no explicit bundle reference -- see engine_runner.py), but
+    # the dot-runner engine still cold-fetches its own modules (context-simple,
+    # the loop-pipeline orchestrator, the context-intelligence hook below) from
+    # git on first use if ~/.amplifier/cache is empty. A missing or empty cache
+    # means first ingest will cold-fetch those modules (needs network + an
+    # Amplifier install).
     _amplifier_home = Path.home() / ".amplifier"
     _amplifier_cache = _amplifier_home / "cache"
     if not _amplifier_home.is_dir():
         _warn(
             "~/.amplifier/ not found — Amplifier (amplifier-app-cli) does not appear "
             "installed/initialized. wiki-weaver is a companion tool; first ingest will "
-            "cold-fetch the engine bundle and requires network + an Amplifier install. "
-            "See README."
+            "cold-fetch the engine's modules and requires network + an Amplifier "
+            "install. See README."
         )
     elif not _amplifier_cache.is_dir() or not any(_amplifier_cache.iterdir()):
         _warn(
             "~/.amplifier/cache/ is missing or empty — Amplifier may not be fully "
-            "initialized; first ingest will cold-fetch the engine bundle from git. "
+            "initialized; first ingest will cold-fetch the engine's modules from git. "
             "Initialize Amplifier first, or ensure network access is available."
         )
     else:
         _ok("Amplifier runtime present (~/.amplifier/cache is non-empty)")
 
-    # Network reachability: load_bundle() fetches from github.com when the cache
-    # is cold. Fast TCP-only probe (no HTTP, no auth, no bundle load) — non-fatal
-    # WARN so it never blocks a user with an already-warm cache.
+    # Network reachability: module resolution fetches from github.com when the
+    # cache is cold. Fast TCP-only probe (no HTTP, no auth, no module load) —
+    # non-fatal WARN so it never blocks a user with an already-warm cache.
     import socket as _socket
 
     try:
@@ -2249,21 +2249,7 @@ def doctor(*, wiki: str | Path | None = None) -> int:
     except OSError as e:
         _warn(
             f"network: github.com:443 unreachable ({type(e).__name__}: {e}) — "
-            "first ingest fetches the attractor engine bundle and will fail offline"
-        )
-
-    if ATTRACTOR_PIPELINE_LOCAL:
-        pipeline_bundle = Path(ATTRACTOR_PIPELINE_LOCAL)
-        if pipeline_bundle.is_file():
-            _ok(f"attractor-pipeline bundle found: {pipeline_bundle}")
-        else:
-            _warn(
-                f"WIKI_WEAVER_ATTRACTOR_PIPELINE set but path missing ({pipeline_bundle});"
-                " will fall back to git URL"
-            )
-    else:
-        _warn(
-            "WIKI_WEAVER_ATTRACTOR_PIPELINE not set; will load attractor-pipeline from git URL"
+            "first ingest fetches the engine's modules and will fail offline"
         )
 
     # context-intelligence hook.
@@ -2353,50 +2339,6 @@ def doctor(*, wiki: str | Path | None = None) -> int:
                 _warn(f"  {rec.label:<44s} (not cached — will clone on first ingest)")
     except Exception as e:  # noqa: BLE001
         _warn(f"could not read resolved @main commits: {e}")
-
-    # Attractor engine routing-contract floor: pipeline/synthesize.dot's assess
-    # node reports its verdict as a flat bare-JSON final message (spawn path,
-    # PR #41). Verdict routing is only fail-safe when the resolved
-    # attractor-bundle commit is at or beyond ATTRACTOR_ROUTING_FLOOR_SHA
-    # (attractor #89, transitively #88): older engines leave a stale
-    # preferred_label in context across loop_restart, so a verdict from one
-    # cycle/source can leak into the next and silently false-converge it.
-    # Read-only diagnostic;
-    # degrades to WARN (never blocks doctor) when inconclusive — e.g. offline,
-    # not yet cloned, or the GitHub compare API is unreachable.
-    try:
-        import asyncio
-
-        from wiki_weaver.updater import (
-            ATTRACTOR_ROUTING_FLOOR_SHA,
-            check_attractor_routing_floor,
-        )
-
-        floor_result = asyncio.run(check_attractor_routing_floor())
-        floor_short = ATTRACTOR_ROUTING_FLOOR_SHA[:8]
-        if floor_result.ok is True:
-            _ok(
-                f"attractor routing-contract floor: {floor_result.message}"
-                f" (>= {floor_short})"
-            )
-        elif floor_result.ok is False:
-            _fail(
-                f"attractor routing-contract floor: {floor_result.message}"
-                f" (>= {floor_short})"
-            )
-            _warn(
-                "  upgrade the attractor engine (amplifier-module-loop-pipeline /"
-                f" attractor bundle) to a commit at or past {floor_short}"
-                " \u2014 run `wiki-weaver update`"
-            )
-            ok = False
-        else:
-            _warn(
-                f"attractor routing-contract floor: {floor_result.message}"
-                f" (>= {floor_short})"
-            )
-    except Exception as e:  # noqa: BLE001
-        _warn(f"could not check attractor routing-contract floor: {e}")
 
     print()
     if ok:
