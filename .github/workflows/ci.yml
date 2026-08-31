@@ -52,6 +52,14 @@ jobs:
         # package amplifier-foundation" class of bug). This exercises the SAME
         # resolution path a real `uv tool install git+https://...` does, against
         # the checked-out commit via git+file://.
+        #
+        # Explicit @$GITHUB_SHA ref is REQUIRED here (review finding, CI-
+        # verified failure): actions/checkout's default shallow clone does not
+        # set up `refs/remotes/origin/HEAD`, so a bare `git+file://$GITHUB_
+        # WORKSPACE` (no ref) fails with "failed to find default branch HEAD"
+        # -- uv's git backend has nothing to default to. Pinning the exact
+        # commit under test sidesteps that entirely (and is more precise: it
+        # tests the actual PR commit, not whatever HEAD happens to resolve to).
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          "$HOME/.local/bin/uv" tool install "git+file://$GITHUB_WORKSPACE"
+          "$HOME/.local/bin/uv" tool install "git+file://$GITHUB_WORKSPACE@$GITHUB_SHA"
