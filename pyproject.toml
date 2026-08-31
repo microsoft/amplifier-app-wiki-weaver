@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "wiki-weaver"
 version = "0.1.0"
 description = "LLM-wiki ingest pipeline driven by the attractor engine."
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [{name = "Microsoft Corporation"}]
 # Runtime libraries are declared as git deps so `uv tool install git+...` resolves
@@ -43,7 +43,25 @@ dependencies = [
     # Shared engine-driving library (drive_engine/run_pipeline + spawn wiring)
     # that engine_runner.py delegates to -- see wiki_weaver/engine_runner.py's
     # module docstring for the split of responsibilities.
-    "amplifier-module-pipeline-runner @ git+https://github.com/microsoft/amplifier-bundle-dot-runner@main#subdirectory=modules/pipeline-runner",
+    #
+    # THE COUPLING (fix/engine-020-compat, decided jointly with
+    # amplifier-bundle-dot-runner's fix/library-seam-default-worker PR):
+    # this points at the ROOT `amplifier-dot-runner` distribution (no
+    # #subdirectory), NOT the `amplifier-module-pipeline-runner` module
+    # subdirectory form used previously. wiki-weaver's engine runs are
+    # always bare `run_pipeline()` calls (engine_runner.py never passes
+    # bundle=), and that bare call now resolves to `amplifier-agent` as its
+    # unconditional default worker (the library-seam fix). The MODULE dist
+    # deliberately does NOT ship amplifier-agent + the loop-amplifier-agent
+    # adapter (it stays lean + Python >=3.11 for callers who always pass
+    # worker=/bundle= explicitly and never touch the default ladder); the
+    # ROOT dist does, unconditionally (WAVE 6) -- and requires Python >=3.12
+    # to do it (see this file's requires-python above, bumped to match).
+    # `amplifier_module_pipeline_runner.run_pipeline` remains importable
+    # unchanged (the root dist re-exports it transitively -- see
+    # amplifier_dot_runner/__init__.py in that repo). Proof: see this
+    # repo's PR body / eval/ install-smoke evidence.
+    "amplifier-dot-runner @ git+https://github.com/microsoft/amplifier-bundle-dot-runner@main",
     "tinycss2>=1.0",
     "markdown>=3.0",
 ]
