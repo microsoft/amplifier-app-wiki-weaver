@@ -61,6 +61,8 @@ import re
 import sys
 from pathlib import Path
 
+from .consistency import SPECIAL_PAGES
+
 __all__ = [
     "GradeResult",
     "grade_overview",
@@ -118,7 +120,10 @@ _WIKILINK = re.compile(r"\[\[[^\]]+\]\]")
 _SECTION_HEADER_H2 = re.compile(r"(?m)^#{2,}\s+")
 
 OVERVIEW_OPENER_THRESHOLD: int = 2  # max source-narration openers → PASS
-OVERVIEW_WIKILINK_MIN: int = 5  # min wikilinks for a navigational overview
+# Cap on the scale-aware OV2 bar (see _required_wikilink_count) -- the min
+# wikilinks required for a navigational overview once a wiki has enough
+# linkable pages to reach it. Unchanged: large-wiki behaviour is identical.
+OVERVIEW_WIKILINK_MIN: int = 5
 
 
 class GradeResult:
@@ -174,6 +179,58 @@ OVERVIEW:
 """
 
 
+def _required_wikilink_count(wiki: Path) -> tuple[int, int]:
+    """Scale-aware OV2 bar: how many wikilinks a genuine overview can reach.
+
+    Returns ``(required, linkable_page_count)``.
+
+    THE PROBLEM: OV2 used to gate every wiki on a flat
+    ``OVERVIEW_WIKILINK_MIN`` (5), regardless of wiki size. overview.md links
+    to the wiki's OTHER pages -- in a wiki of N pages, a natural overview
+    links to roughly N-2 of them (every page except itself and index.md,
+    neither of which is a sensible link target). A 3-page wiki cannot reach 5
+    links without repeating the same link several times, which a genuine
+    thematic synthesis does not do. Measured on a 674-repo production corpus:
+    476/674 (71%) have fewer than 5 pages TOTAL (a count that already
+    includes index.md and overview.md) -- OV2 was structurally unreachable
+    for the large majority of real wikis.
+
+    HOW PAGES ARE COUNTED: ``wiki.glob("*.md")`` -- the same non-recursive,
+    wiki-root-only enumeration already used throughout this module
+    (``grade_overview``'s own type:index scan, ``no_duplicate_pages``) and
+    the rest of the codebase (``consistency._content_pages``,
+    ``retention._gather_after_text``). Non-recursive glob naturally excludes
+    ``_sources/`` (a directory, not a ``*.md`` match) and anything under
+    ``.wiki/``/``.ai/`` -- no new filtering logic needed.
+
+    THE -2: reuses ``consistency.SPECIAL_PAGES`` (``{"index.md",
+    "overview.md"}``) -- the same "these two are structural entry points, not
+    content" boundary this codebase already draws (see
+    ``consistency._content_pages``) -- rather than a bare arithmetic
+    ``page_count - 2``. Excluding by NAME instead of subtracting a constant
+    correctly handles wikis missing ``index.md`` (the documented "fresh wiki,
+    no front door yet" case in consistency.py) without under-counting.
+
+    THE FLOOR: a wiki with ZERO linkable pages (only overview.md itself, and
+    maybe index.md -- exactly the 204/674 "1-page" corpus wikis, whose single
+    counted page IS overview.md) has nothing to link to at all. Demanding
+    >= 1 wikilink from an overview with no other page to name would be a
+    gate against a page that structurally cannot pass it, not a genuine
+    quality bar -- so this case is EXEMPT (required == 0), not floored at 1.
+    Once at least one other page exists, >= 1 link is required (no free
+    pass for a 2+-page wiki that simply declines to link anything).
+
+    THE CAP: ``min(OVERVIEW_WIKILINK_MIN, ...)`` -- wikis with >= 7 linkable
+    pages hit the unchanged bar of 5; large wikis see zero behaviour change.
+    """
+    linkable_page_count = len(
+        [p for p in wiki.glob("*.md") if p.name not in SPECIAL_PAGES]
+    )
+    if linkable_page_count == 0:
+        return 0, linkable_page_count
+    return min(OVERVIEW_WIKILINK_MIN, max(1, linkable_page_count)), linkable_page_count
+
+
 def grade_overview(wiki: Path, judge_fn=None) -> GradeResult:
     """Grade whether overview.md is a synthesized navigational map vs. a per-source log.
 
@@ -181,8 +238,12 @@ def grade_overview(wiki: Path, judge_fn=None) -> GradeResult:
         OV1  source_narration_openers <= OVERVIEW_OPENER_THRESHOLD (2)
              Counts "(source N)" / "(sources N, M)" parenthetical openers.
              A synthesized overview has ~0; a concatenation log has one per source.
-        OV2  wikilink_count >= OVERVIEW_WIKILINK_MIN (5)
-             A navigational map links to pages; a flat log may not.
+        OV2  wikilink_count >= required_wikilinks (SCALE-AWARE, capped at
+             OVERVIEW_WIKILINK_MIN=5). A navigational overview links to
+             roughly (page_count - 2) other pages (every page except itself
+             and index.md); a wiki with few pages cannot reach a flat bar of
+             5 without repeating the same link, which a genuine synthesis
+             will not do. See _required_wikilink_count() docstring.
 
     Diagnostics (reported but NOT gated):
         thread_openers        "A X-th thread …" sentence count (secondary signal)
@@ -224,12 +285,21 @@ def grade_overview(wiki: Path, judge_fn=None) -> GradeResult:
         f"(<= {OVERVIEW_OPENER_THRESHOLD})",
     )
 
-    # OV2 — hard gate: too few wikilinks → not a navigational document
+    # OV2 — hard gate: too few wikilinks → not a navigational document.
+    # Scale-aware (see _required_wikilink_count docstring): a small wiki is
+    # held to a bar it can actually reach (roughly linkable_page_count,
+    # capped at OVERVIEW_WIKILINK_MIN), not the flat constant a 30-page wiki
+    # is held to. A wiki with zero linkable pages is exempt (required == 0).
+    required_wikilinks, linkable_page_count = _required_wikilink_count(wiki)
     res.check(
-        wikilink_count >= OVERVIEW_WIKILINK_MIN,
+        wikilink_count >= required_wikilinks,
         f"OV2 FAIL: {wikilink_count} wikilinks "
-        f"(need >= {OVERVIEW_WIKILINK_MIN} for a navigational overview)",
-        f"OV2 wikilinks: {wikilink_count} (>= {OVERVIEW_WIKILINK_MIN})",
+        f"(need >= {required_wikilinks} for this wiki's {linkable_page_count} "
+        f"linkable page(s); capped at {OVERVIEW_WIKILINK_MIN} for a "
+        f"navigational overview)",
+        f"OV2 wikilinks: {wikilink_count} "
+        f"(>= {required_wikilinks}, scaled from {linkable_page_count} "
+        f"linkable page(s), capped at {OVERVIEW_WIKILINK_MIN})",
     )
 
     # Diagnostics
