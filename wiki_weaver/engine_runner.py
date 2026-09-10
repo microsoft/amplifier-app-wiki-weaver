@@ -28,6 +28,7 @@ import asyncio
 import os
 import re
 import shlex
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -83,6 +84,9 @@ FOOTNOTES_PY = PIPELINE_DIR / "footnotes.py"
 # normalize_unicode.py: repairs stray \uXXXX JSON-escape artifacts in prose
 # (defense-in-depth bridge for amplifier-support #306; see module docstring).
 NORMALIZE_UNICODE_PY = PIPELINE_DIR / "normalize_unicode.py"
+# touched_pages.py: snapshots validator-visible pages before ingest, then
+# deterministically derives the touched-pages manifest from their content delta.
+TOUCHED_PAGES_PY = Path(__file__).resolve().parent / "touched_pages.py"
 # RESERVED FOR EVAL GRADING ONLY. The scenario rubric grades the WHOLE finished
 # corpus wiki (all sources, the A/B test). It is the WRONG bar for the inner
 # per-source loop: a single freshly-ingested article can never satisfy
@@ -217,6 +221,60 @@ def spawn_timeout_seconds() -> float:
 
 
 SPAWN_TIMEOUT_SECONDS = spawn_timeout_seconds()
+
+
+def ingest_max_turns() -> int | None:
+    """Return the optional per-ingest agent-turn cap from the environment.
+
+    An unset value intentionally produces no DOT attribute, preserving the
+    loop orchestrator's default.  A configured cap must be a positive integer:
+    accepting a malformed value would silently discard an operator's budget
+    setting and recreate the invisible-cap failure this setting addresses.
+    """
+    raw = os.environ.get("WIKI_WEAVER_INGEST_MAX_TURNS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "WIKI_WEAVER_INGEST_MAX_TURNS must be a positive integer"
+        ) from exc
+    if value <= 0:
+        raise ValueError("WIKI_WEAVER_INGEST_MAX_TURNS must be a positive integer")
+    return value
+
+
+def _apply_ingest_max_turns(dot_text: str) -> str:
+    """Add the configured ingest turn cap to a rendered synthesize DOT."""
+    configured_max_turns = ingest_max_turns()
+    if configured_max_turns is None:
+        return dot_text
+    return dot_text.replace(
+        "    ingest [\n",
+        f'    ingest [\n        max_agent_turns="{configured_max_turns}",\n',
+        1,
+    )
+
+
+def touched_pages_commands(wiki_dir: Path) -> tuple[str, str]:
+    """Build shell-safe snapshot and manifest-derivation commands for ``wiki_dir``."""
+    page_snapshot = wiki_dir / ".ai" / "pages.snapshot"
+
+    def command(*parts: str | Path) -> str:
+        return " ".join(shlex.quote(str(part)) for part in parts)
+
+    return (
+        command(sys.executable, TOUCHED_PAGES_PY, "snapshot", wiki_dir, page_snapshot),
+        command(
+            sys.executable,
+            TOUCHED_PAGES_PY,
+            "derive",
+            wiki_dir,
+            page_snapshot,
+            touched_manifest_path(wiki_dir),
+        ),
+    )
 
 
 @dataclass
@@ -389,13 +447,9 @@ def build_dot(
     # (PIPELINE_DESIGN.md §4). Dotted context keys are silently dropped in
     # box-node prompts, so a file is the reliable hand-off channel.
     validation_report = wiki_dir / ".ai" / "validation.md"
-    # Touched-pages manifest: ingest OVERWRITES it each cycle with the pages it
-    # created/modified; assess verifies EXACTLY those pages (bounded work-list)
-    # instead of open-ended wiki-wide re-verification. Root-cost fix for the
-    # 2026-07 incident where assess burned its whole child-session tool budget
-    # (max_tool_rounds_per_input=50, set in attractor-pipeline.yaml's agents
-    # block -- NOT settable per-node from wiki-weaver) re-verifying a 48-page
-    # wiki and never rendered a verdict, falsely quarantining 4/25 sources.
+    # Touched-pages manifest: the ingest agent appends paths while it works;
+    # the deterministic page-delta helper merges those paths with actual root
+    # page changes before assess verifies this bounded work-list.
     touched_manifest = touched_manifest_path(wiki_dir)
     validate_cmd = (
         f"{sys.executable} {VALIDATE_PY} {wiki_dir} --out {validation_report}"
@@ -408,6 +462,7 @@ def build_dot(
     normalize_cmd = f"{sys.executable} {NORMALIZE_PY} {wiki_dir}"
     footnotes_cmd = f"{sys.executable} {FOOTNOTES_PY} {wiki_dir}"
     normalize_unicode_cmd = f"{sys.executable} {NORMALIZE_UNICODE_PY} {wiki_dir}"
+    snapshot_cmd, derive_manifest_cmd = touched_pages_commands(wiki_dir)
 
     substitutions = {
         "$source_path": str(source_path),
@@ -427,11 +482,15 @@ def build_dot(
         "$normalize_unicode_cmd": normalize_unicode_cmd,
         "$validate_cmd": validate_cmd,
         "$touched_manifest": str(touched_manifest),
+        "$snapshot_cmd": snapshot_cmd,
+        "$derive_manifest_cmd": derive_manifest_cmd,
         "$max_cycles": str(policy.max_cycles),
         "$source_id": str(source_id),
     }
     for var, value in substitutions.items():
         dot = dot.replace(var, value)
+
+    dot = _apply_ingest_max_turns(dot)
 
     # Apply per-node provider / model overrides from policy.
     #
@@ -1320,6 +1379,7 @@ def run_ingest(
     policy = load_policy(wiki_dir)
     inner_text = INNER_DOT.read_text(encoding="utf-8")
     inner_text = _substitute_models(inner_text, policy)
+    inner_text = _apply_ingest_max_turns(inner_text)
     resolved_synthesize_dot = logs_dir / "synthesize.dot"
     resolved_synthesize_dot.write_text(inner_text, encoding="utf-8")
     synthesize_dot_abs = str(resolved_synthesize_dot)

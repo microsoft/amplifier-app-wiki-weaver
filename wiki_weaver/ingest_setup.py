@@ -73,6 +73,7 @@ def main() -> int:
         NORMALIZE_PY,
         NORMALIZE_UNICODE_PY,
         VALIDATE_PY,
+        touched_pages_commands,
     )
     from wiki_weaver.lib import (
         _assign_source_id,
@@ -119,13 +120,14 @@ def main() -> int:
     # of whether it is invoked directly or as a folder sub-pipeline.
     validation_report = wiki_dir / ".ai" / "validation.md"
 
-    # Touched-pages manifest: assess's bounded verification work-list (one
-    # wiki-relative page path per line, OVERWRITTEN by the ingest node each
-    # cycle). Delete any stale manifest from a PREVIOUS source now -- .ai/ is
-    # shared wiki-level scratch state, so without this reset assess could
-    # scope its verification to the prior source's page list.
+    # Touched-pages manifest: assess's bounded verification work-list. Delete
+    # stale state from a PREVIOUS source now -- .ai/ is shared wiki-level
+    # scratch state, so without this reset assess could scope its verification
+    # to the prior source's page list. synthesize.dot snapshots every cycle and
+    # deterministically merges actual page deltas after each ingest.
     touched_manifest = touched_manifest_path(wiki_dir)
     touched_manifest.unlink(missing_ok=True)
+    snapshot_cmd, derive_manifest_cmd = touched_pages_commands(wiki_dir)
 
     validate_cmd = (
         f"{shlex.quote(sys.executable)} {shlex.quote(str(VALIDATE_PY))}"
@@ -212,6 +214,8 @@ def main() -> int:
         "normalize_unicode_cmd": normalize_unicode_cmd,
         "validate_cmd": validate_cmd,
         "touched_manifest": str(touched_manifest),
+        "snapshot_cmd": snapshot_cmd,
+        "derive_manifest_cmd": derive_manifest_cmd,
         "archive_cmd": archive_cmd,
         "fail_cmd": fail_cmd,
         "tamper_check_cmd": tamper_check_cmd,

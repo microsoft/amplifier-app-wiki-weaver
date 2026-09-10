@@ -150,12 +150,13 @@ def removals_manifest_path(wiki: Path) -> Path:
 def touched_manifest_path(wiki: Path) -> Path:
     """Return the touched-pages manifest path: ``<wiki>/.ai/touched-pages.txt``.
 
-    Written (overwritten) by the ingest node each synthesize cycle with one
-    wiki-relative page path per line for every page it created/modified; read
-    by the assess node as its bounded verification work-list. Scratch state
-    (like ``.ai/feedback/``), NOT process state. Deleted deterministically
-    before each source's synthesis (run_inner / ingest_setup) so a stale
-    manifest from a previous source can never scope-poison the next assess.
+    The ingest node appends one wiki-relative page path per edit. After it
+    exits, the deterministic derive step merges those entries with root-page
+    content changes; assess reads the result as its bounded verification
+    work-list. Scratch state (like ``.ai/feedback/``), NOT process state.
+    Deleted deterministically before each source's synthesis (run_inner /
+    ingest_setup) so a stale manifest from a previous source can never
+    scope-poison the next assess.
     """
     return wiki / ".ai" / "touched-pages.txt"
 
