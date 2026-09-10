@@ -317,6 +317,7 @@ Full design: [`docs/`](docs/).
 |---|---|---|
 | `WIKI_WEAVER_MODEL` | Model (or family) for LLM pipeline/`init` nodes | `sonnet` |
 | `WIKI_WEAVER_PROVIDER` | Provider the LLM nodes route to | `anthropic` |
+| `WIKI_WEAVER_INGEST_MAX_TURNS` | Positive turn limit for each `ingest` agent run | Engine default (unset) |
 
 `WIKI_WEAVER_MODEL` accepts a **bare family token** (`sonnet`, `haiku`, `opus`) or an explicit
 model id.  Family tokens resolve at runtime to the newest model the provider actually serves in
@@ -325,6 +326,10 @@ through unchanged.  Internally, `feedback` nodes use `haiku` (fast, cheap) while
 synthesis nodes (`ingest`, `assess`, `init`, `ask`) use `sonnet`; both can be overridden per-wiki
 in `wiki.config.yaml` under `models:`.  If the family can't be resolved (network error, no match)
 wiki-weaver raises a loud error — it never silently falls back to a stale hardcoded id.
+
+Set `WIKI_WEAVER_INGEST_MAX_TURNS` only when a per-ingest turn budget is needed.
+It must be a positive integer; when unset, wiki-weaver emits no `max_agent_turns`
+node attribute and leaves the engine's existing default unchanged.
 
 ## Requirements
 
