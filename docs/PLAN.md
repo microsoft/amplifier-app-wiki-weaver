@@ -1,6 +1,6 @@
 # WikiWeaver V4 — Plan and Design
 
-**Status:** Kicked off building (Stage 1) — feedback welcome · **Date:** 2026-09-24 · **Owner:** Gurkaran Singh
+**Status:** Kicked off building (Stage 1) — feedback welcome · **Date:** 2026-09-24, revised 2026-10-02 · **Owner:** Gurkaran Singh
 **For:** Brian (team lead), Marc + Ken (Resolve), Sam (Team Pulse)
 
 ---
@@ -36,7 +36,9 @@ The observation that sets up V4 is Brian's, from the sync:
 > able to fully automate it meant we could get more of it done, we were sacrificing that.
 > It was a trade. So the next iteration was: how can we get back some of that value?"*
 
-That is what V4 goes after. On top of that base, four additions:
+In a follow-up 1:1, Brian and Gurkaran aligned on three pillars: lenses known in advance,
+lenses drawn out by interview, and the feedback loop. That is what V4 goes after. On top of that base, four
+additions — carrying all three:
 
 1. **A lens that actually reaches the writer.** V1 derived a policy file from an initial
    purpose; V2 designed lens directories. But V2's writer never sees them — its input is
@@ -80,8 +82,10 @@ without anyone having to sit down and author it.
 
 **The shape.** The pipeline is a **dot graph** — a `.dot` file where each node is either a
 model call or a shell command — and it runs on the **dot-runner engine**, the same engine
-Resolve runs. In attractor terms it's closer to a recipe than a full attractor: a light
-convergence shape, no heavy gate machinery. About eleven nodes, three of them model calls.
+Resolve runs. In attractor terms it's attractor-like in concept — a bounded convergence loop,
+not gate ceremony: per source, write → deterministic checks → rewrite once; across runs,
+corrections converge the wiki toward the lens. About eleven nodes: three inference (box)
+nodes, everything else deterministic glue.
 Per source: a lens-primed **brief** decides what matters here; a **writer** produces the
 source summary and integrates into the topic pages it touches; **deterministic checks**
 either pass it, send it back once, or hold it. Sources are retained and cited so an agent
@@ -165,7 +169,9 @@ Each traces to something measured or decided, not to taste.
    in the loop without the person being in it.*
 8. **Let the model do the work.** Short prompts that state intent, wide latitude in the
    middle, deterministic guardrails at the edges. Procedure written into a prompt is the
-   wheel we're loosening.
+   wheel we're loosening. The tripwire against re-tightening: policy grows in the lens, never
+   in the prompt; corrections are scoped to the pages they concern; no new model gate is
+   added without a measurement that says it pays.
    *Evidence: guidance written as expertise-and-intent outperformed procedure; and a
    read-scope rule written as a prompt sentence was ignored until per-source cost had grown
    from five minutes to eighty-seven.*
@@ -190,9 +196,9 @@ In priority order. *When* each arrives is in §6.
 | R2 | A lens — human-authored markdown, seeded at init from a purpose or a short interview — injected into the writer by code on every pass |
 | R3 | A proxy that answers the brief; a person can answer it instead, or correct the output afterwards |
 | R4 | **A learning system**: corrections are applied to the affected pages, persisted, and read by every subsequent run — so a correction given once is honored thereafter |
-| R5 | Runs behind the contract Team Pulse will be calling: tarball in / tarball out, the four verbs (`doctor · init · ingest · build-dashboard`), a machine-readable result. `init` runs on every job, so running it against an existing wiki must leave that wiki intact |
+| R5 | Runs behind the contract Team Pulse and RepoWeaver already call: the `wiki-weaver` verbs (`doctor · init · ingest · ask · build-dashboard · --version · update`), `ask --json` → `{answer, pages_used, refused}`, `--version` → `wiki-weaver YYYY.MM.DD-<sha>`, the `wiki_weaver.lib` path helpers (`wiki_inbox · wiki_sources · wiki_failed · wiki_ledger · wiki_dashboard`), `.wiki/runs/ingest-*/result.json`, tarball in / tarball out. `init` runs on every job, so running it against an existing wiki must leave that wiki intact |
 | R6 | Index → source summaries → raw sources; the agent follows threads back. Sources retained, never modified. Pages accumulate with dated supersession |
-| R7 | Incremental: a new or edited source updates the wiki. Keyed on content, so an edited file gets re-read |
+| R7 | Incremental: a new or edited source updates the wiki. Keyed on content, so an edited file gets re-read; `_sources/<name>` is the wrapper-visible done signal and the ledger carries the hash |
 | R8 | **Output is for agents to read. Human readability of the wiki is a non-goal** |
 | R9 | General: the same pipeline runs a second corpus with a different lens and zero code changes |
 | R10 | Measured against grep over raw sources and against V2 — on synthesis questions and on cost per answer |
@@ -209,23 +215,45 @@ migration of an existing V1 or V2 wiki (see §9).
 
 ### Layout
 
-    lens.md              purpose · what matters · people · question shapes · page types · owner
-    lens/corrections/    standing corrections, each with the reason it was given
-    index.md             one line per page: title, date range, one-sentence summary
-    log.md               what was ingested, when, what changed, what was skipped and why
-    wiki/sources/<id>.md one summary per source — the indexes to the sources
-    wiki/topics/<t>.md   cross-source pages of the kinds the lens declares
-    sources/            raw, retained, never modified
-    done.jsonl          which sources are ingested, keyed on content
+The directory names are V1's, deliberately: they are the contract Team Pulse's resolver and
+RepoWeaver already call, so both swap to V4 without noticing. Everything new sits beside them.
+
+    _inbox/                      pending sources — markdown; YAML frontmatter optional
+                                 (date, title and kind fall back to header lines and filename)
+    _sources/                    retained raw sources, never modified. A file appearing here
+                                 under its original name = successfully ingested
+    .wiki/failed/<name>          held sources, with the reason in the ledger
+    .wiki/.processed.jsonl       the ledger: content hash, filename, outcome, reason
+    .wiki/runs/ingest-<ts>/result.json   machine-readable outcome with counts
+    .wiki/policy/schema.md       legacy wrapper policy; read if present (also policy/schema.md),
+                                 folded into the lens as a fragment
+    lens.md                      NEW — purpose · what matters · people · question shapes ·
+                                 page types · owner
+    lens/corrections/            NEW — standing corrections, each with the reason it was given
+    feedback/log.jsonl           NEW — raw feedback, each entry with a why; mined later
+    *.md at the corpus root      pages, with frontmatter title/type/sources/last_updated;
+                                 per-source summaries as source-*.md
+    index.md                     one line per page: title, date range, one-sentence summary
+    log.md                       what was ingested, when, what changed, what was skipped and why
 
 All state lives in this directory. Transport is whatever moves it — a tarball under a
-resolver, the filesystem locally.
+resolver, the filesystem locally. Everything that must round-trip (`_sources/`, the ledger,
+`lens.md`, `lens/`, `feedback/`, pages) sits outside the resolver's tarball exclusions
+(`.wiki/runs`, `.wiki/snapshots`).
 
 `index.md` carries a date and a one-line summary per entry deliberately: it's the model of
 how an agent orients — scan titles and summaries, pick the few that look relevant, then read
 those in full.
 
-### The graph — ~11 nodes, 3 of them model calls
+### The graphs
+
+Three `.dot` files, and every model call in the system lives in a box node in one of them:
+`ingest.dot` below; `init.dot` (the interview and the lens draft); `ask.dot` (read the index,
+pick pages, answer with citations). The CLI verbs are a dispatcher that launches the right
+graph. `doctor`, `build-dashboard`, `--version`, `update` and `feedback` are plain Python with
+no model calls. The purity test covers all of it: no model call anywhere outside a box node.
+
+**`ingest.dot` — ~11 nodes, 3 of them model calls**
 
     start
       → select_source   shell   next source, keyed on content
@@ -236,7 +264,7 @@ those in full.
                                 disagreement contract; source cap; citation convention
       → checks          shell   citations resolve · content-loss guard · duplicate headings ·
                                 source cap · link integrity
-                                → ROUTES: pass | rewrite-once | hold
+                                → ROUTES: pass | rewrite-once | hold (→ .wiki/failed/<name>)
       → commit          shell   git commit; record the source as done
       → (loop)
       → index           MODEL   rewrite index.md and log.md from what changed
@@ -270,7 +298,9 @@ shouldn't — and full automation was the stable state.
   correct path applies it to the affected pages and writes it to `lens/corrections/` with
   the reason it was given.
 
-Both feed the same place, and every subsequent run reads it.
+Both feed the same place, and every subsequent run reads it. A third, lighter channel — the
+`feedback` verb — just records what someone noticed, with a why, into `feedback/log.jsonl`;
+it is mined into lens edits later rather than acted on one entry at a time.
 
 ### The query side
 
@@ -289,6 +319,31 @@ Resolve can run it two ways: by calling a command-line tool — which is how Tea
 current version runs — or by running the graph directly. We start with the first so Team
 Pulse sees no change when it switches over, and move to the second because the graph is
 built for it.
+
+### RepoWeaver and other wrappers
+
+RepoWeaver is the first wrapper and the pattern for the rest: it gathers a repository's story
+— PRs, commit logs, module snapshots — shapes it into markdown without any model call, drops
+it into `_inbox/`, and runs `ingest`. Brian's rule is that source-specific preparation lives
+in wrappers so WikiWeaver stays general; a conversation weaver for meetings and chats would
+follow the same shape.
+
+We checked how it actually calls WikiWeaver rather than assuming. It depends on three things
+at once: the CLI verbs and flags (`init --plain`, `ingest --wiki … --max-cycles`,
+`ingest --source` for retries, `ask --json`, `build-dashboard --group-by repos`, `--version`,
+`update`); a Python import of five path helpers from `wiki_weaver.lib` at module load, so
+without them every RepoWeaver command fails, `doctor` included; and the corpus layout as shared
+state — it writes `_inbox/`, reads `_sources/<same name>` as the success signal, derives each
+repo's last-sync date from `_sources/` filenames, and reads `.wiki/failed/` and the ledger to
+classify failures. The resolver additionally reads `.wiki/runs/ingest-*/result.json`.
+
+V4 keeps all of it (R5 and the layout above). Two additions on our side: wrapper-provided
+policy — RepoWeaver's `schema.md`, with its page types and `repos:` field — is read as a lens
+fragment, which is where that knowledge belongs; and we accept the file at both paths
+RepoWeaver might write it to. Three defects found by reading RepoWeaver's code (not by running
+it) go to Marc as a separate brief: it writes its schema to a path V1 never reads, its retry
+path resolves filenames against the wrong directory, and the resolver passes `sync` two flags
+it rejects. None are V4's to fix; all pre-date it.
 
 ### Five cheap wins, taken as-is
 
@@ -321,7 +376,7 @@ to something that already works.
 
 | Stage | What ships | Done when | Target |
 |---|---|---|---|
-| **1 — the working pipeline** | The pipeline above, installable and runnable end to end. Lens delivered to the writer. Checks route. Pages accumulate. Run on the team corpus and on a second, personal corpus with a different lens and no code changes | Purity acceptance passes · full corpus ingests unattended · evaluation baseline recorded: synthesis and cost, against grep and V2 | **days, from 9/30** |
+| **1 — the working pipeline** | The three graphs, installable and runnable end to end. Lens delivered to the writer. Checks route. Pages accumulate. The writer reads `lens/corrections/` from day one (empty at first); a `feedback` verb appends to `feedback/log.jsonl`. Run first on a 7-file smoke slice, then one epoch (E01, 31 sources), then a second epoch incrementally, then the full 215; and on a second, personal corpus with a different lens and no code changes | Purity acceptance passes · smoke, epoch and incremental slices pass · full corpus ingests unattended · evaluation baseline recorded: synthesis and cost, against grep and V2 | **days, from 9/30** |
 | **2 — running in Resolve** | The four verbs and the tarball package over the same pipeline, called the way Team Pulse's current version is called. The command-line path is the bridge that keeps Team Pulse unaffected; running the graph directly is the destination, unlocked by the graph being pure — timing with Marc and Ken | One job executes in Resolve; Team Pulse can call it without noticing what changed underneath | days after Stage 1 complete |
 | **3 — the learning loop** | The correct path end to end, plus interactive mode for the brief | A correction given at source N is honored at source N+1, demonstrated | week 2 |
 | **4 — corrections become lens** | Lens edits proposed from accumulated corrections; the owner accepts or declines with a reason; declines feed the next pass | An owner reviews and accepts a proposed lens edit end to end | week 2–3 (gated on Stage 3 having run long enough to accumulate corrections) |
@@ -336,6 +391,9 @@ The evaluation runs in parallel from Stage 1; every stage gets an arm.
   complaint, so it's worth revisiting once quality is established.
 - Dedicated handling for sources too large even for a large context window, if the hold-and-
   report path turns out to fire often.
+- A periodic lint pass over the whole wiki — near-duplicate pages, orphans, contradictions.
+  Karpathy's gist has one; Stage 1's checks are per-write only. Structural decay is the field's
+  second most-reported failure, so this sits early on the list, not as an afterthought.
 
 ---
 
@@ -360,7 +418,11 @@ Five claims, in the order they matter, and what would settle each:
 | **Pre-computed synthesis is worth the cost** | 1 | Synthesis questions against grep and V2, plus tool calls, files opened and tokens per answer against grep's baseline |
 
 Measurement runs alongside the build rather than gating it: the numbers tell us where to spend
-the next week, not whether to continue.
+the next week, not whether to continue. Aligned with Brian (9/30): evals are dialed down as a
+requirement, and performance is not a focus for V4. The bar is feedback that the quality is
+*as good, if not better* than what the team has now — reached by getting the plumbing working
+first, then fixing the biggest friction points. Evals are recorded from Stage 1 and inform
+priorities; no stage waits on them.
 
 ---
 
@@ -535,6 +597,9 @@ From an interview with someone running both a team wiki and a personal one, ever
   version-numbered repo naming ends.
 - **Who adjudicates lens edits.** The person responsible for that particular system, per the
   sync. For Team Pulse specifically, we should name who that is.
+- **RepoWeaver.** Covered, not deferred: V4 keeps the layout, verbs and library helpers it
+  depends on (§5, R5), so it swaps in with no change on its side. Its own defects go to Marc as
+  a brief.
 
 **Still open**
 
@@ -551,6 +616,8 @@ From an interview with someone running both a team wiki and a personal one, ever
 - Confirmation of the contract Team Pulse will be calling, so V4 lands behind it unchanged.
 - Whether running the graph directly is the preferred host once purity is demonstrated, and the
   timing.
+- A look at the RepoWeaver defects brief (§5) — three pre-existing issues found by reading its
+  code, none of them V4's.
 
 **Sam**
 - The question shapes Team Pulse actually asks the wiki, to seed the lens.
