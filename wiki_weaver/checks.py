@@ -1,0 +1,156 @@
+"""Deterministic per-write checks. Every check can fail the step; none calls a model.
+
+Citation convention (what the writer is told, and what this enforces):
+    [<source-filename>: "<five or more words copied verbatim from that source>"]
+"""
+
+from __future__ import annotations
+
+import re
+from collections import Counter
+from pathlib import Path
+from urllib.parse import unquote
+
+from .lib import MAX_PAGE_SOURCES
+from .sources import normalize_ws, read_text, split_frontmatter
+
+CITE_RE = re.compile(r'\[([^\[\]\n]+?\.md): "([^"\n]+)"\]')
+BARE_CITE_RE = re.compile(r"\[([^\[\]\n]+?\.md)\](?!\()")
+MD_LINK_RE = re.compile(r"\[[^\]\n]*\]\((<[^>\n]+>|[^)\s]+)(?:\s+\"[^\"]*\")?\)")
+WIKILINK_RE = re.compile(r"\[\[([^\]|\n]+)(?:\|[^\]\n]*)?\]\]")
+MARKER_RE = re.compile(r"<!--\s*superseded:\s*\d{4}-\d{2}-\d{2}\s*-->")
+HEADING_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*#*\s*$")
+REQUIRED_FM = ("title", "type", "sources", "last_updated")
+LOSS_THRESHOLD = 0.15
+
+
+def _body_lines(text: str) -> list[str]:
+    _, body = split_frontmatter(text)
+    out = []
+    for line in body.splitlines():
+        s = normalize_ws(MARKER_RE.sub("", line))
+        if s:
+            out.append(s)
+    return out
+
+
+def _headings(text: str, level: int | None = None) -> list[str]:
+    _, body = split_frontmatter(text)
+    hs = []
+    for line in body.splitlines():
+        m = HEADING_RE.match(line.strip())
+        if m and (level is None or len(m.group(1)) == level):
+            hs.append(normalize_ws(m.group(2)).lower())
+    return hs
+
+
+def check_frontmatter(name: str, text: str) -> list[str]:
+    fm, _ = split_frontmatter(text)
+    if fm is None:
+        return [f"{name}: missing or unparseable frontmatter"]
+    errs = [f"{name}: frontmatter missing '{k}'" for k in REQUIRED_FM if not fm.get(k)]
+    srcs = fm.get("sources")
+    if srcs is not None and not isinstance(srcs, list):
+        errs.append(f"{name}: frontmatter 'sources' must be a list")
+    return errs
+
+
+def check_source_cap(name: str, text: str) -> list[str]:
+    fm, _ = split_frontmatter(text)
+    srcs = (fm or {}).get("sources") or []
+    if isinstance(srcs, list) and len(srcs) > MAX_PAGE_SOURCES:
+        return [f"{name}: {len(srcs)} sources listed (cap is {MAX_PAGE_SOURCES})"]
+    return []
+
+
+def check_duplicate_headings(name: str, text: str) -> list[str]:
+    dups = [h for h, n in Counter(_headings(text, level=2)).items() if n > 1]
+    return [f"{name}: duplicate ## heading '{h}'" for h in dups]
+
+
+def check_citations(name: str, text: str, source_texts: dict[str, str]) -> list[str]:
+    """Every quote is >=5 words and an exact (whitespace-normalized) substring of its source;
+    every cited file is a known source and is listed in the page's `sources:`."""
+    errs: list[str] = []
+    fm, body = split_frontmatter(text)
+    listed = {str(s) for s in ((fm or {}).get("sources") or []) if isinstance(s, str)}
+    norm_cache: dict[str, str] = {}
+    for m in CITE_RE.finditer(body):
+        fname, quote = m.group(1).strip(), m.group(2)
+        if fname not in source_texts:
+            errs.append(f"{name}: cites unknown source [{fname}]")
+            continue
+        if len(quote.split()) < 5:
+            errs.append(f'{name}: quote under 5 words: [{fname}: "{quote}"]')
+            continue
+        hay = norm_cache.setdefault(fname, normalize_ws(source_texts[fname]))
+        if normalize_ws(quote) not in hay:
+            errs.append(f'{name}: quote not found verbatim in {fname}: "{quote[:80]}"')
+        if listed and fname not in listed:
+            errs.append(f"{name}: cites {fname} but it is not in frontmatter sources")
+    for m in BARE_CITE_RE.finditer(body):
+        if m.group(1).strip() in source_texts:
+            errs.append(f"{name}: citation without a quote: [{m.group(1).strip()}]")
+    return errs
+
+
+def check_links(name: str, text: str, wiki: Path) -> list[str]:
+    errs = []
+    _, body = split_frontmatter(text)
+    for m in MD_LINK_RE.finditer(body):
+        target = m.group(1).strip("<>")
+        if re.match(r"^[a-z][a-z0-9+.-]*:", target, re.IGNORECASE) or target.startswith("#"):
+            continue
+        path = unquote(target.split("#", 1)[0])
+        if path and not (wiki / path).exists():
+            errs.append(f"{name}: broken link -> {target}")
+    for m in WIKILINK_RE.finditer(body):
+        slug = m.group(1).strip()
+        cand = slug if slug.endswith(".md") else f"{slug}.md"
+        if not (wiki / cand).exists():
+            errs.append(f"{name}: broken wikilink [[{slug}]]")
+    return errs
+
+
+def check_content_loss(name: str, before: str, after: str) -> list[str]:
+    """A rewritten page that drops >15% of its lines, or any heading, needs a new
+    superseded marker; otherwise it fails."""
+    b, a = _body_lines(before), _body_lines(after)
+    if not b:
+        return []
+    lost = sum((Counter(b) - Counter(a)).values())
+    frac = lost / len(b)
+    lost_heads = sorted(set(_headings(before)) - set(_headings(after)))
+    new_markers = len(MARKER_RE.findall(after)) > len(MARKER_RE.findall(before))
+    errs = []
+    if (frac > LOSS_THRESHOLD or lost_heads) and not new_markers:
+        if frac > LOSS_THRESHOLD:
+            errs.append(
+                f"{name}: lost {lost}/{len(b)} lines ({frac:.0%}) without a superseded marker"
+            )
+        for h in lost_heads:
+            errs.append(f"{name}: heading '{h}' removed without a superseded marker")
+    return errs
+
+
+def run_page_checks(
+    wiki: Path,
+    pages: list[str],
+    before_dir: Path,
+    source_texts: dict[str, str],
+) -> list[str]:
+    errs: list[str] = []
+    for name in pages:
+        p = wiki / name
+        if not p.exists():
+            continue
+        text = read_text(p)
+        errs += check_frontmatter(name, text)
+        errs += check_source_cap(name, text)
+        errs += check_duplicate_headings(name, text)
+        errs += check_citations(name, text, source_texts)
+        errs += check_links(name, text, wiki)
+        prior = before_dir / name
+        if prior.exists():
+            errs += check_content_loss(name, read_text(prior), text)
+    return errs

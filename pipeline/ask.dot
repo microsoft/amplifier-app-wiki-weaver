@@ -1,0 +1,46 @@
+// WikiWeaver V4 - ask: index -> pick pages (MODEL) -> read -> answer (MODEL) -> emit.
+// No search index of any kind: the agent orients from index.md, as READING.md describes.
+
+digraph WikiWeaverAsk {
+    graph [
+        goal="Answer the question from the wiki, citing sources, or refuse when no page covers it.",
+        params="py, ask_dir, fmt",
+        default_max_retries=2,
+        default_fidelity="truncate",
+        model_stylesheet=".strong { llm_provider: anthropic; llm_model: opus; }"
+    ]
+
+    start [shape=Mdiamond]
+    done  [shape=Msquare]
+
+    assemble [shape=parallelogram, max_retries=0,
+        tool_command="\"$py\" -m wiki_weaver.steps ask_assemble \"$ask_dir\""]
+
+    pick [shape=box, class="strong", fidelity="truncate",
+        prompt="Read context.md in the directory given here: $ask_dir. It holds how to read this wiki, its index.md, and a question. Choose at most 6 pages from the index that are most likely to answer the question. Write picks.txt in that same directory: one page file name per line (for example some-topic.md). If no page looks relevant, write an empty picks.txt. Do not read or write anything else."]
+
+    read [shape=parallelogram, max_retries=0,
+        tool_command="\"$py\" -m wiki_weaver.steps ask_read \"$ask_dir\""]
+
+    answer [shape=box, class="strong", fidelity="truncate",
+        prompt="Answer a question from the wiki. In the directory $ask_dir read context.md (how to read this wiki, the index, the question) and pages.md (the pages picked for it). Follow the reading guidance: the pages are enough for orientation and synthesis; for a specific date, number, name or commitment, follow the citation into _sources/ and check the passage. Cite as [<source-filename>: \"quoted words\"]. If no page covers the question, refuse rather than guess. Write answer.json in $ask_dir with exactly these keys: answer (string), pages_used (list of page file names you relied on), refused (true when the wiki does not cover the question, else false). Write nothing else."]
+
+    emit [shape=parallelogram, max_retries=0,
+        tool_command="\"$py\" -m wiki_weaver.steps ask_emit \"$ask_dir\" \"$fmt\""]
+
+    stop [shape=parallelogram, max_retries=0,
+        tool_command="echo 'ask failed; see the run logs' >&2; exit 1"]
+
+    start -> assemble
+    assemble -> pick
+    assemble -> stop [condition="outcome=fail"]
+    pick -> read
+    pick -> stop [condition="outcome=fail"]
+    read -> answer
+    read -> stop [condition="outcome=fail"]
+    answer -> emit
+    answer -> stop [condition="outcome=fail"]
+    emit -> done [condition="outcome=success"]
+    emit -> stop [condition="outcome=fail"]
+    stop -> done [condition="outcome=fail", label="loud exit"]
+}

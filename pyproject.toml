@@ -4,116 +4,33 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wiki-weaver"
-version = "0.1.0"
-description = "LLM-wiki ingest pipeline driven by the attractor engine."
+version = "4.0.0.dev0"
+description = "WikiWeaver V4: a lens-steered wiki built by a pure dot graph on the dot-runner engine."
+readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "MIT"}
-authors = [{name = "Microsoft Corporation"}]
-# Runtime libraries are declared as git deps so `uv tool install git+...` resolves
-# them into the isolated tool venv (uv tool venvs do NOT share another tool's site
-# packages). Tracked at @main ON PURPOSE: wiki-weaver is a COMPANION to an installed
-# Amplifier ecosystem and must stay in lockstep with it, not pinned to a stale commit.
-#
-# RUNTIME PREREQUISITE (not satisfied by these deps): an Amplifier installation
-# (amplifier-app-cli) for ~/.amplifier config + API keys + the warm bundle cache the
-# engine loads on first ingest. `wiki-weaver doctor` verifies all of this.
-dependencies = [
-    # NOTE (fresh-install fix): declared as a plain named requirement redirected
-    # via [tool.uv.sources] below -- NOT a direct `@ git+...@main` URL. This used
-    # to be a direct reference, but amplifier-module-pipeline-runner's own
-    # published dependency line for amplifier-foundation is a NAMED requirement
-    # redirected via its OWN [tool.uv.sources] (`branch = "main"`). uv identifies
-    # a git requirement by its ref-KIND representation, not just the ref it
-    # resolves to: a `@main`-suffixed direct URL and a `branch = "main"`
-    # sources-redirect are DIFFERENT representations of "the same ref" to uv's
-    # resolver, even though they print identically. `uv tool install
-    # git+<this repo>` failed with "Requirements contain conflicting URLs for
-    # package amplifier-foundation" the instant both shapes were resolved
-    # together (which they always are -- pipeline-runner is a direct dependency
-    # below). Matching pipeline-runner's declaration SHAPE (not just its ref) is
-    # what makes the two co-resolve. See amplifier-bundle-dot-runner/modules/
-    # pipeline-runner/pyproject.toml's own (much longer) comment on this same
-    # line for the full investigation and the shapes that were tried and
-    # rejected.
-    "amplifier-foundation>=1.0.0",
-    # NOTE: these two moved from amplifier-bundle-attractor to
-    # amplifier-bundle-dot-runner in the engine repo split (module paths are
-    # unchanged; only the source repo URL flipped).
-    "amplifier-unified-llm-client @ git+https://github.com/microsoft/amplifier-bundle-dot-runner@main#subdirectory=modules/unified-llm-client",
-    # Shared engine-driving library (drive_engine/run_pipeline + spawn wiring)
-    # that engine_runner.py delegates to -- see wiki_weaver/engine_runner.py's
-    # module docstring for the split of responsibilities.
-    #
-    # THE COUPLING (fix/engine-020-compat, decided jointly with
-    # amplifier-bundle-dot-runner's fix/library-seam-default-worker PR):
-    # this points at the ROOT `amplifier-dot-runner` distribution (no
-    # #subdirectory), NOT the `amplifier-module-pipeline-runner` module
-    # subdirectory form used previously. wiki-weaver's engine runs are
-    # always bare `run_pipeline()` calls (engine_runner.py never passes
-    # bundle=), and that bare call now resolves to `amplifier-agent` as its
-    # unconditional default worker (the library-seam fix). The MODULE dist
-    # deliberately does NOT ship amplifier-agent + the loop-amplifier-agent
-    # adapter (it stays lean + Python >=3.11 for callers who always pass
-    # worker=/bundle= explicitly and never touch the default ladder); the
-    # ROOT dist does, unconditionally (WAVE 6) -- and requires Python >=3.12
-    # to do it (see this file's requires-python above, bumped to match).
-    # `amplifier_module_pipeline_runner.run_pipeline` remains importable
-    # unchanged (the root dist re-exports it transitively -- see
-    # amplifier_dot_runner/__init__.py in that repo). Proof: see this
-    # repo's PR body / eval/ install-smoke evidence.
-    "amplifier-dot-runner @ git+https://github.com/microsoft/amplifier-bundle-dot-runner@main",
-    "tinycss2>=1.0",
-    "markdown>=3.0",
-]
+license = { text = "MIT" }
+authors = [{ name = "Microsoft Corporation" }]
+# No LLM client library, by design: every model call is a box node in pipeline/*.dot,
+# run by the dot-runner engine (a separate install; `wiki-weaver doctor` checks it).
+dependencies = ["pyyaml>=6"]
 
-[tool.uv.sources]
-# Matches amplifier-module-pipeline-runner's own [tool.uv.sources] redirect for
-# the exact same package+ref -- see the long comment on the dependency line
-# above for why the shape (not just the ref) has to match for co-resolution.
-# Still floats on `main` deliberately (wiki-weaver tracks @main on purpose).
-amplifier-foundation = { git = "https://github.com/microsoft/amplifier-foundation", branch = "main" }
-
-[project.urls]
-Repository = "https://github.com/microsoft/amplifier-app-wiki-weaver"
-
-# Dev-only tooling (PEP 735 dependency group). Installed by default with
-# `uv sync` / `uv run`, so the project venv has the test runner alongside the
-# real runtime deps (tinycss2 + markdown). The canonical test command is:
-#
-#     uv run pytest eval/ -q
-#
-# which runs the FULL deterministic eval suite with tinycss2 ACTIVE (the CSS
-# sanitizer's dependency). pytest-asyncio is declared because parts of the
-# broader eval suite use async tests.
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "pyyaml>=6",
-    # Not a runtime dep -- needed only so eval/test_hatch_build.py can import
-    # the real hatchling.builders.hooks.plugin.interface.BuildHookInterface
-    # that hatch_build.py's build hook subclasses.
-    "hatchling>=1.28.0",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["eval"]
-asyncio_mode = "auto"
+[project.optional-dependencies]
+dev = ["pytest>=8"]
 
 [project.scripts]
 wiki-weaver = "wiki_weaver.cli:main"
-
-[tool.hatch.metadata]
-# Required so hatchling will build a wheel whose dependencies use direct git URLs.
-allow-direct-references = true
-
-[tool.hatch.build.hooks.custom]
-# Bakes a git-derived version (commit date + short SHA) into
-# wiki_weaver/_version.py at wheel-build time -- see hatch_build.py.
-path = "hatch_build.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wiki_weaver"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"pipeline" = "wiki_weaver_pipeline"
+"pipeline" = "wiki_weaver/pipeline"
+
+[tool.hatch.build.hooks.custom]
+path = "build_hook.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
