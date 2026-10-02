@@ -2,17 +2,18 @@
 // Per source: select -> assemble -> brief (MODEL) -> page_select -> write (MODEL) -> checks
 //   checks: pass -> commit | first failure -> write once more with findings | second -> hold
 // After the inbox drains: index (MODEL) rewrites index.md and appends log.md.
+// The CLI runs this graph in batches (the engine bounds steps per run) until the inbox drains.
 // Every inference is a box node. Every parallelogram runs deterministic glue
 // (python -m wiki_weaver.steps), never a model.
 //
 // Run from the corpus directory:
 //   dot-runner run ingest.dot --cwd . --param py=<python with wiki_weaver> \
-//     --param run_dir=<abs run dir> --param max_cycles=0 --param only=-
+//     --param run_dir=<abs batch dir> --param cap=<sources per batch, 0 = none> --param only=-
 
 digraph WikiWeaverIngest {
     graph [
         goal="Integrate every pending source in _inbox/ into the wiki, guided by lens.md, so that pages accumulate cited, dated synthesis.",
-        params="py, run_dir, max_cycles, only",
+        params="py, run_dir, cap, only",
         default_max_retries=2,
         default_fidelity="truncate",
         model_stylesheet=".strong { llm_provider: anthropic; llm_model: opus; } .large_context { llm_provider: anthropic; llm_model: sonnet; }"
@@ -22,7 +23,7 @@ digraph WikiWeaverIngest {
     done  [shape=Msquare]
 
     select [shape=parallelogram, max_retries=0,
-        tool_command="\"$py\" -m wiki_weaver.steps select \"$run_dir\" \"$max_cycles\" \"$only\""]
+        tool_command="\"$py\" -m wiki_weaver.steps select \"$run_dir\" \"$cap\" \"$only\""]
 
     assemble [shape=parallelogram, max_retries=0,
         tool_command="\"$py\" -m wiki_weaver.steps assemble"]

@@ -84,7 +84,7 @@ def test_happy_path_commit(corpus: Path, tmp_path: Path):
     assert step(corpus, "commit", str(run)) == (0, "next")
     assert (corpus / "_sources" / ORCHARD).exists() and not (corpus / "_inbox" / ORCHARD).exists()
     row = json.loads((corpus / ".wiki/.processed.jsonl").read_text().splitlines()[-1])
-    assert row["outcome"] == "ingested" and row["model_calls"] == 2
+    assert row["status"] == "converged" and row["converged"] is True and row["model_calls"] == 2
     assert set(row["pages_touched"]) == set(sel)
     # same content is never selected twice; the next source is the 03-04 one
     step(corpus, "select", str(run), "0", "-")
@@ -110,17 +110,25 @@ def test_rewrite_then_hold_reverts(corpus: Path, tmp_path: Path):
     assert (corpus / ".wiki/failed" / ORCHARD).exists()
     assert not (corpus / "source-2031-03-02-orchard-sync.md").exists()
     assert (corpus / "lens.md").read_text() != "tampered"
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=corpus, capture_output=True, text=True, check=True
+    )
+    assert status.stdout == ""  # hold commits its bookkeeping; the next write starts clean
     row = json.loads((corpus / ".wiki/.processed.jsonl").read_text().splitlines()[-1])
-    assert row["outcome"] == "held" and row["reason"].startswith("checks failed twice")
+    assert row["status"] == "failed" and row["converged"] is False
+    assert (
+        row["reason"].startswith("checks failed twice") and row["failure_kind"] == "checks_failed"
+    )
     assert row["model_calls"] == 3
 
 
-def test_oversized_is_held_and_max_cycles(corpus: Path, tmp_path: Path):
+def test_oversized_is_failed_and_batch_cap(corpus: Path, tmp_path: Path):
     run = tmp_path / "run"
     (corpus / "_inbox" / "2030-01-01 huge.md").write_text("word " * 90_000)
     assert step(corpus, "select", str(run), "1", "-") == (0, "drained")
     row = json.loads((corpus / ".wiki/.processed.jsonl").read_text().splitlines()[-1])
-    assert row["outcome"] == "held" and row["reason"].startswith("oversized")
+    assert row["status"] == "failed" and row["failure_kind"] == "oversized"
+    assert row["reason"].startswith("oversized")
 
 
 def test_source_retry_moves_held_back(corpus: Path, tmp_path: Path):
@@ -159,3 +167,59 @@ def test_ask_emit_shape(tmp_path: Path):
         "pages_used": ["p.md"],
         "refused": False,
     }
+
+
+V1_LEDGER_KEYS = {
+    "source",
+    "source_id",
+    "hash",
+    "status",
+    "converged",
+    "reason",
+    "failure_kind",
+    "failed_to",
+    "timestamp",
+}
+
+
+def test_ledger_rows_use_v1_shape(corpus: Path, tmp_path: Path):
+    """Every row a run can write carries V1's keys; done-ness is V1's `converged` rule."""
+    run = tmp_path / "run"
+    (corpus / "_inbox" / "2030-01-01 empty.md").write_text("")
+    (corpus / "_inbox" / "2030-01-02 huge.md").write_text("word " * 90_000)
+    # converged row
+    step(corpus, "select", str(run), "0", "-")
+    step(corpus, "assemble")
+    fake_brief(corpus, [])
+    step(corpus, "page_select")
+    q = '[2031-03-02 Orchard Sync.md: "The orchard sensor rollout ships on Friday"]'
+    (corpus / "source-2031-03-02-orchard-sync.md").write_text(page("O", [ORCHARD], q + "\n"))
+    assert step(corpus, "checks") == (0, "pass")
+    step(corpus, "commit", str(run))
+    # failed (checks) row
+    step(corpus, "select", str(run), "0", "-")
+    step(corpus, "assemble")
+    fake_brief(corpus, [])
+    step(corpus, "page_select")
+    step(corpus, "checks")
+    step(corpus, "checks")
+    step(corpus, "hold", str(run))
+    rows = [json.loads(x) for x in (corpus / ".wiki/.processed.jsonl").read_text().splitlines()]
+    assert {r["status"] for r in rows} == {"skipped", "failed", "converged"}
+    for r in rows:
+        assert V1_LEDGER_KEYS <= set(r), r
+        assert isinstance(r["converged"], bool) and isinstance(r["source_id"], int)
+        assert r["converged"] == (r["status"] == "converged")
+        assert len(r["hash"]) == 64 and r["timestamp"]
+        if r["status"] == "failed":
+            assert r["failed_to"].endswith("/.wiki/failed/" + r["source"])
+            assert Path(r["failed_to"]).exists()
+    assert {row["source"] for row in rows if row.get("converged")} == {ORCHARD}
+    from wiki_weaver.ledger import processed_sources
+
+    assert processed_sources(corpus) == {ORCHARD}
+    # the 0-byte file is skipped once, stays in the inbox, and is not picked again
+    assert (corpus / "_inbox" / "2030-01-01 empty.md").exists()
+    assert sum(r["source"] == "2030-01-01 empty.md" for r in rows) == 1
+    # ids are stable per content hash and distinct across sources
+    assert len({r["source_id"] for r in rows}) == len({r["hash"] for r in rows})

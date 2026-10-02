@@ -11,14 +11,17 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import __version__
+from . import __version__, pidlock
+from . import result as rs
 from .dashboard import build_dashboard
+from .ledger import eligible
 from .lib import (
     feedback_log,
     lens_path,
@@ -33,7 +36,15 @@ from .steps import GIT_ID, jlines
 from .version import resolve_version
 
 PKG = Path(__file__).resolve().parent
-CORPUS_GITIGNORE = "_inbox/\n.wiki/work/\n.wiki/runs/\n.wiki/ask/\n.wiki/init/\n.DS_Store\n"
+CORPUS_IGNORES = (
+    "_inbox/",
+    ".wiki/work/",
+    ".wiki/runs/",
+    ".wiki/ask/",
+    ".wiki/init/",
+    ".wiki/ingest.lock",
+    ".DS_Store",
+)
 
 
 def pipeline_dir() -> Path:
@@ -107,8 +118,13 @@ def scaffold(corpus: Path) -> None:
     if not reading.exists():
         shutil.copy2(PKG / "data" / "READING.md", reading)
     gi = corpus / ".gitignore"
-    if not gi.exists():
-        gi.write_text(CORPUS_GITIGNORE)
+    have = gi.read_text().splitlines() if gi.exists() else []
+    missing = [line for line in CORPUS_IGNORES if line not in have]
+    if missing:
+        with gi.open("a") as f:
+            if have and have[-1].strip():
+                f.write("\n")
+            f.write("\n".join(missing) + "\n")
     if not (corpus / ".git").exists():
         git(corpus, "init", "-q")
     commit_pending(corpus, "chore: scaffold wiki")
@@ -149,50 +165,155 @@ def cmd_init(a: argparse.Namespace) -> int:
     return 0
 
 
-def _trace_counts(logs_root: Path) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for tr in logs_root.rglob("trace.jsonl"):
-        for row in jlines(tr):
-            counts[row["node_id"]] = counts.get(row["node_id"], 0) + 1
-    return counts
+def _trace(logs_root: Path) -> list[dict]:
+    rows: list[dict] = []
+    for tr in sorted(logs_root.rglob("trace.jsonl")):
+        rows += jlines(tr)
+    return rows
+
+
+def _preflight(corpus: Path) -> list[str]:
+    problems = []
+    if not lens_path(corpus).exists():
+        problems.append(f"{corpus} has no lens.md; run `wiki-weaver init {corpus}` first")
+    if not shutil.which("dot-runner"):
+        problems.append("dot-runner not found on PATH")
+    if not shutil.which("git"):
+        problems.append("git not found on PATH")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        problems.append("ANTHROPIC_API_KEY is not set")
+    return problems
+
+
+BATCH = 40  # sources per engine run; the engine caps steps at 50 x node count per run
 
 
 def cmd_ingest(a: argparse.Namespace) -> int:
     corpus = Path(a.wiki).expanduser().resolve()
-    if not lens_path(corpus).exists():
-        die(f"{corpus} has no lens.md; run `wiki-weaver init {corpus}` first")
-    scaffold(corpus)
-    commit_pending(corpus, "chore: snapshot before ingest")
+    if not corpus.is_dir():
+        print(f"wiki-weaver: wiki dir not found: {corpus}", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    lock = pidlock.lock_path(corpus)
+    if not pidlock.acquire(lock):
+        print(
+            f"wiki-weaver: another ingest holds {corpus} (PID {pidlock.holder(lock)}); skipping",
+            file=sys.stderr,
+        )
+        return rs.EXIT_LOCKED
+    prev = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(1)))
+    try:
+        return _ingest_locked(corpus, a)
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+        pidlock.release(lock)
+
+
+def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
     started, t0 = datetime.now(UTC), time.time()
     run_id = f"ingest-{stamp()}"
     run_dir = wiki_runs(corpus) / run_id
     run_dir.mkdir(parents=True)
-    # --max-cycles is V1's per-source convergence budget. V4's budget is fixed by the
-    # graph (write, then at most one rewrite), so the flag parses and has no effect.
-    # --limit (V1) caps how many sources this run takes on.
-    params = {"run_dir": str(run_dir), "max_cycles": str(a.limit or 0), "only": a.source or "-"}
-    rc = run_graph("ingest", corpus, params, run_dir / "engine")
-    changes = jlines(run_dir / "changes.jsonl")
-    trace = _trace_counts(run_dir / "engine")
-    per_node = {n: trace.get(n, 0) for n in ("brief", "write", "index")}
-    ingested = [c for c in changes if c["outcome"] == "ingested"]
-    result = {
-        "run_id": run_id,
-        "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "finished": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "total": len(changes),
-        "ingested": len(ingested),
-        "held": len(changes) - len(ingested),
-        "pages_written": len({p for c in ingested for p in c["pages_touched"]}),
-        "model_calls": sum(per_node.values()),
-        "wall_seconds": round(time.time() - t0, 1),
-    }
-    (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-    (run_dir / "model_calls.json").write_text(json.dumps(per_node, indent=2) + "\n")
-    print(json.dumps(result))
-    if rc != 0:
-        die(f"ingest engine run failed (exit {rc}); logs in {run_dir}")
-    return 0
+    rows: list[dict] = []
+    errored: list[dict] = []
+    trace: list[dict] = []
+    before_pages = {p.name for p in page_files(corpus)}
+    batches = 0
+
+    def snapshot(status: str) -> dict:
+        per_node = {
+            n: sum(1 for t in trace if t.get("node_id") == n) for n in ("brief", "write", "index")
+        }
+        conv = [r for r in rows if r.get("converged")]
+        touched = {p for r in conv for p in r.get("pages_touched", [])}
+        data = rs.build(
+            run_id=run_id,
+            status=status,
+            rows=rows,
+            errored=errored,
+            extra={
+                "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "finished": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if status == "final"
+                else None,
+                "wall_seconds": round(time.time() - t0, 1),
+                "pages_written": len(touched),
+                "pages_created": len({p for p in touched if p not in before_pages}),
+                "model_calls": sum(per_node.values()),
+                "model_calls_by_node": per_node,
+                "batches": batches,
+                "max_cycles": a.max_cycles,
+                "limit": a.limit,
+                "source": a.source,
+            },
+        )
+        rs.write(run_dir / "result.json", data)
+        return data
+
+    try:
+        problems = _preflight(corpus)
+        if problems:
+            errored += [{"reason": f"preflight: {p}"} for p in problems]
+            for p in problems:
+                print(f"wiki-weaver: {p}", file=sys.stderr)
+            return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
+        scaffold(corpus)
+        commit_pending(corpus, "chore: snapshot before ingest")
+        only = Path(a.source).name if a.source else None
+        if only:
+            if not ((wiki_inbox(corpus) / only).exists() or (wiki_failed(corpus) / only).exists()):
+                errored.append({"reason": f"--source {only}: not in _inbox/ or .wiki/failed/"})
+                print(f"wiki-weaver: --source {only} not found", file=sys.stderr)
+                return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
+        elif not eligible(corpus):
+            # decided once, before any batching
+            print("wiki-weaver: nothing to do (no new sources in _inbox/)")
+            snapshot("final")
+            return rs.EXIT_EMPTY
+        snapshot("in_progress")
+        remaining = a.limit if a.limit and a.limit > 0 else None
+        while True:
+            batches += 1
+            cap = BATCH if remaining is None else min(BATCH, remaining)
+            bdir = run_dir / f"batch-{batches:02d}"
+            bdir.mkdir()
+            params = {"run_dir": str(bdir), "cap": str(cap), "only": only or "-"}
+            rc = run_graph("ingest", corpus, params, bdir / "engine", log_file=bdir / "engine.log")
+            brows = jlines(bdir / "changes.jsonl")
+            rows += brows
+            btrace = _trace(bdir / "engine")
+            trace += btrace
+            if rc != 0:
+                errored.append(
+                    {
+                        "reason": f"engine run failed in batch {batches} (exit {rc}); see {bdir}/engine.log"
+                    }
+                )
+            if any(t.get("node_id") == "index" and t.get("status") != "success" for t in btrace):
+                errored.append(
+                    {
+                        "reason": f"index step failed in batch {batches}; pages were committed, index.md/log.md may be stale"
+                    }
+                )
+            attempted = sum(1 for r in brows if r.get("status") != "skipped")
+            if remaining is not None:
+                remaining -= attempted
+            snapshot("in_progress")
+            if rc != 0 or only or attempted < cap or (remaining is not None and remaining <= 0):
+                break
+        data = snapshot("final")
+        print(
+            json.dumps(
+                {k: data[k] for k in ("run_id", "verdict", "counts", "model_calls", "wall_seconds")}
+            )
+        )
+        return rs.EXIT_FOR_VERDICT[data["verdict"]]
+    except BaseException as exc:
+        errored.append({"reason": f"ingest interrupted: {type(exc).__name__}: {exc}"})
+        snapshot("final")
+        if isinstance(exc, Exception):
+            print(f"wiki-weaver: {exc}", file=sys.stderr)
+            return rs.EXIT_ERRORED
+        raise
 
 
 def cmd_ask(a: argparse.Namespace) -> int:

@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import checks as ck
+from . import ledger as lg
 from .lib import (
     MAX_PAGE_SOURCES,
     MAX_SOURCE_CHARS,
@@ -26,7 +27,6 @@ from .lib import (
     schema_fragments,
     wiki_failed,
     wiki_inbox,
-    wiki_ledger,
     wiki_sources,
     wiki_work,
 )
@@ -111,22 +111,18 @@ def save_current(cur: dict) -> None:
     jwrite(wiki_work(WIKI) / "current.json", cur)
 
 
-def ledger_rows() -> list[dict]:
-    return jlines(wiki_ledger(WIKI))
-
-
-def record(run_dir: Path, cur: dict, outcome: str, reason: str, pages: list[str]) -> None:
-    row = {
-        "ts": now(),
-        "filename": cur["filename"],
-        "sha256": cur["sha256"],
-        "outcome": outcome,
-        "reason": reason,
-        "pages_touched": pages,
-        "model_calls": cur.get("model_calls", 0),
-    }
-    jappend(wiki_ledger(WIKI), row)
+def record(run_dir: Path, row: dict) -> None:
+    """One V1-shaped ledger row, mirrored into this batch's changes.jsonl."""
+    lg.append_row(WIKI, row)
     jappend(run_dir / "changes.jsonl", row)
+
+
+def commit_state(message: str) -> None:
+    """Commit bookkeeping (ledger, held files) so the next write's scope check sees
+    only what that write changed."""
+    git("add", "-A")
+    if git("diff", "--cached", "--name-only").strip():
+        git("commit", "-q", "-m", message)
 
 
 def source_texts(cur: dict) -> dict[str, str]:
@@ -138,17 +134,12 @@ def source_texts(cur: dict) -> dict[str, str]:
 # ---------------------------------------------------------------- ingest
 
 
-def _hold_file(run_dir: Path, path: Path, sha: str, reason: str, model_calls: int = 0) -> None:
+def _move_to_failed(path: Path) -> Path:
     failed = wiki_failed(WIKI)
     failed.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(path), failed / path.name)
-    record(
-        run_dir,
-        {"filename": path.name, "sha256": sha, "model_calls": model_calls},
-        "held",
-        reason,
-        [],
-    )
+    dest = failed / path.name
+    shutil.move(str(path), dest)
+    return dest
 
 
 def _summary_page(filename: str) -> str:
@@ -163,41 +154,75 @@ def _summary_page(filename: str) -> str:
     return f"{base}.md"
 
 
-def step_select(run_dir: str, max_cycles: str, only: str) -> str:
+def _attempted(rows: list[dict]) -> int:
+    return sum(1 for r in rows if r.get("status") != lg.STATUS_SKIPPED)
+
+
+def step_select(run_dir: str, cap_s: str, only: str) -> str:
+    """Pick the next source. ``cap_s`` bounds attempts in this batch (0 = no cap);
+    0-byte sources are skipped (ledgered, left in place) and oversized ones held."""
     run = Path(run_dir)
     work = wiki_work(WIKI)
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    done_this_run = jlines(run / "changes.jsonl")
-    cap = int(max_cycles) if max_cycles.strip().lstrip("-").isdigit() else 0
-    if cap > 0 and len(done_this_run) >= cap:
-        return "drained"
+    cap = int(cap_s) if cap_s.strip().isdigit() else 0
     inbox = wiki_inbox(WIKI)
     inbox.mkdir(exist_ok=True)
-    rows = ledger_rows()
-    seen = {r["sha256"] for r in rows}
-    if only and only != "-":
-        name = Path(only).name
-        if any(r["filename"] == name for r in done_this_run):
+    while True:
+        batch = jlines(run / "changes.jsonl")
+        if cap > 0 and _attempted(batch) >= cap:
             return "drained"
-        held = wiki_failed(WIKI) / name
-        if not (inbox / name).exists() and held.exists():
-            shutil.move(str(held), inbox / name)
-        if not (inbox / name).exists():
-            print(f"--source {name}: not found in _inbox/ or .wiki/failed/", file=sys.stderr)
-            return "drained"
-        ingested = {r["sha256"] for r in rows if r["outcome"] == "ingested"}
-        cands = [inbox / name] if sha256_file(inbox / name) not in ingested else []
-    else:
-        cands = [p for p in inbox.glob("*.md") if p.is_file()]
-        cands = [p for p in cands if sha256_file(p) not in seen]
-        cands.sort(key=lambda p: (str(source_meta(p).get("date") or "9999"), p.name))
-    for p in cands:
-        sha = sha256_file(p)
-        if len(read_text(p)) > MAX_SOURCE_CHARS:
-            _hold_file(run, p, sha, f"oversized: more than {MAX_SOURCE_CHARS} characters")
-            if cap > 0 and len(jlines(run / "changes.jsonl")) >= cap:
+        if only and only != "-":
+            name = Path(only).name
+            if any(r.get("source") == name for r in batch):
                 return "drained"
+            held = wiki_failed(WIKI) / name
+            if not (inbox / name).exists() and held.exists():
+                shutil.move(str(held), inbox / name)
+            p = inbox / name
+            if not p.exists() or sha256_file(p) in lg.converged_hashes(lg.read_rows(WIKI)):
+                return "drained"
+        else:
+            cands = lg.eligible(WIKI)
+            if not cands:
+                return "drained"
+            p = cands[0]
+        sha = sha256_file(p)
+        if p.stat().st_size == 0:
+            record(
+                run,
+                lg.make_row(
+                    WIKI,
+                    source=p.name,
+                    file_hash=sha,
+                    status=lg.STATUS_SKIPPED,
+                    reason="empty source (0 bytes)",
+                    failure_kind=lg.KIND_EMPTY,
+                    pages_touched=[],
+                    model_calls=0,
+                ),
+            )
+            commit_state(f"skip: {p.name} (empty)")
+            if only and only != "-":
+                return "drained"
+            continue
+        if lg.is_oversized(p):
+            dest = _move_to_failed(p)
+            record(
+                run,
+                lg.make_row(
+                    WIKI,
+                    source=p.name,
+                    file_hash=sha,
+                    status=lg.STATUS_FAILED,
+                    reason=f"oversized: more than {MAX_SOURCE_CHARS} characters",
+                    failure_kind=lg.KIND_OVERSIZED,
+                    failed_to=str(dest.resolve()),
+                    pages_touched=[],
+                    model_calls=0,
+                ),
+            )
+            commit_state(f"hold: {p.name} (oversized)")
             continue
         save_current(
             {
@@ -212,7 +237,6 @@ def step_select(run_dir: str, max_cycles: str, only: str) -> str:
             }
         )
         return "source"
-    return "drained"
 
 
 def step_assemble() -> str:
@@ -345,13 +369,27 @@ def step_hold(run_dir: str) -> str:
         reason = "brief: model step failed or wrote no slugs"
     else:
         reason = f"failed at {stage}"
+    kind = lg.KIND_CHECKS if stage == "checks" else lg.KIND_MODEL_STEP
+    if stage not in ("checks", "brief", "write"):
+        kind = lg.KIND_UNKNOWN
     _revert_writes()
     src = wiki_inbox(WIKI) / cur["filename"]
-    failed = wiki_failed(WIKI)
-    failed.mkdir(parents=True, exist_ok=True)
-    if src.exists():
-        shutil.move(str(src), failed / src.name)
-    record(Path(run_dir), cur, "held", reason, [])
+    dest = _move_to_failed(src) if src.exists() else wiki_failed(WIKI) / cur["filename"]
+    record(
+        Path(run_dir),
+        lg.make_row(
+            WIKI,
+            source=cur["filename"],
+            file_hash=cur["sha256"],
+            status=lg.STATUS_FAILED,
+            reason=reason,
+            failure_kind=kind,
+            failed_to=str(dest.resolve()),
+            pages_touched=[],
+            model_calls=cur.get("model_calls", 0),
+        ),
+    )
+    commit_state(f"hold: {cur['filename']} ({kind})")
     return "next"
 
 
@@ -360,8 +398,20 @@ def step_commit(run_dir: str) -> str:
     pages = root_md_changes()
     srcs = wiki_sources(WIKI)
     srcs.mkdir(exist_ok=True)
-    shutil.move(str(wiki_inbox(WIKI) / cur["filename"]), srcs / cur["filename"])
-    record(Path(run_dir), cur, "ingested", "", pages)
+    dest = srcs / cur["filename"]
+    shutil.move(str(wiki_inbox(WIKI) / cur["filename"]), dest)
+    record(
+        Path(run_dir),
+        lg.make_row(
+            WIKI,
+            source=cur["filename"],
+            file_hash=cur["sha256"],
+            status=lg.STATUS_CONVERGED,
+            archived_to=str(dest.resolve()),
+            pages_touched=pages,
+            model_calls=cur.get("model_calls", 0),
+        ),
+    )
     git("add", "-A")
     git("commit", "-q", "-m", f"ingest: {cur['filename']}")
     return "next"
@@ -369,7 +419,7 @@ def step_commit(run_dir: str) -> str:
 
 def step_index_prep(run_dir: str) -> str:
     changes = jlines(Path(run_dir) / "changes.jsonl")
-    if not any(r["outcome"] == "ingested" for r in changes):
+    if not any(r.get("converged") for r in changes):
         return "skip"
     work = wiki_work(WIKI)
     work.mkdir(parents=True, exist_ok=True)
@@ -379,9 +429,9 @@ def step_index_prep(run_dir: str) -> str:
         dates[p.name] = str(m.get("date") or "")
     out = ["# What changed in this run\n\n"]
     for r in changes:
-        line = f"- {r['outcome']}: {r['filename']}"
-        line += f" -> pages: {', '.join(r['pages_touched'])}" if r["pages_touched"] else ""
-        line += f" (reason: {r['reason']})" if r["reason"] else ""
+        line = f"- {r['status']}: {r['source']}"
+        line += f" -> pages: {', '.join(r['pages_touched'])}" if r.get("pages_touched") else ""
+        line += f" (reason: {r['reason']})" if r.get("reason") else ""
         out.append(line + "\n")
     out.append("\n# Page manifest (every page in the wiki)\n\n")
     for p in page_files(WIKI):
