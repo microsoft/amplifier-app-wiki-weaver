@@ -218,8 +218,14 @@ def test_ledger_rows_use_v1_shape(corpus: Path, tmp_path: Path):
     from wiki_weaver.ledger import processed_sources
 
     assert processed_sources(corpus) == {ORCHARD}
-    # the 0-byte file is skipped once, stays in the inbox, and is not picked again
-    assert (corpus / "_inbox" / "2030-01-01 empty.md").exists()
+    # the 0-byte file is skipped once, moved out of the inbox, and not picked again
+    assert not (corpus / "_inbox" / "2030-01-01 empty.md").exists()
+    assert (corpus / ".wiki/skipped/2030-01-01 empty.md").exists()
+    held = next(r for r in rows if r["status"] == "failed" and r["failure_kind"] == "checks_failed")
+    assert held["failed_checks"]["write_1"] == held["failed_checks"]["write_2"]
+    assert held["failed_checks"]["write_1"].get("summary_missing") == 1
+    conv = next(r for r in rows if r["converged"])
+    assert conv["failed_checks"] == {} and conv["wall_seconds"] >= 0
     assert sum(r["source"] == "2030-01-01 empty.md" for r in rows) == 1
     # ids are stable per content hash and distinct across sources
     assert len({r["source_id"] for r in rows}) == len({r["hash"] for r in rows})

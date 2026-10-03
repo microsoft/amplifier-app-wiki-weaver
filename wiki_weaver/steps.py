@@ -17,7 +17,6 @@ from pathlib import Path
 from . import checks as ck
 from . import ledger as lg
 from .lib import (
-    MAX_PAGE_SOURCES,
     MAX_SOURCE_CHARS,
     NON_PAGE_FILES,
     corrections_dir,
@@ -189,6 +188,9 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
             p = cands[0]
         sha = sha256_file(p)
         if p.stat().st_size == 0:
+            skipped = WIKI / ".wiki" / "skipped"
+            skipped.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), skipped / p.name)
             record(
                 run,
                 lg.make_row(
@@ -299,8 +301,7 @@ def step_page_select() -> str:
         if p.exists():
             shutil.copy2(p, before / name)
             n_src = len((page_frontmatter(p) or {}).get("sources") or [])
-            cap = " - AT SOURCE CAP: do not add another source" if n_src >= MAX_PAGE_SOURCES else ""
-            out += [f"\n\n## {name} (existing, {n_src} sources{cap})\n\n", read_text(p)]
+            out += [f"\n\n## {name} (existing, {n_src} sources)\n\n", read_text(p)]
         else:
             out += [f"\n\n## {name} (new page - does not exist yet)\n"]
     idx = WIKI / "index.md"
@@ -333,6 +334,10 @@ def step_checks() -> str:
     with (work / "findings.md").open("a") as f:
         f.write(block)
     cur["findings"] = errs
+    kinds: dict[str, int] = {}
+    for e in errs:
+        kinds[ck.check_kind(e)] = kinds.get(ck.check_kind(e), 0) + 1
+    cur.setdefault("failed_checks", {})[f"write_{cur['attempts']}"] = kinds
     if cur["attempts"] < 2:
         cur["model_calls"] += 1
         cur["stage"] = "write"
@@ -387,6 +392,8 @@ def step_hold(run_dir: str) -> str:
             failed_to=str(dest.resolve()),
             pages_touched=[],
             model_calls=cur.get("model_calls", 0),
+            failed_checks=cur.get("failed_checks", {}),
+            wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
     commit_state(f"hold: {cur['filename']} ({kind})")
@@ -410,6 +417,8 @@ def step_commit(run_dir: str) -> str:
             archived_to=str(dest.resolve()),
             pages_touched=pages,
             model_calls=cur.get("model_calls", 0),
+            failed_checks=cur.get("failed_checks", {}),
+            wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
     git("add", "-A")

@@ -38,16 +38,6 @@ def test_frontmatter_required_fields():
     assert ck.check_frontmatter("p.md", FM) == []
 
 
-def test_source_cap():
-    many = (
-        "---\ntitle: T\ntype: x\nlast_updated: 2031-01-01\nsources:\n"
-        + "".join(f"  - s{i}.md\n" for i in range(11))
-        + "---\n"
-    )
-    assert ck.check_source_cap("p.md", many)
-    assert not ck.check_source_cap("p.md", FM)
-
-
 def test_duplicate_h2():
     assert ck.check_duplicate_headings("p.md", FM + "## A\nx\n## A\ny\n")
     assert not ck.check_duplicate_headings("p.md", FM + "## A\n### A\n")
@@ -77,3 +67,22 @@ def test_marker_on_kept_line_is_not_loss():
     before = FM + "## Plan\nShips Friday.\n"
     after = FM + "## Plan\n<!-- superseded: 2031-03-05 --> Ships Friday.\nNow Tuesday.\n"
     assert ck.check_content_loss("p.md", before, after) == []
+
+
+def test_no_source_cap():
+    many = (
+        "---\ntitle: T\ntype: x\nlast_updated: 2031-01-01\nsources:\n"
+        + "".join(f"  - s{i}.md\n" for i in range(40))
+        + "---\nbody\n"
+    )
+    assert not hasattr(ck, "check_source_cap")
+    assert ck.run_page_checks(Path("."), [], Path("."), {}) == []
+    assert ck.check_frontmatter("p.md", many) == []
+
+
+def test_check_kind():
+    assert ck.check_kind('p.md: quote not found verbatim in a.md: "x"') == "citations"
+    assert (
+        ck.check_kind("p.md: lost 3/10 lines (30%) without a superseded marker") == "content_loss"
+    )
+    assert ck.check_kind("wrote outside the selected pages: lens.md") == "write_scope"

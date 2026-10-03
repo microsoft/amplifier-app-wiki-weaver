@@ -125,7 +125,7 @@ def eligible(wiki: Path) -> list[Path]:
     """Inbox sources this wiki has not yet dealt with, oldest content first.
 
     Excluded: content already converged (under any name -- a duplicate is nothing to
-    do) and a (name, hash) pair already ledgered (a skipped 0-byte file stays put).
+    do) and a (name, hash) pair already ledgered.
     """
     inbox = wiki_inbox(wiki)
     if not inbox.is_dir():

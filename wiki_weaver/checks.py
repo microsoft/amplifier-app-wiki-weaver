@@ -11,7 +11,6 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import unquote
 
-from .lib import MAX_PAGE_SOURCES
 from .sources import normalize_ws, read_text, split_frontmatter
 
 CITE_RE = re.compile(r'\[([^\[\]\n]+?\.md): "([^"\n]+)"\]')
@@ -53,14 +52,6 @@ def check_frontmatter(name: str, text: str) -> list[str]:
     if srcs is not None and not isinstance(srcs, list):
         errs.append(f"{name}: frontmatter 'sources' must be a list")
     return errs
-
-
-def check_source_cap(name: str, text: str) -> list[str]:
-    fm, _ = split_frontmatter(text)
-    srcs = (fm or {}).get("sources") or []
-    if isinstance(srcs, list) and len(srcs) > MAX_PAGE_SOURCES:
-        return [f"{name}: {len(srcs)} sources listed (cap is {MAX_PAGE_SOURCES})"]
-    return []
 
 
 def check_duplicate_headings(name: str, text: str) -> list[str]:
@@ -133,6 +124,30 @@ def check_content_loss(name: str, before: str, after: str) -> list[str]:
     return errs
 
 
+# Check names, for counting which check caused a failed write.
+CHECK_KINDS = (
+    ("cites unknown source", "citations"),
+    ("quote under 5 words", "citations"),
+    ("not found verbatim", "citations"),
+    ("not in frontmatter sources", "citations"),
+    ("citation without a quote", "citations"),
+    ("broken link", "links"),
+    ("broken wikilink", "links"),
+    ("without a superseded marker", "content_loss"),
+    ("duplicate ## heading", "duplicate_headings"),
+    ("frontmatter", "frontmatter"),
+    ("wrote outside the selected pages", "write_scope"),
+    ("was not written", "summary_missing"),
+)
+
+
+def check_kind(finding: str) -> str:
+    for needle, kind in CHECK_KINDS:
+        if needle in finding:
+            return kind
+    return "other"
+
+
 def run_page_checks(
     wiki: Path,
     pages: list[str],
@@ -146,7 +161,6 @@ def run_page_checks(
             continue
         text = read_text(p)
         errs += check_frontmatter(name, text)
-        errs += check_source_cap(name, text)
         errs += check_duplicate_headings(name, text)
         errs += check_citations(name, text, source_texts)
         errs += check_links(name, text, wiki)

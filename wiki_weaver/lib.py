@@ -21,7 +21,6 @@ NON_PAGE_FILES = {"index.md", "log.md", "lens.md", "READING.md"}
 RESERVED_SLUGS = {"_inbox", "_sources", "lens", "feedback", "index", "log", "reading"}
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 MAX_SOURCE_CHARS = 400_000
-MAX_PAGE_SOURCES = 10
 
 
 def wiki_ledger(wiki: Path) -> Path:
