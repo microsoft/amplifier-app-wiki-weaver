@@ -257,6 +257,17 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             for p in problems:
                 print(f"wiki-weaver: {p}", file=sys.stderr)
             return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
+        # A run that died mid-source leaves that writer's edits uncommitted; undo them
+        # before the snapshot below would commit them as if they were the owner's.
+        rec = subprocess.run(
+            [sys.executable, "-m", "wiki_weaver.steps", "recover"],
+            cwd=corpus,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rec.stdout.strip().endswith("recovered"):
+            print(f"wiki-weaver: {rec.stderr.strip()}", file=sys.stderr)
         scaffold(corpus)
         commit_pending(corpus, "chore: snapshot before ingest")
         only = Path(a.source).name if a.source else None

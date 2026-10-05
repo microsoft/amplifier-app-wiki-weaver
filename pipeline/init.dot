@@ -27,7 +27,7 @@ digraph WikiWeaverInit {
         label="Lens interview",
         prompt="Three questions to seed this wiki's lens. Answer all three in one reply: (1) What is this wiki for? (2) What do you care about in the sources - what should it notice and keep? (3) What kinds of pages do you want (for example people, projects, decisions, topics)?"]
 
-    draft [shape=box, class="strong", fidelity="truncate",
+    draft [shape=box, timeout="900s", class="strong", fidelity="truncate",
         prompt="Draft lens.md for a new wiki. The lens is the steering wheel: the brief and the writer read it on every source to decide what matters. Base it on the owner's own words: the purpose text in .wiki/init/purpose.md if that file exists, and any interview answers given above. Write lens.md with exactly these six ## headings, in this order: Purpose, What matters, People, Question shapes, Page types, Owner. State expertise and intent, not procedure: what the wiki is for, what deserves attention and what does not, who the people are, what questions an agent will bring, and which page types to keep (a short bulleted list of type names with one line each). Keep it to the owner's intent; do not invent facts about people. If the owner is not named, write: Unassigned. Write only lens.md."]
 
     lens_check [shape=parallelogram, max_retries=0,

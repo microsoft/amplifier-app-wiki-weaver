@@ -28,13 +28,13 @@ digraph WikiWeaverIngest {
     assemble [shape=parallelogram, max_retries=0,
         tool_command="\"$py\" -m wiki_weaver.steps assemble"]
 
-    brief [shape=box, class="strong", fidelity="truncate",
+    brief [shape=box, timeout="900s", class="strong", fidelity="truncate",
         prompt="You write the brief for one source entering a wiki. Read .wiki/work/context.md: the lens (what this wiki is for and what matters to its owner), the standing corrections, and the source itself. Read index.md if it exists: the pages the wiki already has. Write .wiki/work/brief.md covering: what this source is about; what matters in it, judged by the lens; what to watch for when integrating it (commitments and who owns them, positions that changed, disagreements, details that are easy to get wrong); and which pages it should touch and why. Then write .wiki/work/slugs.txt: at most 8 page slugs, one per line, lowercase words joined by hyphens, no .md suffix. Prefer pages already in index.md; propose a new page only where the lens's page types call for one. Leave out the source's own summary page; it is added automatically. If context.md marks this as a CHANGED SOURCE, focus the brief on what changed and what it overturns. A source with nothing worth keeping may list no slugs, but still write the file. Do not create or edit any other file."]
 
     page_select [shape=parallelogram, max_retries=0,
         tool_command="\"$py\" -m wiki_weaver.steps page_select"]
 
-    write [shape=box, class="large_context", fidelity="truncate",
+    write [shape=box, timeout="2400s", class="large_context", fidelity="truncate",
         prompt="You are the writer: integrate one source into the wiki. Read .wiki/work/brief.md (what matters here), .wiki/work/context.md (the lens, the standing corrections, the source), and .wiki/work/pages.md (the pages you may write with their current content, and index.md). If .wiki/work/findings.md exists, a previous attempt failed deterministic checks: fix every finding it lists. Write the source summary page named in context.md and update or create the other selected pages. Write ONLY the files listed in pages.md; never touch index.md, log.md, lens.md or anything else. Integrate, never replace: keep what a page already says and weave the new material in; when something changed, say what and give the date; mark text that is no longer current with <!-- superseded: YYYY-MM-DD --> and leave it readable. Disagreement contract: when people disagree, record each position and who holds it, keep decided, proposed and still-open distinct, and never turn an exchange into a conclusion the source does not state. Citations: cite specific claims - dates, numbers, names, commitments, positions - with a quote, as [s<id>: \"five or more words copied exactly from that source\"], using the source id given in context.md; orientation and synthesis sentences need no citation. The quote must be an exact substring of the source (no paraphrase, no added or changed punctuation; choose spans of at least five words without double quotes or square brackets). Keep existing citations exactly as they are. If context.md marks a CHANGED SOURCE, a quoted passage that no longer appears in this version is wrapped in a <!-- superseded: YYYY-MM-DD --> marker, never deleted. `## Current state` is the one section you may rewrite; everything else you integrate into. Every page starts with YAML frontmatter: title; type (one of the lens page types, or source for a summary page); sources (a list of the exact filenames of the sources the page cites); last_updated (YYYY-MM-DD). No duplicate ## headings within a page. Internal links must point to files that exist. The lens decides what matters; follow it and the standing corrections."]
 
     checks [shape=parallelogram, max_retries=0,
@@ -49,7 +49,7 @@ digraph WikiWeaverIngest {
     index_prep [shape=parallelogram, max_retries=0,
         tool_command="\"$py\" -m wiki_weaver.steps index_prep \"$run_dir\""]
 
-    index [shape=box, class="strong", fidelity="truncate",
+    index [shape=box, timeout="1800s", class="strong", fidelity="truncate",
         prompt="Read .wiki/work/index_input.md: what changed in this run, a manifest of every page in the wiki, and the current index.md. Rewrite index.md so it has exactly one line per page in the manifest, in the form - [title](file.md) · date range · one sentence on what the page holds; group the lines under a ## heading per page type. Keep the lines of unchanged pages as they are; read a new or changed page before writing its sentence. Then append to log.md (create it if missing; never edit earlier entries) one dated entry for this run: what was ingested, which pages changed and how, what was held and why. Touch no other file."]
 
     finalize [shape=parallelogram, max_retries=0,

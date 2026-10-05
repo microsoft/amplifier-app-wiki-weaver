@@ -411,6 +411,23 @@ def _revert_writes(keep: tuple[str, ...] = ()) -> None:
             (WIKI / p).unlink(missing_ok=True)
 
 
+def step_recover() -> str:
+    """Undo a source left half-written by a run that died mid-source (current.json still
+    present): revert its uncommitted page edits and clear the scratch space. The source
+    itself stays in _inbox/ and is picked up again."""
+    work = wiki_work(WIKI)
+    if not (work / "current.json").exists():
+        return "clean"
+    cur = current()
+    reverted = changed_paths()
+    _revert_writes()
+    shutil.rmtree(work, ignore_errors=True)
+    print(
+        f"recovered interrupted source {cur.get('filename')}: reverted {reverted}", file=sys.stderr
+    )
+    return "recovered"
+
+
 def step_hold(run_dir: str) -> str:
     cur = current()
     stage = cur.get("stage", "?")
@@ -640,6 +657,7 @@ STEPS = {
     "page_select": step_page_select,
     "checks": step_checks,
     "hold": step_hold,
+    "recover": step_recover,
     "commit": step_commit,
     "index_prep": step_index_prep,
     "finalize": step_finalize,
