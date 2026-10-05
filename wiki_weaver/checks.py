@@ -1,7 +1,9 @@
 """Deterministic per-write checks. Every check can fail the step; none calls a model.
 
 Citation convention (what the writer is told, and what this enforces):
-    [<source-filename>: "<five or more words copied verbatim from that source>"]
+    [s<source_id>: "<five or more words copied verbatim from that source version>"]
+The id is the ledger's hash-based ``source_id``: it names one exact version of a source,
+so a quote from a since-edited version still resolves (see ledger.source_versions).
 """
 
 from __future__ import annotations
@@ -13,8 +15,9 @@ from urllib.parse import unquote
 
 from .sources import normalize_ws, read_text, split_frontmatter
 
-CITE_RE = re.compile(r'\[([^\[\]\n]+?\.md): "([^"\n]+)"\]')
-BARE_CITE_RE = re.compile(r"\[([^\[\]\n]+?\.md)\](?!\()")
+CITE_RE = re.compile(r'\[s(\d+): "([^"\n]+)"\]')
+BARE_CITE_RE = re.compile(r"\[s(\d+)\](?!\()")
+CURRENT_STATE_RE = re.compile(r"^##\s+current state\b", re.IGNORECASE)
 MD_LINK_RE = re.compile(r"\[[^\]\n]*\]\((<[^>\n]+>|[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 WIKILINK_RE = re.compile(r"\[\[([^\]|\n]+)(?:\|[^\]\n]*)?\]\]")
 MARKER_RE = re.compile(r"<!--\s*superseded:\s*\d{4}-\d{2}-\d{2}\s*-->")
@@ -23,18 +26,33 @@ REQUIRED_FM = ("title", "type", "sources", "last_updated")
 LOSS_THRESHOLD = 0.15
 
 
+def _without_current_state(body: str) -> str:
+    """Drop the `## Current state` section (heading included): the one section the
+    writer may rewrite, so it is outside the content-loss guard."""
+    out, inside = [], False
+    for line in body.splitlines():
+        st = line.strip()
+        if st.startswith(("## ", "# ")):
+            inside = bool(CURRENT_STATE_RE.match(st))
+        if not inside:
+            out.append(line)
+    return "\n".join(out)
+
+
 def _body_lines(text: str) -> list[str]:
     _, body = split_frontmatter(text)
     out = []
-    for line in body.splitlines():
+    for line in _without_current_state(body).splitlines():
         s = normalize_ws(MARKER_RE.sub("", line))
         if s:
             out.append(s)
     return out
 
 
-def _headings(text: str, level: int | None = None) -> list[str]:
+def _headings(text: str, level: int | None = None, skip_current: bool = False) -> list[str]:
     _, body = split_frontmatter(text)
+    if skip_current:
+        body = _without_current_state(body)
     hs = []
     for line in body.splitlines():
         m = HEADING_RE.match(line.strip())
@@ -59,29 +77,31 @@ def check_duplicate_headings(name: str, text: str) -> list[str]:
     return [f"{name}: duplicate ## heading '{h}'" for h in dups]
 
 
-def check_citations(name: str, text: str, source_texts: dict[str, str]) -> list[str]:
-    """Every quote is >=5 words and an exact (whitespace-normalized) substring of its source;
-    every cited file is a known source and is listed in the page's `sources:`."""
+def check_citations(name: str, text: str, sources: dict[int, tuple[str, str]]) -> list[str]:
+    """Every quote is >=5 words and an exact (whitespace-normalized) substring of the source
+    version its id names; every cited source is known and listed in the page's `sources:`.
+    ``sources`` maps source_id -> (filename, text of that version)."""
     errs: list[str] = []
     fm, body = split_frontmatter(text)
     listed = {str(s) for s in ((fm or {}).get("sources") or []) if isinstance(s, str)}
-    norm_cache: dict[str, str] = {}
+    norm_cache: dict[int, str] = {}
     for m in CITE_RE.finditer(body):
-        fname, quote = m.group(1).strip(), m.group(2)
-        if fname not in source_texts:
-            errs.append(f"{name}: cites unknown source [{fname}]")
+        sid, quote = int(m.group(1)), m.group(2)
+        if sid not in sources:
+            errs.append(f"{name}: cites unknown source [s{sid}]")
             continue
+        fname, stext = sources[sid]
         if len(quote.split()) < 5:
-            errs.append(f'{name}: quote under 5 words: [{fname}: "{quote}"]')
+            errs.append(f'{name}: quote under 5 words: [s{sid}: "{quote}"]')
             continue
-        hay = norm_cache.setdefault(fname, normalize_ws(source_texts[fname]))
+        hay = norm_cache.setdefault(sid, normalize_ws(stext))
         if normalize_ws(quote) not in hay:
-            errs.append(f'{name}: quote not found verbatim in {fname}: "{quote[:80]}"')
+            errs.append(f'{name}: quote not found verbatim in s{sid} ({fname}): "{quote[:80]}"')
         if listed and fname not in listed:
-            errs.append(f"{name}: cites {fname} but it is not in frontmatter sources")
+            errs.append(f"{name}: cites s{sid} ({fname}) but it is not in frontmatter sources")
     for m in BARE_CITE_RE.finditer(body):
-        if m.group(1).strip() in source_texts:
-            errs.append(f"{name}: citation without a quote: [{m.group(1).strip()}]")
+        if int(m.group(1)) in sources:
+            errs.append(f"{name}: citation without a quote: [s{m.group(1)}]")
     return errs
 
 
@@ -111,7 +131,9 @@ def check_content_loss(name: str, before: str, after: str) -> list[str]:
         return []
     lost = sum((Counter(b) - Counter(a)).values())
     frac = lost / len(b)
-    lost_heads = sorted(set(_headings(before)) - set(_headings(after)))
+    lost_heads = sorted(
+        set(_headings(before, skip_current=True)) - set(_headings(after, skip_current=True))
+    )
     new_markers = len(MARKER_RE.findall(after)) > len(MARKER_RE.findall(before))
     errs = []
     if (frac > LOSS_THRESHOLD or lost_heads) and not new_markers:
@@ -152,7 +174,7 @@ def run_page_checks(
     wiki: Path,
     pages: list[str],
     before_dir: Path,
-    source_texts: dict[str, str],
+    sources: dict[int, tuple[str, str]],
 ) -> list[str]:
     errs: list[str] = []
     for name in pages:
@@ -162,7 +184,7 @@ def run_page_checks(
         text = read_text(p)
         errs += check_frontmatter(name, text)
         errs += check_duplicate_headings(name, text)
-        errs += check_citations(name, text, source_texts)
+        errs += check_citations(name, text, sources)
         errs += check_links(name, text, wiki)
         prior = before_dir / name
         if prior.exists():

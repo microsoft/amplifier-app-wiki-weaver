@@ -4,10 +4,11 @@ This wiki is pre-computed synthesis over raw sources. It has three layers:
 
 1. `index.md` - one line per page: title, date range, one sentence. Start here; pick the
    few pages that look relevant and read those in full.
-2. Pages (`*.md`) - topic pages and per-source summaries (`source-*.md`). Each claim cites
-   its source as `[<source-filename>: "a few words quoted from it"]`.
-3. `_sources/` - the raw sources, unmodified. The quoted words are an exact substring of
-   the named file, so you can search for them and land on the spot.
+2. Pages (`*.md`) - topic pages and per-source summaries (`source-*.md`). Specific claims
+   cite a source as `[s<id>: "five or more words quoted from it"]`.
+3. `_sources/` - the raw sources. `s<id>` is `source_id` in `.wiki/.processed.jsonl`; its
+   `source` field is the file name. Search that file for the quoted words to land on the
+   spot (an earlier version of an edited source is `.wiki/source-versions/s<id>.md`).
 
 Summaries are pointers, not testimony.
 

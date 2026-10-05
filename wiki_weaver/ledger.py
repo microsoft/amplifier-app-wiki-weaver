@@ -146,3 +146,44 @@ def eligible(wiki: Path) -> list[Path]:
 
 def is_oversized(path: Path) -> bool:
     return len(read_text(path)) > MAX_SOURCE_CHARS
+
+
+def versions_dir(wiki: Path) -> Path:
+    """Prior versions of edited sources, kept so `[s<id>: ...]` keeps resolving."""
+    return Path(wiki) / ".wiki" / "source-versions"
+
+
+def source_versions(wiki: Path) -> dict[int, tuple[str, str]]:
+    """source_id -> (filename, text of that exact version), for every resolvable id.
+
+    The current version lives in _sources/<name>; an earlier version of an edited source
+    lives in .wiki/source-versions/s<id>.md.
+    """
+    wiki = Path(wiki)
+    by_id: dict[int, tuple[str, str]] = {}
+    for r in read_rows(wiki):
+        sid = r.get("source_id")
+        if isinstance(sid, int) and sid not in by_id:
+            by_id[sid] = (_name(r), _hash(r))
+    hashes: dict[str, str] = {}
+    out: dict[int, tuple[str, str]] = {}
+    for sid, (name, h) in by_id.items():
+        cur = wiki / "_sources" / name
+        if cur.is_file():
+            if name not in hashes:
+                hashes[name] = sha256_file(cur)
+            if hashes[name] == h:
+                out[sid] = (name, read_text(cur))
+                continue
+        old = versions_dir(wiki) / f"s{sid}.md"
+        if old.is_file():
+            out[sid] = (name, read_text(old))
+    return out
+
+
+def ids_for_source(wiki: Path, name: str) -> set[int]:
+    return {
+        r["source_id"]
+        for r in read_rows(wiki)
+        if _name(r) == name and isinstance(r.get("source_id"), int)
+    }

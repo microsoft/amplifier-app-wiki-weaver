@@ -6,6 +6,7 @@ corpus as the working directory. A step prints one routing token on its last std
 
 from __future__ import annotations
 
+import difflib
 import json
 import shutil
 import subprocess
@@ -112,6 +113,7 @@ def save_current(cur: dict) -> None:
 
 def record(run_dir: Path, row: dict) -> None:
     """One V1-shaped ledger row, mirrored into this batch's changes.jsonl."""
+    row.setdefault("run_id", run_dir.parent.name)
     lg.append_row(WIKI, row)
     jappend(run_dir / "changes.jsonl", row)
 
@@ -124,10 +126,23 @@ def commit_state(message: str) -> None:
         git("commit", "-q", "-m", message)
 
 
-def source_texts(cur: dict) -> dict[str, str]:
-    texts = {p.name: read_text(p) for p in wiki_sources(WIKI).glob("*.md")}
-    texts[cur["filename"]] = read_text(wiki_inbox(WIKI) / cur["filename"])
+def check_sources(cur: dict) -> dict[int, tuple[str, str]]:
+    """source_id -> (filename, text) for every resolvable version, plus the one in flight."""
+    texts = lg.source_versions(WIKI)
+    texts[cur["source_id"]] = (cur["filename"], read_text(wiki_inbox(WIKI) / cur["filename"]))
     return texts
+
+
+def pages_citing(name: str) -> list[str]:
+    """Pages that cite any version of source ``name`` or list it in `sources:`."""
+    ids = lg.ids_for_source(WIKI, name)
+    out = []
+    for p in page_files(WIKI):
+        text = read_text(p)
+        srcs = (page_frontmatter(p) or {}).get("sources") or []
+        if name in srcs or any(int(m.group(1)) in ids for m in ck.CITE_RE.finditer(text)):
+            out.append(p.name)
+    return out
 
 
 # ---------------------------------------------------------------- ingest
@@ -226,10 +241,17 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
             )
             commit_state(f"hold: {p.name} (oversized)")
             continue
+        rows = lg.read_rows(WIKI)
+        prev = wiki_sources(WIKI) / p.name
+        prev_sha = sha256_file(prev) if prev.is_file() else None
+        changed = prev_sha is not None and prev_sha != sha
         save_current(
             {
                 "filename": p.name,
                 "sha256": sha,
+                "source_id": lg.source_id_for(rows, sha),
+                "changed": changed,
+                "prev_source_id": lg.source_id_for(rows, prev_sha) if changed else None,
                 "summary_page": _summary_page(p.name),
                 "started": now(),
                 "t0": time.time(),
@@ -250,11 +272,34 @@ def step_assemble() -> str:
     parts += [f"\n## {c.name}\n{read_text(c).strip()}\n" for c in corr] or ["(none yet)\n"]
     for frag in schema_fragments(WIKI):
         parts += [f"\n# Wrapper policy fragment ({frag.as_posix()})\n", read_text(frag).strip()]
+    sid = cur["source_id"]
     parts += [
         "\n\n# Source\n",
         f"filename: {cur['filename']}\n",
+        f'source id: s{sid} - cite this source as [s{sid}: "five or more words quoted exactly"]\n',
         *(f"{k}: {v}\n" for k, v in meta.items() if k != "filename" and v),
         f"summary page to write: {cur['summary_page']}\n",
+    ]
+    if cur.get("changed"):
+        old = read_text(wiki_sources(WIKI) / cur["filename"])
+        diff = difflib.unified_diff(
+            old.splitlines(keepends=True),
+            read_text(src).splitlines(keepends=True),
+            fromfile=f"s{cur['prev_source_id']} (previous version)",
+            tofile=f"s{sid} (this version)",
+            n=2,
+        )
+        parts += [
+            (
+                "\nCHANGED SOURCE: this source was ingested before and has changed. The "
+                f"previous version is s{cur['prev_source_id']}; existing citations of it stay "
+                "as they are. A quoted passage that no longer appears in this version is "
+                "superseded, not deleted. The unified diff, previous -> this version:\n\n```diff\n"
+            ),
+            "".join(diff),
+            "```\n",
+        ]
+    parts += [
         "\n----- SOURCE TEXT BEGINS -----\n",
         read_text(src),
         "\n----- SOURCE TEXT ENDS -----\n",
@@ -291,6 +336,11 @@ def step_page_select() -> str:
         notes.append(f"dropped slugs beyond {MAX_SLUGS}: {', '.join(slugs[MAX_SLUGS:])}")
         slugs = slugs[:MAX_SLUGS]
     selected = [cur["summary_page"]] + [f"{s}.md" for s in slugs]
+    if cur.get("changed"):
+        citing = [n for n in pages_citing(cur["filename"]) if n not in selected]
+        selected += citing
+        if citing:
+            notes.append(f"added because they cite the changed source: {', '.join(citing)}")
     before = work / "before"
     before.mkdir(exist_ok=True)
     out = ["# Selected pages\n", "You may write ONLY these files:\n"]
@@ -308,7 +358,9 @@ def step_page_select() -> str:
     out += ["\n\n# index.md\n\n", read_text(idx) if idx.exists() else "(empty)\n"]
     (work / "pages.md").write_text("".join(out))
     (work / "selected.txt").write_text("\n".join(selected) + "\n")
+    chars = sum(len(read_text(work / f)) for f in ("context.md", "pages.md", "brief.md"))
     cur.update(stage="write", model_calls=cur["model_calls"] + 1, selected=selected)
+    cur["writer_input_chars"] = chars
     save_current(cur)
     return "ok"
 
@@ -324,7 +376,7 @@ def step_checks() -> str:
     if cur["summary_page"] not in changed:
         errs.append(f"source summary {cur['summary_page']} was not written")
     pages = [p for p in changed if p in selected]
-    errs += ck.run_page_checks(WIKI, pages, work / "before", source_texts(cur))
+    errs += ck.run_page_checks(WIKI, pages, work / "before", check_sources(cur))
     if not errs:
         save_current(cur)
         return "pass"
@@ -393,6 +445,7 @@ def step_hold(run_dir: str) -> str:
             pages_touched=[],
             model_calls=cur.get("model_calls", 0),
             failed_checks=cur.get("failed_checks", {}),
+            writer_input_chars=cur.get("writer_input_chars", 0),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -406,6 +459,12 @@ def step_commit(run_dir: str) -> str:
     srcs = wiki_sources(WIKI)
     srcs.mkdir(exist_ok=True)
     dest = srcs / cur["filename"]
+    if cur.get("changed") and dest.exists():
+        keep = lg.versions_dir(WIKI) / f"s{cur['prev_source_id']}.md"
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        if not keep.exists():
+            shutil.copyfile(dest, keep)
+        dest.unlink()
     shutil.move(str(wiki_inbox(WIKI) / cur["filename"]), dest)
     record(
         Path(run_dir),
@@ -418,6 +477,7 @@ def step_commit(run_dir: str) -> str:
             pages_touched=pages,
             model_calls=cur.get("model_calls", 0),
             failed_checks=cur.get("failed_checks", {}),
+            writer_input_chars=cur.get("writer_input_chars", 0),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -518,7 +578,7 @@ def step_ask_assemble(ask_dir: str) -> str:
     reading = WIKI / "READING.md"
     idx = WIKI / "index.md"
     parts = [
-        "# How to read this wiki\n\n",
+        "# READING.md\n\n",
         read_text(reading) if reading.exists() else "(no READING.md)\n",
         "\n# index.md\n\n",
         read_text(idx) if idx.exists() else "(the wiki has no index yet)\n",

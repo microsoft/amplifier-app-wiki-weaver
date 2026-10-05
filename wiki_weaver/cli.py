@@ -19,9 +19,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__, pidlock
+from . import checks as ck
 from . import result as rs
 from .dashboard import build_dashboard
-from .ledger import eligible
+from .ledger import eligible, source_versions
 from .lib import (
     feedback_log,
     lens_path,
@@ -332,6 +333,35 @@ def cmd_ask(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lint(a: argparse.Namespace) -> int:
+    """Run the deterministic page checks over the whole wiki. No model."""
+    corpus = Path(a.wiki).expanduser().resolve()
+    if not corpus.is_dir():
+        print(f"wiki-weaver: wiki dir not found: {corpus}", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    sources = source_versions(corpus)
+    errs: list[str] = []
+    pages = page_files(corpus)
+    for p in pages:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        errs += ck.check_frontmatter(p.name, text)
+        errs += ck.check_duplicate_headings(p.name, text)
+        errs += ck.check_citations(p.name, text, sources)
+        errs += ck.check_links(p.name, text, corpus)
+    idx = corpus / "index.md"
+    if idx.exists():
+        errs += ck.check_links("index.md", idx.read_text(encoding="utf-8"), corpus)
+    kinds: dict[str, int] = {}
+    for e in errs:
+        kinds[ck.check_kind(e)] = kinds.get(ck.check_kind(e), 0) + 1
+    cites = sum(len(ck.CITE_RE.findall(p.read_text(encoding="utf-8"))) for p in pages)
+    for e in errs[:50]:
+        print(e)
+    summary = {"pages": len(pages), "citations": cites, "errors": len(errs), "by_check": kinds}
+    print(json.dumps(summary))
+    return 0 if not errs else 1
+
+
 def cmd_feedback(a: argparse.Namespace) -> int:
     corpus = Path(a.wiki).expanduser().resolve()
     if not corpus.is_dir():
@@ -452,6 +482,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--group-link-template", dest="group_link_template", default=None, metavar="T")
     s.add_argument("--skip-index", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_dashboard)
+
+    s = sub.add_parser("lint", help="run the deterministic checks over every page")
+    s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    s.set_defaults(func=cmd_lint)
 
     s = sub.add_parser("feedback", help="record feedback with a why")
     s.add_argument("--wiki", default=".", help="wiki directory (default: .)")

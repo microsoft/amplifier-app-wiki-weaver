@@ -53,6 +53,11 @@ def fake_brief(c: Path, slugs: list[str]) -> None:
     (c / ".wiki/work/slugs.txt").write_text("\n".join(slugs) + "\n")
 
 
+def cite(corpus: Path, quote: str) -> str:
+    sid = json.loads((corpus / ".wiki/work/current.json").read_text())["source_id"]
+    return f'[s{sid}: "{quote}"]'
+
+
 def page(title: str, srcs: list[str], body: str) -> str:
     s = "".join(f'  - "{x}"\n' for x in srcs)
     return f"---\ntitle: {title}\ntype: topics\nsources:\n{s}last_updated: 2031-03-02\n---\n{body}"
@@ -77,7 +82,7 @@ def test_happy_path_commit(corpus: Path, tmp_path: Path):
     assert step(corpus, "page_select") == (0, "ok")
     sel = (corpus / ".wiki/work/selected.txt").read_text().split()
     assert sel == ["source-2031-03-02-orchard-sync.md", "orchard-rollout.md"]
-    q = '[2031-03-02 Orchard Sync.md: "The orchard sensor rollout ships on Friday"]'
+    q = cite(corpus, "The orchard sensor rollout ships on Friday")
     (corpus / sel[0]).write_text(page("Orchard Sync", [ORCHARD], f"- Rollout Friday {q}\n"))
     (corpus / sel[1]).write_text(page("Orchard rollout", [ORCHARD], f"## Plan\n- Friday {q}\n"))
     assert step(corpus, "checks") == (0, "pass")
@@ -99,7 +104,7 @@ def test_rewrite_then_hold_reverts(corpus: Path, tmp_path: Path):
     step(corpus, "assemble")
     fake_brief(corpus, ["orchard-rollout"])
     step(corpus, "page_select")
-    bad = page("X", [ORCHARD], '[2031-03-02 Orchard Sync.md: "words that are not in it"]\n')
+    bad = page("X", [ORCHARD], cite(corpus, "words that are not in it at all") + "\n")
     (corpus / "source-2031-03-02-orchard-sync.md").write_text(bad)
     (corpus / "lens.md").write_text("tampered")
     assert step(corpus, "checks") == (0, "rewrite")
@@ -192,7 +197,7 @@ def test_ledger_rows_use_v1_shape(corpus: Path, tmp_path: Path):
     step(corpus, "assemble")
     fake_brief(corpus, [])
     step(corpus, "page_select")
-    q = '[2031-03-02 Orchard Sync.md: "The orchard sensor rollout ships on Friday"]'
+    q = cite(corpus, "The orchard sensor rollout ships on Friday")
     (corpus / "source-2031-03-02-orchard-sync.md").write_text(page("O", [ORCHARD], q + "\n"))
     assert step(corpus, "checks") == (0, "pass")
     step(corpus, "commit", str(run))
@@ -229,3 +234,116 @@ def test_ledger_rows_use_v1_shape(corpus: Path, tmp_path: Path):
     assert sum(r["source"] == "2030-01-01 empty.md" for r in rows) == 1
     # ids are stable per content hash and distinct across sources
     assert len({r["source_id"] for r in rows}) == len({r["hash"] for r in rows})
+
+
+def test_correction_reaches_writer_context(corpus: Path, tmp_path: Path):
+    (corpus / "lens/corrections/2031-03-10 orchard naming.md").write_text(
+        "Call it the orchard rollout, never the sensor project. Why: the owner asked.\n"
+    )
+    step(corpus, "select", str(tmp_path / "r"), "0", "-")
+    assert step(corpus, "assemble") == (0, "ok")
+    ctx = (corpus / ".wiki/work/context.md").read_text()
+    assert "## 2031-03-10 orchard naming.md" in ctx
+    assert "never the sensor project" in ctx
+    assert ctx.index("# Standing corrections") < ctx.index("never the sensor project")
+    assert ctx.index("never the sensor project") < ctx.index("SOURCE TEXT BEGINS")
+
+
+def _ingest_orchard(corpus: Path, run: Path, body_quote: str) -> None:
+    step(corpus, "select", str(run), "0", "-")
+    step(corpus, "assemble")
+    fake_brief(corpus, ["orchard-rollout"])
+    step(corpus, "page_select")
+    q = cite(corpus, body_quote)
+    (corpus / "source-2031-03-02-orchard-sync.md").write_text(page("O", [ORCHARD], q + "\n"))
+    (corpus / "orchard-rollout.md").write_text(page("R", [ORCHARD], "## Plan\n" + q + "\n"))
+    assert step(corpus, "checks") == (0, "pass")
+    step(corpus, "commit", str(run))
+
+
+def test_changed_source_reingest(corpus: Path, tmp_path: Path):
+    """An edited source is re-read: flagged, diffed, every citing page selected, the old
+    version kept so its citations still resolve."""
+    for f in (corpus / "_inbox").glob("*.md"):
+        if f.name != ORCHARD:
+            f.unlink()
+    _ingest_orchard(corpus, tmp_path / "r1", "The orchard sensor rollout ships on Friday")
+    old_id = json.loads((corpus / ".wiki/.processed.jsonl").read_text().splitlines()[-1])[
+        "source_id"
+    ]
+    edited = (
+        (FIX / ORCHARD)
+        .read_text()
+        .replace(
+            "Wren Talbot: The orchard sensor rollout ships on Friday the seventh.\n",
+            "Wren Talbot: The orchard sensor rollout slips to Tuesday the eleventh.\n",
+        )
+    )
+    (corpus / "_inbox" / ORCHARD).write_text(edited)
+    assert step(corpus, "select", str(tmp_path / "r2"), "0", "-") == (0, "source")
+    cur = json.loads((corpus / ".wiki/work/current.json").read_text())
+    assert cur["changed"] is True and cur["prev_source_id"] == old_id
+    assert cur["source_id"] != old_id
+    step(corpus, "assemble")
+    ctx = (corpus / ".wiki/work/context.md").read_text()
+    assert "CHANGED SOURCE" in ctx and "-Wren Talbot: The orchard sensor rollout ships" in ctx
+    assert "+Wren Talbot: The orchard sensor rollout slips to Tuesday" in ctx
+    fake_brief(corpus, [])  # brief picks nothing; citing pages are added anyway
+    step(corpus, "page_select")
+    sel = (corpus / ".wiki/work/selected.txt").read_text().split("\n")
+    assert "orchard-rollout.md" in sel
+    # writer supersedes the old quote (kept, still citing the old version) and adds the new
+    new_q = cite(corpus, "The orchard sensor rollout slips to Tuesday")
+    old_q = f'[s{old_id}: "The orchard sensor rollout ships on Friday"]'
+    body = f"## Plan\n<!-- superseded: 2031-03-12 --> {old_q}\n{new_q}\n"
+    (corpus / "orchard-rollout.md").write_text(page("R", [ORCHARD], body))
+    (corpus / "source-2031-03-02-orchard-sync.md").write_text(
+        page("O", [ORCHARD], f"<!-- superseded: 2031-03-12 --> {old_q}\n{new_q}\n")
+    )
+    assert step(corpus, "checks") == (0, "pass")
+    step(corpus, "commit", str(tmp_path / "r2"))
+    assert (corpus / f".wiki/source-versions/s{old_id}.md").read_text().count("Friday") == 1
+    assert "slips to Tuesday" in (corpus / "_sources" / ORCHARD).read_text()
+    from wiki_weaver.ledger import source_versions
+
+    vers = source_versions(corpus)
+    assert "ships on Friday" in vers[old_id][1] and "slips to Tuesday" in vers[cur["source_id"]][1]
+
+
+def test_citation_transform_two_entry_ledger(tmp_path: Path):
+    from wiki_weaver.migrate import transform_citations
+
+    w = tmp_path / "w"
+    (w / ".wiki").mkdir(parents=True)
+    rows = [
+        {"source": "a.md", "source_id": 1, "hash": "h1", "status": "converged", "converged": True},
+        {
+            "source": "b c.md",
+            "source_id": 2,
+            "hash": "h2",
+            "status": "converged",
+            "converged": True,
+        },
+    ]
+    (w / ".wiki/.processed.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    p = w / "topic.md"
+    p.write_text(
+        page(
+            "T",
+            ["a.md", "b c.md"],
+            '- x [a.md: "one two three four five"] and [b c.md: "six seven eight nine ten"]\n',
+        )
+    )
+    rep = transform_citations(w)
+    assert rep == {"pages": 1, "citations": 2, "unknown_filenames": [], "applied": True}
+    text = p.read_text()
+    assert '[s1: "one two three four five"]' in text and '[s2: "six seven eight nine ten"]' in text
+    # unknown filename: nothing changes
+    q = w / "other.md"
+    original = page(
+        "U", ["z.md"], '[z.md: "one two three four five"] [a.md: "one two three four five"]\n'
+    )
+    q.write_text(original)
+    rep = transform_citations(w)
+    assert rep["unknown_filenames"] == ["z.md"] and rep["applied"] is False
+    assert q.read_text() == original

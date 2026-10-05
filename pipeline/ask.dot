@@ -23,7 +23,7 @@ digraph WikiWeaverAsk {
         tool_command="\"$py\" -m wiki_weaver.steps ask_read \"$ask_dir\""]
 
     answer [shape=box, class="strong", fidelity="truncate",
-        prompt="Answer a question from the wiki. In the directory $ask_dir read context.md (how to read this wiki, the index, the question) and pages.md (the pages picked for it). Follow the reading guidance: the pages are enough for orientation and synthesis; for a specific date, number, name or commitment, follow the citation into _sources/ and check the passage. Cite as [<source-filename>: \"quoted words\"]. If no page covers the question, refuse rather than guess. Write answer.json in $ask_dir with exactly these keys: answer (string), pages_used (list of page file names you relied on), refused (true when the wiki does not cover the question, else false). Write nothing else."]
+        prompt="Answer a question from the wiki. In the directory $ask_dir read context.md (how to read this wiki, the index, the question) and pages.md (the pages picked for it). Follow the reading guidance: the pages are enough for orientation and synthesis; for a specific date, number, name or commitment, follow the citation into _sources/ and check the passage. Cite as the pages do, [s<id>: \"quoted words\"]. If no page covers the question, refuse rather than guess. Write answer.json in $ask_dir with exactly these keys: answer (string), pages_used (list of page file names you relied on), refused (true when the wiki does not cover the question, else false). Write nothing else."]
 
     emit [shape=parallelogram, max_retries=0,
         tool_command="\"$py\" -m wiki_weaver.steps ask_emit \"$ask_dir\" \"$fmt\""]

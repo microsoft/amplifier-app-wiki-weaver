@@ -116,3 +116,18 @@ def test_c_no_shell_node_invokes_a_model():
             if MODEL_WORDS.search(cmd):
                 bad.append(f"{g.name}:{nid}: model-looking token in {cmd!r}")
     assert not bad, bad
+
+
+def test_dot_runner_lint_passes_on_all_graphs():
+    import shutil
+    import subprocess
+
+    import pytest
+
+    exe = shutil.which("dot-runner")
+    if not exe:
+        pytest.skip("dot-runner not installed")
+    for g in GRAPHS:
+        r = subprocess.run([exe, "lint", str(g)], capture_output=True, text=True, check=False)
+        assert r.returncode == 0, (g.name, r.stdout, r.stderr)
+        assert "ERROR" not in r.stdout, (g.name, r.stdout)
