@@ -82,14 +82,18 @@ that's a signal.
   one exact source version. The check's logic is unchanged.
 - Earlier versions of an edited source are kept at `.wiki/source-versions/s<id>.md`, so a
   superseded `[s<old>: ...]` still resolves. Reason: the id names a version (hash-based,
-  as in V1); without the old text every superseded quote would fail the check.
-  OPEN: corpus-package contract — new path beside `_sources/`.
+  as in V1); without the old text every superseded quote would fail the check. Kept: state
+  a later run needs, outside the resolver's exclusions; owner adds it to the corpus
+  contract on v4.
 - e01 transformed by the ledger map: 6,609 citations, 0 unknown filenames, `lint` 0
   errors. Five largest pages −29% bytes; citation share 51–55% → 32–37%.
 - Changed source: every page citing any version of it joins the writer's selection, on
-  top of the brief's ≤8 slugs. Superseded markers carry the date the change was ingested,
-  not a source date. OPEN: which date the owner wants.
-- `## Current state` heading is outside the heading-loss rule as well as the 15% rule.
+  top of the brief's ≤8 slugs.
+- Superseded-marker date, stated in the writer prompt: a position that changes in a source
+  carries the source's date; a source file that is itself edited carries the ingest date
+  (given in the assembled context).
+- `## Current state` heading (matched on the heading prefix) is outside the heading-loss
+  rule as well as the 15% rule.
   Reason: its `(as of <date>)` changes every pass, so keeping it in the heading rule would
   fail every rewrite. All other headings are guarded as before.
 - `wiki-weaver lint --wiki` added: the per-write checks over every page and index.md. No
@@ -106,3 +110,6 @@ that's a signal.
   (two files were both named _index.md).
 - The three team questions are asked on e01 after each epoch, not on personal.
 - tools/measure.py produces checkpoint measurements; repo-only, not in the package.
+- Citation check's 5-word minimum kept through E03 so the density change is the only
+  variable. All 23 misses so far (12 CP3, 11 personal) were short quotes, verbatim in the
+  source; zero not-found. Short-quote findings are now counted as their own kind.

@@ -80,6 +80,7 @@ def test_no_source_cap():
 
 def test_check_kind():
     assert ck.check_kind('p.md: quote not found verbatim in a.md: "x"') == "citations"
+    assert ck.check_kind('p.md: quote under 5 words: [s1: "worked ok"]') == "short_quote"
     assert (
         ck.check_kind("p.md: lost 3/10 lines (30%) without a superseded marker") == "content_loss"
     )

@@ -149,7 +149,7 @@ def check_content_loss(name: str, before: str, after: str) -> list[str]:
 # Check names, for counting which check caused a failed write.
 CHECK_KINDS = (
     ("cites unknown source", "citations"),
-    ("quote under 5 words", "citations"),
+    ("quote under 5 words", "short_quote"),
     ("not found verbatim", "citations"),
     ("not in frontmatter sources", "citations"),
     ("citation without a quote", "citations"),

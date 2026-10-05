@@ -229,6 +229,7 @@ def test_ledger_rows_use_v1_shape(corpus: Path, tmp_path: Path):
     held = next(r for r in rows if r["status"] == "failed" and r["failure_kind"] == "checks_failed")
     assert held["failed_checks"]["write_1"] == held["failed_checks"]["write_2"]
     assert held["failed_checks"]["write_1"].get("summary_missing") == 1
+    assert "short_quote" not in held["failed_checks"]["write_1"]
     conv = next(r for r in rows if r["converged"])
     assert conv["failed_checks"] == {} and conv["wall_seconds"] >= 0
     assert sum(r["source"] == "2030-01-01 empty.md" for r in rows) == 1
@@ -286,6 +287,7 @@ def test_changed_source_reingest(corpus: Path, tmp_path: Path):
     assert cur["source_id"] != old_id
     step(corpus, "assemble")
     ctx = (corpus / ".wiki/work/context.md").read_text()
+    assert "ingest date: " in ctx
     assert "CHANGED SOURCE" in ctx and "-Wren Talbot: The orchard sensor rollout ships" in ctx
     assert "+Wren Talbot: The orchard sensor rollout slips to Tuesday" in ctx
     fake_brief(corpus, [])  # brief picks nothing; citing pages are added anyway

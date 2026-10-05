@@ -281,6 +281,7 @@ def step_assemble() -> str:
         f"summary page to write: {cur['summary_page']}\n",
     ]
     if cur.get("changed"):
+        parts.append(f"ingest date: {now()[:10]}\n")
         old = read_text(wiki_sources(WIKI) / cur["filename"])
         diff = difflib.unified_diff(
             old.splitlines(keepends=True),

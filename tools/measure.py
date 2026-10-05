@@ -145,8 +145,17 @@ def main() -> None:
             for r in rows
             if r.get("run_id") == run.name and r.get("writer_input_chars")
         ]
+        timeouts: dict[str, int] = {}
+        for st in run.rglob("status.json"):
+            try:
+                sj = json.loads(st.read_text())
+            except ValueError:
+                continue
+            if sj.get("failure_reason") == "timeout":
+                timeouts[sj.get("node_id", "?")] = timeouts.get(sj.get("node_id", "?"), 0) + 1
         if d:
             wall[run.name] = {
+                "timeouts": timeouts,
                 "sources": len(d),
                 "wall_median_s": round(statistics.median(d)),
                 "wall_mean_s": round(statistics.mean(d)),
