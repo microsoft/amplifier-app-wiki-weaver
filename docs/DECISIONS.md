@@ -70,9 +70,25 @@ that's a signal.
   it did not arise. Interim: `lint` catches it. REVISIT: on re-ingest of a changed source,
   auto-select every page that cites it.
 - Re-ingest of a changed source (option C): the writer is told the source changed, gets a
-      unified diff of old vs new in its context, and every page citing the source is added to
-      its selection. Stale quotes are marked superseded, not deleted. All in tool-node glue —
-      no new nodes, edges, model calls or checks. REVISIT: superseded-vs-delete when the
-      source itself was corrected (a fixed typo shouldn't be preserved as history); decide
-      with consolidation. The loss guard stays unaware of re-ingests on purpose.
-    
+  unified diff of old vs new in its context, and every page citing the source is added to
+  its selection. Stale quotes are marked superseded, not deleted. All in tool-node glue —
+  no new nodes, edges, model calls or checks. REVISIT: superseded-vs-delete when the
+  source itself was corrected (a fixed typo shouldn't be preserved as history); decide
+  with consolidation. The loss guard stays unaware of re-ingests on purpose.
+
+## 2026-10-05 — Stage 1, CP4 step 1 (personal corpus)
+
+- Prior versions of edited sources kept at `.wiki/source-versions/s<id>.md` so old
+  citations still resolve. Travels with the corpus. (corpus-package layout, clause 10)
+- Superseded-marker date: a position that changes in a source carries the source's date; a
+  source file that is itself edited carries the ingest date — the closest honest proxy.
+- `## Current state` is exempt from the heading-loss rule, matched on the prefix; its
+  `(as of <date>)` suffix changes every pass.
+- Citation 5-word minimum held through E03 so the density change is the only variable;
+  short-quote failures counted separately. REVISIT after E03: lower to three, or drop.
+- Model-step timeouts: brief 900 s · write 2400 s · index 1800 s · ask/init 900 s.
+  Ingest undoes any half-written source before starting.
+- Retry eligibility: anything not converged is eligible, as in V1 — RepoWeaver's retry
+  path depends on it.
+- The three ask questions run on the team corpus after E03, not on personal.
+
