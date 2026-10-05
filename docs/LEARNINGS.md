@@ -105,4 +105,49 @@
     add every citing page to its selection, mark stale quotes superseded rather than deleting.
     All in tool-node glue.
     **Status.** Pending, before the personal run.
-    
+
+    ### The twelve CP3 citation misses were short quotes, not mismatches — 2026-10-05
+    **Problem.** The open question was whether the check was failing on whitespace,
+    paraphrase or fabrication.
+    **How it showed.** All 12 findings were "quote under 5 words", and all 12 quotes were
+    present verbatim in their source (7 distinct quotes over 5 sources; 4 of the 5 were chat
+    exports). Examples: "worked ok", "not in yet", "Tested five bundles end-to-end" (four
+    words), a bare URL. The personal run: 20 distinct first-write findings — 11 short
+    quotes, 8 cited-but-not-in-`sources:`, 1 broken wikilink, 0 verbatim misses.
+    **Fix.** None to the check. The writer reaches for short, punchy fragments; the
+    rewrite fixes them every time (0 second-write failures across E02 and personal).
+    **Status.** No change. REVISIT only if the rewrite stops fixing them.
+
+    ### A dead network hung the writer for an hour, and the next run would have committed its half-page — 2026-10-05
+    **Problem.** Box nodes had no timeout. A run killed mid-source left the writer's
+    uncommitted page edits in the corpus, and the next ingest's pre-run snapshot commits
+    whatever is uncommitted.
+    **How it showed.** During a network outage the personal run's write node sat for 63
+    minutes on a 5 KB note. Killing it left `source-people-chris.md` untracked in the corpus.
+    In the restarted run the outage turned into fast failures instead: five briefs failed
+    with "Connection error", were held, and the index step failed (exit 1, errored).
+    **Fix.** Every box node has a timeout; ingest begins with a `recover` step that reverts
+    an in-flight source's edits before the snapshot. Verified: the restart reported
+    `recovered interrupted source People - Chris.md` and committed nothing from it.
+    **Status.** Applied (5f390bb).
+
+    ### Held sources could not be retried by re-dropping them — 2026-10-05
+    **Problem.** Eligibility skipped any (name, hash) already in the ledger, failed rows
+    included. V1 counts only converged rows as processed.
+    **How it showed.** The five outage-held personal sources, moved back to _inbox/, would
+    have been ignored.
+    **Fix.** Eligibility excludes converged content only. Re-dropped, all five converged.
+    **Status.** Applied (2f90b2c).
+
+    ### Removing quoted text from a source: the citing pages kept it, marked superseded — 2026-10-05
+    **Problem.** The CP3 open item: what happens to quotes when a source loses the passage
+    they came from.
+    **How it showed.** One bullet removed from the personal note on Ken. Four pages quoted
+    it (ken, wiki-weaver, samuel-lee, team-pulse, plus the source summary); all were
+    selected because they cite the source, and every quote stayed, wrapped in a superseded
+    marker and still citing `s11`, the old version, with a note that s26 dropped the line.
+    `resolve.md`, which cites other passages of the note, was not touched. `lint`: 0 errors.
+    No page lost a line; no rewrite was needed.
+    **Fix.** Prior versions retained at `.wiki/source-versions/s<id>.md` so the old id still
+    resolves.
+    **Status.** Applied (d9a8b6d). Writer input for that source was 112 K characters.

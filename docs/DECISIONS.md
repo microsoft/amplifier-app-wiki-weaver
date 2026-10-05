@@ -75,4 +75,34 @@ that's a signal.
       no new nodes, edges, model calls or checks. REVISIT: superseded-vs-delete when the
       source itself was corrected (a fixed typo shouldn't be preserved as history); decide
       with consolidation. The loss guard stays unaware of re-ingests on purpose.
-    
+
+## 2026-10-05 — Stage 1, CP4 (personal; before E03)
+
+- Citations are `[s<source_id>: "quote"]`; the check resolves the id through the ledger to
+  one exact source version. The check's logic is unchanged.
+- Earlier versions of an edited source are kept at `.wiki/source-versions/s<id>.md`, so a
+  superseded `[s<old>: ...]` still resolves. Reason: the id names a version (hash-based,
+  as in V1); without the old text every superseded quote would fail the check.
+  OPEN: corpus-package contract — new path beside `_sources/`.
+- e01 transformed by the ledger map: 6,609 citations, 0 unknown filenames, `lint` 0
+  errors. Five largest pages −29% bytes; citation share 51–55% → 32–37%.
+- Changed source: every page citing any version of it joins the writer's selection, on
+  top of the brief's ≤8 slugs. Superseded markers carry the date the change was ingested,
+  not a source date. OPEN: which date the owner wants.
+- `## Current state` heading is outside the heading-loss rule as well as the 15% rule.
+  Reason: its `(as of <date>)` changes every pass, so keeping it in the heading rule would
+  fail every rewrite. All other headings are guarded as before.
+- `wiki-weaver lint --wiki` added: the per-write checks over every page and index.md. No
+  model.
+- Every box node has a timeout (brief 900s, write 2400s, index 1800s; ask and init 900s);
+  a timeout is a FAIL and ingest routes it to hold. REVISIT: if a legitimate write nears
+  2400s (E02 max was 422s).
+- Ingest starts with `recover`: if a source was in flight, its uncommitted edits are
+  reverted before the pre-run snapshot. Reason: the snapshot would otherwise commit a dead
+  writer's half-page as the owner's edit.
+- A held source dropped back into _inbox/ is retried (V1: failed rows never count as
+  processed). Eligibility excludes converged content only.
+- Personal corpus: ~/.lifeos/memory/**/*.md flattened into _inbox/ with "/" → " - "
+  (two files were both named _index.md).
+- The three team questions are asked on e01 after each epoch, not on personal.
+- tools/measure.py produces checkpoint measurements; repo-only, not in the package.
