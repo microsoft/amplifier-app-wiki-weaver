@@ -363,3 +363,19 @@ def test_recover_undoes_a_half_written_source(corpus: Path, tmp_path: Path):
     assert (corpus / "_inbox" / ORCHARD).exists()
     assert not (corpus / ".wiki/work").exists()
     assert step(corpus, "recover") == (0, "clean")
+
+
+def test_held_source_dropped_back_is_retried(corpus: Path, tmp_path: Path):
+    """V1's retry path: a held source re-dropped into _inbox/ is eligible again."""
+    from wiki_weaver.ledger import eligible
+
+    step(corpus, "select", str(tmp_path / "r"), "0", "-")
+    step(corpus, "assemble")
+    fake_brief(corpus, [])
+    step(corpus, "page_select")
+    step(corpus, "checks")
+    step(corpus, "checks")
+    step(corpus, "hold", str(tmp_path / "r"))
+    assert ORCHARD not in [p.name for p in eligible(corpus)]
+    shutil.move(corpus / ".wiki/failed" / ORCHARD, corpus / "_inbox" / ORCHARD)
+    assert ORCHARD in [p.name for p in eligible(corpus)]

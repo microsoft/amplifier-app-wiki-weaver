@@ -124,20 +124,21 @@ def append_row(wiki: Path, row: dict) -> None:
 def eligible(wiki: Path) -> list[Path]:
     """Inbox sources this wiki has not yet dealt with, oldest content first.
 
-    Excluded: content already converged (under any name -- a duplicate is nothing to
-    do) and a (name, hash) pair already ledgered.
+    Excluded: content already converged, under any name (a duplicate is nothing to do).
+    A held source dropped back into _inbox/ is retried, as in V1 (failed rows never count
+    as processed); 0-byte and oversized sources leave _inbox/ when they are recorded.
     """
     inbox = wiki_inbox(wiki)
     if not inbox.is_dir():
         return []
     rows = read_rows(wiki)
-    done, seen = converged_hashes(rows), seen_keys(rows)
+    done = converged_hashes(rows)
     out = []
     for p in inbox.glob("*.md"):
         if not p.is_file():
             continue
         h = sha256_file(p)
-        if h in done or (p.name, h) in seen:
+        if h in done:
             continue
         out.append(p)
     out.sort(key=lambda p: (str(source_meta(p).get("date") or "9999"), p.name))
