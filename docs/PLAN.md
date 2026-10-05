@@ -114,8 +114,9 @@ The design itself was over-steered, and we're loosening it:
   and persistent rather than per-source.*
 - **Checks become deterministic and routing.** A small structural check caught real content
   losses that a model judge missed entirely.
-- **Citations become thread-following, not proof.** Each sentence names its source file and
-  quotes a few words from it, so an agent can jump to the exact spot. Nothing to verify,
+- **Citations become thread-following, not proof.** A specific claim — a date, a number, a
+  name, a commitment, a position — names its source and quotes a few of its words, so an
+  agent can jump to the exact spot; orientation and synthesis need no citation. Nothing to verify,
   nothing that can fail a publish.
 - **Pages accumulate rather than being replaced.** V3's renderer overwrote each page with
   the most recent source's view, silently hiding nearly half of everything it had
@@ -353,8 +354,11 @@ it rejects. None are V4's to fix; all pre-date it.
    agent lands on the spot, plus a check that the quote is really there.
 2. **The disagreement contract.** The largest prompt-level win. One paragraph.
 3. **Deterministic gates instead of judge models.** See principle 5.
-4. **Cap attributed sources per page** at roughly 8–10. Attribution measurably degrades past
-   that, and a fabrication appeared on a page attributing seventeen.
+4. ~~Cap attributed sources per page at roughly 8–10.~~ **Retracted at Stage 1 CP2.** The prior
+   program found attribution degrading past ~10 sources; Stage 1 began with that cap and it
+   bound after one epoch on exactly the pages that must accumulate. The citation check — a
+   verbatim quote verified against the named source — guards attribution directly, so the
+   cap is removed and page size is watched instead.
 5. **Spend deterministic machinery freely.** Counters, coverage reconciliation, loss guards.
 
 ### Why this shape
@@ -434,6 +438,8 @@ are quoted as recorded; where a metric's units aren't defined in the source, the
 the decision are what carry weight.
 
 ### 8.1 What each version established, and what it left
+
+*A running row-per-behavior comparison of V1, V2 and V4 is kept in `docs/LINEAGE.md`.*
 
 **V1** built the base — the page structure, the index-to-summaries-to-sources shape, sources
 retained, citations. Steering is limited to an initial purpose, and there is no reviewer.
@@ -572,6 +578,10 @@ From an interview with someone running both a team wiki and a personal one, ever
 
 ## 9. Risks and open questions
 
+*Implementation decisions and the revisit list are in `docs/DECISIONS.md`; what went wrong
+in the build and how it was fixed, in `docs/LEARNINGS.md`; caller-facing promises are in
+`contracts/`.*
+
 **Risks we're carrying knowingly**
 
 - **A short prompt plus a lens may write worse pages than V2's long one.** V2's writer prompt
@@ -588,6 +598,9 @@ From an interview with someone running both a team wiki and a personal one, ever
   or V2 wiki. For anyone holding a wiki that took a week to build, that's a real cost and we're
   stating it rather than discovering it later. Sources are retained in every version, so
   nothing is lost — but the rebuild is a rebuild.
+- **The engine caps a run at ~85 sources** (dot-runner stops any run at nodes × 50 steps).
+  Stage 1 works around it by batching in the CLI; the graph stays pure. Removed when the
+  engine allows longer runs.
 
 **Plan, where a question was open**
 
