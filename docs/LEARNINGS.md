@@ -167,7 +167,9 @@
     permission, not as an instruction to replace it. Candidates: state it as "replace the
     whole section each pass; put it first"; or a deterministic check that the section is
     the first `##` and has no meeting-named bullets.
-    **Status.** OPEN — owner's call before E04.
+    **Status.** Fixed before E04 (1314d78) — see the next entry. (Correction: on the large
+    pages the section *was* the first `##`; the line numbers came after a 50–75-line
+    `sources:` frontmatter list.)
 
     ### Writer input reached a million characters — 2026-10-06
     **Problem.** The writer gets each selected page whole. With no source cap and pages that
@@ -178,3 +180,24 @@
     (median 196s E01 → 243s E02 → 255s E03; max 443s).
     **Fix.** None (NOT YET: no splitting, no history files). Measured every report.
     **Status.** Watching. E04 shows whether wall time starts to track input size.
+
+    ### Current state as a replaced roll-up worked — 2026-10-06
+    **Problem.** The section was accumulating "Update from the <meeting>" bullets.
+    **How it showed.** Pages touched in E03: median 5 source-subject bullets per section
+    (max 13). After the fix, pages touched in E04: 37 of 39 have the section, median 0
+    (28 of 37 have none), max 2; section length median 7 lines, max 11. The new format
+    check fired on 0 first writes.
+    **Fix.** The writer line now describes the section (a synthesis replaced in full, set
+    by the lens's page type, not a list of updates); each lens says what it covers; a
+    deterministic check for heading format and position.
+    **Status.** Applied (1314d78). Some sections still open with prose leads naming a
+    meeting ("As of the planning call of 2026-06-26 …"), which the bullet metric does not
+    count.
+
+    ### The scope check caught a typo'd page name — 2026-10-06
+    **Problem.** A writer created `eekly-commitments-2026-06-15.md` (first letter dropped)
+    alongside the page it meant to write.
+    **How it showed.** E04, first write of one source: "wrote outside the selected pages".
+    The rewrite removed it and passed.
+    **Fix.** None needed; this is the write-scope check doing its job.
+    **Status.** Recorded as evidence for that check.

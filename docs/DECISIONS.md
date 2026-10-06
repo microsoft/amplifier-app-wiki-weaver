@@ -124,3 +124,20 @@ that's a signal.
   in E02), so this is a cost and context-headroom question before it is a time one.
 - OPEN: `## Current state` is not behaving as a rewritten summary — see LEARNINGS
   2026-10-06. No change made; the owner decides between a writer-prompt fix and a check.
+
+## 2026-10-06 — Stage 1, CP4 (E04 into e01)
+
+- `## Current state` is the page's roll-up, replaced in full every pass, first `##`
+  section, heading exactly `## Current state (as of YYYY-MM-DD)`. Writer prompt states the
+  shape; each lens says what it covers per page type; the checks node enforces the
+  heading format and position on any page that has the section (fail → rewrite once). No
+  length rule; no backfill (the pages without one are a post-E07 step).
+- The 5-word quote minimum stays; the REVISIT is closed (3 findings in 33 sources at E03,
+  6 in 31 at E04, all fixed on rewrite).
+- Writer input unchanged. REVISIT: at E04 the median is 825 K characters, 19 of 31
+  sources exceed 800 K, the max is 1.51 M, and wall time now tracks it (r = 0.64).
+- OPEN: `(as of <date>)` is filled with the ingest date (today), not the latest source
+  date the section reflects; the sections say "as of 2026-06-26" in their text instead.
+- OPEN: the heading-prefix match catches a source summary headed
+  `## Current state, as Manoj described it (2026-05-15)`; `lint` reports it. Harmless
+  until that summary is rewritten.
