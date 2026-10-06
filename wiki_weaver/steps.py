@@ -274,7 +274,8 @@ def step_assemble() -> str:
         parts += [f"\n# Wrapper policy fragment ({frag.as_posix()})\n", read_text(frag).strip()]
     sid = cur["source_id"]
     parts += [
-        "\n\n# Source\n",
+        f"\n\ntoday: {now()[:10]}\n",
+        "\n# Source\n",
         f"filename: {cur['filename']}\n",
         f'source id: s{sid} - cite this source as [s{sid}: "five or more words quoted exactly"]\n',
         *(f"{k}: {v}\n" for k, v in meta.items() if k != "filename" and v),

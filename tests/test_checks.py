@@ -95,3 +95,14 @@ def test_current_state_section_is_outside_the_loss_guard():
     # the record below it is still guarded, headings included
     lost = FM + "## Current state (as of 2031-03-09)\nx\n"
     assert any("record" in e for e in ck.check_content_loss("p.md", before, lost))
+
+
+def test_current_state_format_and_position():
+    ok = FM + "# T\n\n## Current state (as of 2031-03-09)\nx\n## Record\ny\n"
+    assert ck.check_current_state("p.md", ok) == []
+    assert ck.check_current_state("p.md", FM + "## Record\ny\n") == []  # no section: no rule
+    no_date = FM + "## Current state\nx\n## Record\ny\n"
+    assert any("must read" in e for e in ck.check_current_state("p.md", no_date))
+    not_first = FM + "## Record\ny\n## Current state (as of 2031-03-09)\nx\n"
+    assert any("not the first" in e for e in ck.check_current_state("p.md", not_first))
+    assert ck.check_kind(ck.check_current_state("p.md", not_first)[0]) == "current_state"

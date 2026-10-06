@@ -123,6 +123,28 @@ def check_links(name: str, text: str, wiki: Path) -> list[str]:
     return errs
 
 
+CURRENT_STATE_FORMAT = re.compile(r"^## Current state \(as of \d{4}-\d{2}-\d{2}\)$")
+
+
+def check_current_state(name: str, text: str) -> list[str]:
+    """A page that has a `## Current state` section: the heading reads exactly
+    `## Current state (as of YYYY-MM-DD)` and it is the first `##` section."""
+    _, body = split_frontmatter(text)
+    h2 = [ln.strip() for ln in body.splitlines() if ln.startswith("## ")]
+    cs = [h for h in h2 if CURRENT_STATE_RE.match(h)]
+    if not cs:
+        return []
+    errs = []
+    for h in cs:
+        if not CURRENT_STATE_FORMAT.match(h):
+            errs.append(
+                f"{name}: current state heading must read '## Current state (as of YYYY-MM-DD)', got '{h}'"
+            )
+    if not CURRENT_STATE_RE.match(h2[0]):
+        errs.append(f"{name}: current state is not the first ## section (first is '{h2[0]}')")
+    return errs
+
+
 def check_content_loss(name: str, before: str, after: str) -> list[str]:
     """A rewritten page that drops >15% of its lines, or any heading, needs a new
     superseded marker; otherwise it fails."""
@@ -157,6 +179,8 @@ CHECK_KINDS = (
     ("broken wikilink", "links"),
     ("without a superseded marker", "content_loss"),
     ("duplicate ## heading", "duplicate_headings"),
+    ("current state heading must read", "current_state"),
+    ("current state is not the first", "current_state"),
     ("frontmatter", "frontmatter"),
     ("wrote outside the selected pages", "write_scope"),
     ("was not written", "summary_missing"),
@@ -186,6 +210,7 @@ def run_page_checks(
         errs += check_duplicate_headings(name, text)
         errs += check_citations(name, text, sources)
         errs += check_links(name, text, wiki)
+        errs += check_current_state(name, text)
         prior = before_dir / name
         if prior.exists():
             errs += check_content_loss(name, read_text(prior), text)

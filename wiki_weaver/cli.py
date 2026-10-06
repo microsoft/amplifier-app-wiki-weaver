@@ -359,6 +359,7 @@ def cmd_lint(a: argparse.Namespace) -> int:
         errs += ck.check_duplicate_headings(p.name, text)
         errs += ck.check_citations(p.name, text, sources)
         errs += ck.check_links(p.name, text, corpus)
+        errs += ck.check_current_state(p.name, text)
     idx = corpus / "index.md"
     if idx.exists():
         errs += ck.check_links("index.md", idx.read_text(encoding="utf-8"), corpus)

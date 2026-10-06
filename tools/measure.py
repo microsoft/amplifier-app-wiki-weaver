@@ -78,6 +78,52 @@ def topic_stats(text: str) -> dict:
     }
 
 
+SOURCE_WORDS = re.compile(
+    r"\b(meeting|recording|recorded|chat|call|note|notes|digest|sync|transcript|1:1|"
+    r"standup|session|thread|channel|update from)\b",
+    re.IGNORECASE,
+)
+
+
+def current_state_metrics(text: str) -> dict | None:
+    """Lines in `## Current state`, and bullets whose subject is a source: the bullet's
+    lead (text before the first ':' or the first 80 chars) names a meeting, recording,
+    chat, call, note, digest, sync, transcript or session."""
+    _, body = split_frontmatter(text)
+    lines, inside, found = [], False, False
+    for ln in body.splitlines():
+        if ln.startswith(("## ", "# ")):
+            inside = bool(re.match(r"^##\s+current state\b", ln, re.IGNORECASE))
+            found = found or inside
+            continue
+        if inside and ln.strip():
+            lines.append(ln)
+    if not found:
+        return None
+    src_bullets = 0
+    for ln in lines:
+        m = re.match(r"^\s*([-*]|\d+\.)\s+(.*)", ln)
+        if not m:
+            continue
+        lead = re.sub(r"[*_]", "", m.group(2))
+        lead = lead.split(":", 1)[0][:80] if ":" in lead[:80] else lead[:80]
+        if SOURCE_WORDS.search(lead):
+            src_bullets += 1
+    return {"lines": len(lines), "source_bullets": src_bullets}
+
+
+def _dist(xs: list[int]) -> dict:
+    if not xs:
+        return {}
+    return {
+        "n": len(xs),
+        "min": min(xs),
+        "median": statistics.median(xs),
+        "max": max(xs),
+        "zero": sum(1 for x in xs if x == 0),
+    }
+
+
 def ask_stats(ask_dir: Path) -> dict:
     q = read_text(ask_dir / "question.txt").strip() if (ask_dir / "question.txt").exists() else "?"
     out = {}
@@ -153,8 +199,10 @@ def main() -> None:
                 continue
             if sj.get("failure_reason") == "timeout":
                 timeouts[sj.get("node_id", "?")] = timeouts.get(sj.get("node_id", "?"), 0) + 1
+        over = sum(1 for x in ch if x > 800_000)
         if d:
             wall[run.name] = {
+                "writer_chars_over_800k": over,
                 "timeouts": timeouts,
                 "sources": len(d),
                 "wall_median_s": round(statistics.median(d)),
@@ -165,6 +213,14 @@ def main() -> None:
                 "writer_chars_median": statistics.median(ch) if ch else None,
                 "writer_chars_max": max(ch) if ch else None,
             }
+    touched_cs = {}
+    if "--run" in sys.argv:
+        run_id = sys.argv[sys.argv.index("--run") + 1]
+        names = {p for r in rows if r.get("run_id") == run_id for p in r.get("pages_touched", [])}
+        for n in sorted(names):
+            if (w / n).exists() and not n.startswith("source-"):
+                m = current_state_metrics(read_text(w / n))
+                touched_cs[n] = m
     idx = w / "index.md"
     asks = sorted((w / ".wiki" / "ask").glob("*"))[-n_asks:] if n_asks else []
     report = {
@@ -187,6 +243,13 @@ def main() -> None:
         },
         "per_run": wall,
         "asks": [ask_stats(a) for a in asks],
+        "touched_current_state": {
+            "touched_topic_pages": len(touched_cs),
+            "with_section": sum(1 for v in touched_cs.values() if v),
+            "lines": _dist([v["lines"] for v in touched_cs.values() if v]),
+            "source_bullets": _dist([v["source_bullets"] for v in touched_cs.values() if v]),
+            "pages": touched_cs if "--topics" in sys.argv else None,
+        },
     }
     if "--topics" in sys.argv:
         report["topics"] = topics
