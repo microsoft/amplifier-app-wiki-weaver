@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,8 @@ from . import ledger as lg
 from .lib import (
     MAX_SOURCE_CHARS,
     NON_PAGE_FILES,
+    atomic_append_line,
+    atomic_write_text,
     corrections_dir,
     is_valid_slug,
     lens_path,
@@ -57,14 +60,11 @@ def jread(p: Path, default=None):
 
 
 def jwrite(p: Path, data) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2) + "\n")
+    atomic_write_text(p, json.dumps(data, indent=2) + "\n")
 
 
 def jappend(p: Path, row: dict) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    atomic_append_line(p, json.dumps(row, ensure_ascii=False))
 
 
 def jlines(p: Path) -> list[dict]:
@@ -84,7 +84,7 @@ def git(*args: str, check: bool = True) -> str:
 
 def changed_paths() -> list[str]:
     """Paths changed since the last commit (tracked or untracked, not ignored)."""
-    out = git("status", "--porcelain", "-z", "--untracked-files=all")
+    out = git("status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
     paths, parts, i = [], out.split("\0"), 0
     while i < len(parts):
         entry = parts[i]
@@ -148,12 +148,33 @@ def pages_citing(name: str) -> list[str]:
 # ---------------------------------------------------------------- ingest
 
 
-def _move_to_failed(path: Path) -> Path:
-    failed = wiki_failed(WIKI)
-    failed.mkdir(parents=True, exist_ok=True)
-    dest = failed / path.name
-    shutil.move(str(path), dest)
+INFLIGHT = "inflight"  # .wiki/work/inflight: tracked state is being changed right now
+
+
+def _place(src: Path, dest_dir: Path) -> Path:
+    """Copy a source to its retained place atomically. The inbox copy is removed only
+    after the commit that records it (see _finish), so a crash leaves it in _inbox/."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    tmp = dest_dir / f".{src.name}.tmp"
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dest)
     return dest
+
+
+def _finish(src: Path) -> None:
+    """Last step of a source's bookkeeping: drop the inbox copy."""
+    src.unlink(missing_ok=True)
+
+
+def _mark_inflight() -> None:
+    work = wiki_work(WIKI)
+    work.mkdir(parents=True, exist_ok=True)
+    (work / INFLIGHT).write_text(now())
+
+
+def _clear_inflight() -> None:
+    (wiki_work(WIKI) / INFLIGHT).unlink(missing_ok=True)
 
 
 def _summary_page(filename: str) -> str:
@@ -192,7 +213,13 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
                 return "drained"
             held = wiki_failed(WIKI) / name
             if not (inbox / name).exists() and held.exists():
-                shutil.move(str(held), inbox / name)
+                # retry: the held copy comes back to _inbox/; record that in git now so
+                # the write's scope check sees only the writer's changes
+                _mark_inflight()
+                _place(held, inbox)
+                held.unlink()
+                commit_state(f"retry: {name}")
+                _clear_inflight()
             p = inbox / name
             if not p.exists() or sha256_file(p) in lg.converged_hashes(lg.read_rows(WIKI)):
                 return "drained"
@@ -203,9 +230,8 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
             p = cands[0]
         sha = sha256_file(p)
         if p.stat().st_size == 0:
-            skipped = WIKI / ".wiki" / "skipped"
-            skipped.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(p), skipped / p.name)
+            _mark_inflight()
+            _place(p, WIKI / ".wiki" / "skipped")
             record(
                 run,
                 lg.make_row(
@@ -220,11 +246,14 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
                 ),
             )
             commit_state(f"skip: {p.name} (empty)")
+            _finish(p)
+            _clear_inflight()
             if only and only != "-":
                 return "drained"
             continue
         if lg.is_oversized(p):
-            dest = _move_to_failed(p)
+            _mark_inflight()
+            dest = _place(p, wiki_failed(WIKI))
             record(
                 run,
                 lg.make_row(
@@ -240,6 +269,8 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
                 ),
             )
             commit_state(f"hold: {p.name} (oversized)")
+            _finish(p)
+            _clear_inflight()
             continue
         rows = lg.read_rows(WIKI)
         prev = wiki_sources(WIKI) / p.name
@@ -296,7 +327,7 @@ def step_assemble() -> str:
                 "\nCHANGED SOURCE: this source was ingested before and has changed. The "
                 f"previous version is s{cur['prev_source_id']}; existing citations of it stay "
                 "as they are. A quoted passage that no longer appears in this version is "
-                "superseded, not deleted. The unified diff, previous -> this version:\n\n```diff\n"
+                "wrapped in a superseded block, not deleted. The unified diff, previous -> this version:\n\n```diff\n"
             ),
             "".join(diff),
             "```\n",
@@ -378,7 +409,10 @@ def step_checks() -> str:
     if cur["summary_page"] not in changed:
         errs.append(f"source summary {cur['summary_page']} was not written")
     pages = [p for p in changed if p in selected]
-    errs += ck.run_page_checks(WIKI, pages, work / "before", check_sources(cur))
+    pages += [p for p in selected if p not in pages and (work / "before" / p).exists()]
+    errs += ck.run_page_checks(
+        WIKI, pages, work / "before", check_sources(cur), cur.get("source_id")
+    )
     if not errs:
         save_current(cur)
         return "pass"
@@ -401,33 +435,64 @@ def step_checks() -> str:
     return "hold"
 
 
-def _revert_writes(keep: tuple[str, ...] = ()) -> None:
-    """Undo every uncommitted change in the corpus (ignored paths are untouched)."""
+def _in_head(path: str) -> bool:
+    r = subprocess.run(
+        ["git", "cat-file", "-e", f"HEAD:{path}"], cwd=WIKI, capture_output=True, check=False
+    )
+    return r.returncode == 0
+
+
+def _revert_writes(keep: tuple[str, ...] = ()) -> list[str]:
+    """Return every uncommitted path (tracked, staged or untracked; ignored paths are
+    untouched) to its state at HEAD. Restores from HEAD, not the index, so a staged
+    half-page does not survive."""
+    reverted = []
     for p in changed_paths():
         if p in keep:
             continue
-        tracked = git("ls-files", "--error-unmatch", p, check=False).strip()
-        if tracked:
-            git("checkout", "--", p)
+        if _in_head(p):
+            git("checkout", "HEAD", "--", p)
         else:
+            git("rm", "-q", "--cached", "--ignore-unmatch", "--", p, check=False)
             (WIKI / p).unlink(missing_ok=True)
+        reverted.append(p)
+    return reverted
 
 
 def step_recover() -> str:
-    """Undo a source left half-written by a run that died mid-source (current.json still
-    present): revert its uncommitted page edits and clear the scratch space. The source
-    itself stays in _inbox/ and is picked up again."""
+    """Undo a source left half-processed by a run that died: if a source or its
+    bookkeeping was in flight, return every uncommitted change to HEAD and clear the
+    scratch space. The source is then in exactly one place: still in _inbox/ (picked up
+    again), or committed (its leftover inbox copy, identical to _sources/, is dropped)."""
     work = wiki_work(WIKI)
-    if not (work / "current.json").exists():
-        return "clean"
-    cur = current()
-    reverted = changed_paths()
-    _revert_writes()
-    shutil.rmtree(work, ignore_errors=True)
-    print(
-        f"recovered interrupted source {cur.get('filename')}: reverted {reverted}", file=sys.stderr
-    )
-    return "recovered"
+    did = False
+    if (work / "current.json").exists() or (work / INFLIGHT).exists():
+        cur = jread(work / "current.json", {}) if (work / "current.json").exists() else {}
+        reverted = _revert_writes()
+        shutil.rmtree(work, ignore_errors=True)
+        print(
+            f"recovered interrupted source {cur.get('filename', '(bookkeeping)')}: "
+            f"reverted {reverted}",
+            file=sys.stderr,
+        )
+        did = True
+    done = lg.converged_hashes(lg.read_rows(WIKI))
+    for p in sorted(wiki_inbox(WIKI).glob("*.md")) if wiki_inbox(WIKI).is_dir() else []:
+        kept = wiki_sources(WIKI) / p.name
+        h = sha256_file(p)
+        if (
+            h in done
+            and kept.is_file()
+            and sha256_file(kept) == h
+            and _in_head(f"_sources/{p.name}")
+        ):
+            p.unlink()
+            print(
+                f"recovered: {p.name} was already committed; dropped its inbox copy",
+                file=sys.stderr,
+            )
+            did = True
+    return "recovered" if did else "clean"
 
 
 def step_hold(run_dir: str) -> str:
@@ -450,7 +515,7 @@ def step_hold(run_dir: str) -> str:
         kind = lg.KIND_UNKNOWN
     _revert_writes()
     src = wiki_inbox(WIKI) / cur["filename"]
-    dest = _move_to_failed(src) if src.exists() else wiki_failed(WIKI) / cur["filename"]
+    dest = _place(src, wiki_failed(WIKI)) if src.exists() else wiki_failed(WIKI) / cur["filename"]
     record(
         Path(run_dir),
         lg.make_row(
@@ -469,6 +534,7 @@ def step_hold(run_dir: str) -> str:
         ),
     )
     commit_state(f"hold: {cur['filename']} ({kind})")
+    _finish(src)
     return "next"
 
 
@@ -478,13 +544,13 @@ def step_commit(run_dir: str) -> str:
     srcs = wiki_sources(WIKI)
     srcs.mkdir(exist_ok=True)
     dest = srcs / cur["filename"]
+    src = wiki_inbox(WIKI) / cur["filename"]
     if cur.get("changed") and dest.exists():
         keep = lg.versions_dir(WIKI) / f"s{cur['prev_source_id']}.md"
         keep.parent.mkdir(parents=True, exist_ok=True)
         if not keep.exists():
             shutil.copyfile(dest, keep)
-        dest.unlink()
-    shutil.move(str(wiki_inbox(WIKI) / cur["filename"]), dest)
+    _place(src, srcs)
     record(
         Path(run_dir),
         lg.make_row(
@@ -502,6 +568,7 @@ def step_commit(run_dir: str) -> str:
     )
     git("add", "-A")
     git("commit", "-q", "-m", f"ingest: {cur['filename']}")
+    _finish(src)  # last: until here a crash leaves the source in _inbox/
     return "next"
 
 
@@ -555,6 +622,17 @@ def step_finalize() -> str:
     if changed_paths() or git("diff", "--cached", "--name-only").strip():
         git("commit", "-q", "-m", "index: update index.md and log.md")
     return "done"
+
+
+def step_index_restore() -> str:
+    """The index step failed: keep the per-source page commits, return index.md, log.md
+    and anything else the index step touched to HEAD, and fail the run."""
+    reverted = _revert_writes()
+    print(
+        f"index step failed; restored from HEAD: {reverted or 'nothing to restore'}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------- init
@@ -612,10 +690,19 @@ def step_ask_assemble(ask_dir: str) -> str:
 def step_ask_read(ask_dir: str) -> str:
     d = Path(ask_dir)
     picks = _parse_slugs(read_text(d / "picks.txt")) if (d / "picks.txt").exists() else []
+    root = WIKI.resolve()
     chosen = []
     for s in picks:
         name = s if s.endswith(".md") else f"{s}.md"
-        if name not in NON_PAGE_FILES and (WIKI / name).is_file() and name not in chosen:
+        try:
+            target = (root / name).resolve()
+        except (OSError, ValueError):
+            continue
+        # a page is a file directly under the corpus root; anything else is refused
+        if target.parent != root or not target.is_file():
+            continue
+        name = target.name
+        if name not in NON_PAGE_FILES and name not in chosen:
             chosen.append(name)
     chosen = chosen[:MAX_ASK_PAGES]
     out = [f"# Pages picked ({len(chosen)})\n"]
@@ -663,6 +750,7 @@ STEPS = {
     "commit": step_commit,
     "index_prep": step_index_prep,
     "finalize": step_finalize,
+    "index_restore": step_index_restore,
     "init_mode": step_init_mode,
     "default_lens": step_default_lens,
     "lens_check": step_lens_check,
@@ -672,12 +760,27 @@ STEPS = {
 }
 
 
+# Parameters reach a step through the environment (the graph's tool_env), never through
+# shell text: a source name like "Bob's chat $(...)" is data, not a command.
+STEP_ENV = {
+    "select": ("RUN_DIR", "CAP", "ONLY"),
+    "commit": ("RUN_DIR",),
+    "hold": ("RUN_DIR",),
+    "index_prep": ("RUN_DIR",),
+    "init_mode": ("MODE",),
+    "ask_assemble": ("ASK_DIR",),
+    "ask_read": ("ASK_DIR",),
+    "ask_emit": ("ASK_DIR", "FMT"),
+}
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] not in STEPS:
         print(f"usage: python -m wiki_weaver.steps {{{','.join(STEPS)}}} [args]", file=sys.stderr)
         sys.exit(2)
-    token = STEPS[argv[0]](*argv[1:])
+    args = argv[1:] or [os.environ.get(k, "") for k in STEP_ENV.get(argv[0], ())]
+    token = STEPS[argv[0]](*args)
     print(token)
 
 

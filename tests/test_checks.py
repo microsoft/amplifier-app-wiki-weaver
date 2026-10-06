@@ -57,8 +57,9 @@ def test_content_loss_guard():
     assert any("lost" in e for e in ck.check_content_loss("p.md", before, shrunk))
     no_heading = before.replace("## Plan\n", "")
     assert any("heading" in e for e in ck.check_content_loss("p.md", before, no_heading))
+    # a superseded marker no longer excuses deleted lines (Phase A, item 3)
     marked = shrunk + "<!-- superseded: 2031-03-05 --> plan changed\n"
-    assert ck.check_content_loss("p.md", before, marked) == []
+    assert any("lost" in e for e in ck.check_content_loss("p.md", before, marked))
 
 
 def test_marker_on_kept_line_is_not_loss():
@@ -81,9 +82,7 @@ def test_no_source_cap():
 def test_check_kind():
     assert ck.check_kind('p.md: quote not found verbatim in a.md: "x"') == "citations"
     assert ck.check_kind('p.md: quote under 5 words: [s1: "worked ok"]') == "short_quote"
-    assert (
-        ck.check_kind("p.md: lost 3/10 lines (30%) without a superseded marker") == "content_loss"
-    )
+    assert ck.check_kind("p.md: lost 3/10 lines (30%); superseded text must stay") == "content_loss"
     assert ck.check_kind("wrote outside the selected pages: lens.md") == "write_scope"
 
 

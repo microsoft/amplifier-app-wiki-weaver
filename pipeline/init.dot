@@ -18,10 +18,10 @@ digraph WikiWeaverInit {
     done  [shape=Msquare]
 
     init_mode [shape=parallelogram, max_retries=0,
-        tool_command="\"$py\" -m wiki_weaver.steps init_mode \"$mode\""]
+        tool_command="\"$PY\" -m wiki_weaver.steps init_mode", tool_env="py,mode"]
 
     default_lens [shape=parallelogram, max_retries=0,
-        tool_command="\"$py\" -m wiki_weaver.steps default_lens"]
+        tool_command="\"$PY\" -m wiki_weaver.steps default_lens", tool_env="py"]
 
     interview [shape=hexagon, mode="freeform",
         label="Lens interview",
@@ -31,7 +31,7 @@ digraph WikiWeaverInit {
         prompt="Draft lens.md for a new wiki. The lens is the steering wheel: the brief and the writer read it on every source to decide what matters. Base it on the owner's own words: the purpose text in .wiki/init/purpose.md if that file exists, and any interview answers given above. Write lens.md with exactly these six ## headings, in this order: Purpose, What matters, People, Question shapes, Page types, Owner. State expertise and intent, not procedure: what the wiki is for, what deserves attention and what does not, who the people are, what questions an agent will bring, and which page types to keep (a short bulleted list of type names with one line each). Keep it to the owner's intent; do not invent facts about people. If the owner is not named, write: Unassigned. Write only lens.md."]
 
     lens_check [shape=parallelogram, max_retries=0,
-        tool_command="\"$py\" -m wiki_weaver.steps lens_check"]
+        tool_command="\"$PY\" -m wiki_weaver.steps lens_check", tool_env="py"]
 
     stop [shape=parallelogram, max_retries=0,
         tool_command="echo 'init: lens.md could not be produced; see the run logs' >&2; exit 1"]

@@ -143,6 +143,20 @@ def commit_pending(corpus: Path, message: str) -> None:
 def cmd_init(a: argparse.Namespace) -> int:
     corpus = Path(a.wiki_dir).expanduser().resolve()
     corpus.mkdir(parents=True, exist_ok=True)
+    lock = pidlock.lock_path(corpus)
+    if not pidlock.acquire(lock):
+        print(
+            f"wiki-weaver: another run holds {corpus} (PID {pidlock.holder(lock)}); skipping",
+            file=sys.stderr,
+        )
+        return rs.EXIT_LOCKED
+    try:
+        return _init_locked(corpus, a)
+    finally:
+        pidlock.release(lock)
+
+
+def _init_locked(corpus: Path, a: argparse.Namespace) -> int:
     scaffold(corpus)
     if lens_path(corpus).exists():
         print(f"wiki-weaver: {corpus} already initialized; lens.md kept as is")
@@ -266,6 +280,11 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             text=True,
             check=False,
         )
+        if rec.returncode != 0:
+            tail = (rec.stderr.strip().splitlines() or ["no output"])[-1]
+            errored.append({"reason": f"recover failed (exit {rec.returncode}): {tail}"})
+            print(f"wiki-weaver: recover failed; not starting: {tail}", file=sys.stderr)
+            return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
         if rec.stdout.strip().endswith("recovered"):
             print(f"wiki-weaver: {rec.stderr.strip()}", file=sys.stderr)
         scaffold(corpus)

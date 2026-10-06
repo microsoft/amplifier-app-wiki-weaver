@@ -105,23 +105,29 @@ def test_exit_nothing_to_do_writes_one_result(tmp_path: Path):
     assert len(results) == 1
     data = json.loads(results[0].read_text())
     assert data["verdict"] == "empty" and data["status"] == "final"
-    assert not pidlock.lock_path(w).exists()
+    assert not pidlock.is_held(pidlock.lock_path(w))
 
 
 def test_exit_75_when_locked_and_lock_released(tmp_path: Path):
     w = _wiki(tmp_path)
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    hold = (
+        "import sys, time; from pathlib import Path; from wiki_weaver import pidlock;"
+        "print(pidlock.acquire(Path(sys.argv[1])), flush=True); time.sleep(30)"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", hold, str(pidlock.lock_path(w))], stdout=subprocess.PIPE, text=True
+    )
     try:
-        pidlock.lock_path(w).write_text(str(holder.pid))
+        assert holder.stdout.readline().strip() == "True"
         assert ww("ingest", "--wiki", str(w)).returncode == 75
-        assert pidlock.lock_path(w).read_text() == str(holder.pid)  # not stolen
+        assert pidlock.holder(pidlock.lock_path(w)) == holder.pid  # not stolen
     finally:
         holder.kill()
         holder.wait()
-    # a dead holder's lock is stale and reclaimed
+    # a dead holder's lock is released by the OS
     env = {**os.environ, "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", "x")}
     assert ww("ingest", "--wiki", str(w), env=env).returncode == 3
-    assert not pidlock.lock_path(w).exists()
+    assert not pidlock.is_held(pidlock.lock_path(w))
 
 
 def test_preflight_failure_is_exit_1_with_result(tmp_path: Path):

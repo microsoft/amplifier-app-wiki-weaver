@@ -13,7 +13,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from .lib import MAX_SOURCE_CHARS, wiki_inbox, wiki_ledger
+from .lib import MAX_SOURCE_CHARS, atomic_append_line, wiki_inbox, wiki_ledger
 from .sources import read_text, sha256_file, source_meta
 
 V1_KEYS = (
@@ -115,10 +115,7 @@ def make_row(
 
 
 def append_row(wiki: Path, row: dict) -> None:
-    p = wiki_ledger(wiki)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    atomic_append_line(wiki_ledger(wiki), json.dumps(row, ensure_ascii=False))
 
 
 def eligible(wiki: Path) -> list[Path]:

@@ -21,6 +21,7 @@ CURRENT_STATE_RE = re.compile(r"^##\s+current state\b", re.IGNORECASE)
 MD_LINK_RE = re.compile(r"\[[^\]\n]*\]\((<[^>\n]+>|[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 WIKILINK_RE = re.compile(r"\[\[([^\]|\n]+)(?:\|[^\]\n]*)?\]\]")
 MARKER_RE = re.compile(r"<!--\s*superseded:\s*\d{4}-\d{2}-\d{2}\s*-->")
+CLOSE_RE = re.compile(r"<!--\s*/superseded\s*-->")
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.+?)\s*#*\s*$")
 REQUIRED_FM = ("title", "type", "sources", "last_updated")
 LOSS_THRESHOLD = 0.15
@@ -43,7 +44,7 @@ def _body_lines(text: str) -> list[str]:
     _, body = split_frontmatter(text)
     out = []
     for line in _without_current_state(body).splitlines():
-        s = normalize_ws(MARKER_RE.sub("", line))
+        s = normalize_ws(CLOSE_RE.sub("", MARKER_RE.sub("", line)))
         if s:
             out.append(s)
     return out
@@ -55,7 +56,7 @@ def _headings(text: str, level: int | None = None, skip_current: bool = False) -
         body = _without_current_state(body)
     hs = []
     for line in body.splitlines():
-        m = HEADING_RE.match(line.strip())
+        m = HEADING_RE.match(CLOSE_RE.sub("", MARKER_RE.sub("", line)).strip())
         if m and (level is None or len(m.group(1)) == level):
             hs.append(normalize_ws(m.group(2)).lower())
     return hs
@@ -102,7 +103,48 @@ def check_citations(name: str, text: str, sources: dict[int, tuple[str, str]]) -
     for m in BARE_CITE_RE.finditer(body):
         if int(m.group(1)) in sources:
             errs.append(f"{name}: citation without a quote: [s{m.group(1)}]")
+        else:
+            errs.append(f"{name}: cites unknown source [s{m.group(1)}]")
     return errs
+
+
+def superseded_spans(body: str) -> list[tuple[int, int]]:
+    """Character spans of superseded text: `<!-- superseded: DATE -->` up to the next
+    `<!-- /superseded -->`; a marker with no closing tag (the legacy line form) runs to the
+    end of its line."""
+    spans = []
+    pos = 0
+    while (m := MARKER_RE.search(body, pos)) is not None:
+        close = CLOSE_RE.search(body, m.end())
+        nxt = MARKER_RE.search(body, m.end())
+        if close and (nxt is None or close.start() < nxt.start()):
+            end = close.end()
+        else:
+            eol = body.find("\n", m.end())
+            end = len(body) if eol < 0 else eol
+        spans.append((m.start(), end))
+        pos = end
+    return spans
+
+
+def check_superseded_blocks(name: str, text: str, current_id: int | None) -> list[str]:
+    """A superseded block holds only text that is no longer true, so it may not cite the
+    source being ingested now: the replacement goes outside the block."""
+    if current_id is None:
+        return []
+    _, body = split_frontmatter(text)
+    for a, b in superseded_spans(body):
+        span = body[a:b]
+        ids = {int(m.group(1)) for m in CITE_RE.finditer(span)}
+        ids |= {int(m.group(1)) for m in BARE_CITE_RE.finditer(span)}
+        if current_id in ids:
+            snippet = normalize_ws(span)[:100]
+            msg = (
+                f"{name}: superseded block cites the current source s{current_id}; the marker "
+                f"wraps only the text that is no longer true: {snippet}"
+            )
+            return [msg]
+    return []
 
 
 def check_links(name: str, text: str, wiki: Path) -> list[str]:
@@ -145,9 +187,23 @@ def check_current_state(name: str, text: str) -> list[str]:
     return errs
 
 
+def _heading_marked_nearby(h: str, after: str) -> bool:
+    """A removed heading passes only if its text survives on a line that carries a
+    superseded marker or sits next to one."""
+    _, body = split_frontmatter(after)
+    lines = body.splitlines()
+    marked = [bool(MARKER_RE.search(ln) or CLOSE_RE.search(ln)) for ln in lines]
+    for i, ln in enumerate(lines):
+        text = normalize_ws(CLOSE_RE.sub("", MARKER_RE.sub("", ln))).lstrip("#").strip().lower()
+        if h and h in text and any(marked[j] for j in range(max(0, i - 1), min(len(lines), i + 2))):
+            return True
+    return False
+
+
 def check_content_loss(name: str, before: str, after: str) -> list[str]:
-    """A rewritten page that drops >15% of its lines, or any heading, needs a new
-    superseded marker; otherwise it fails."""
+    """A rewritten page may not drop >15% of its lines (superseded text stays on the page,
+    so marked lines are not deletions), nor a heading unless a superseded marker sits on or
+    next to the line that keeps its text. `## Current state` is outside both rules."""
     b, a = _body_lines(before), _body_lines(after)
     if not b:
         return []
@@ -156,15 +212,12 @@ def check_content_loss(name: str, before: str, after: str) -> list[str]:
     lost_heads = sorted(
         set(_headings(before, skip_current=True)) - set(_headings(after, skip_current=True))
     )
-    new_markers = len(MARKER_RE.findall(after)) > len(MARKER_RE.findall(before))
     errs = []
-    if (frac > LOSS_THRESHOLD or lost_heads) and not new_markers:
-        if frac > LOSS_THRESHOLD:
-            errs.append(
-                f"{name}: lost {lost}/{len(b)} lines ({frac:.0%}) without a superseded marker"
-            )
-        for h in lost_heads:
-            errs.append(f"{name}: heading '{h}' removed without a superseded marker")
+    if frac > LOSS_THRESHOLD:
+        errs.append(f"{name}: lost {lost}/{len(b)} lines ({frac:.0%}); superseded text must stay")
+    for h in lost_heads:
+        if not _heading_marked_nearby(h, after):
+            errs.append(f"{name}: heading '{h}' removed without an adjacent superseded marker")
     return errs
 
 
@@ -177,7 +230,10 @@ CHECK_KINDS = (
     ("citation without a quote", "citations"),
     ("broken link", "links"),
     ("broken wikilink", "links"),
-    ("without a superseded marker", "content_loss"),
+    ("superseded text must stay", "content_loss"),
+    ("without an adjacent superseded marker", "content_loss"),
+    ("page deleted", "content_loss"),
+    ("superseded block cites the current source", "superseded_current"),
     ("duplicate ## heading", "duplicate_headings"),
     ("current state heading must read", "current_state"),
     ("current state is not the first", "current_state"),
@@ -199,11 +255,15 @@ def run_page_checks(
     pages: list[str],
     before_dir: Path,
     sources: dict[int, tuple[str, str]],
+    current_id: int | None = None,
 ) -> list[str]:
     errs: list[str] = []
     for name in pages:
         p = wiki / name
+        prior = before_dir / name
         if not p.exists():
+            if prior.exists():
+                errs.append(f"{name}: page deleted")
             continue
         text = read_text(p)
         errs += check_frontmatter(name, text)
@@ -211,7 +271,7 @@ def run_page_checks(
         errs += check_citations(name, text, sources)
         errs += check_links(name, text, wiki)
         errs += check_current_state(name, text)
-        prior = before_dir / name
+        errs += check_superseded_blocks(name, text, current_id)
         if prior.exists():
             errs += check_content_loss(name, read_text(prior), text)
     return errs

@@ -16,7 +16,9 @@ Summaries are pointers, not testimony.
 - For a specific date, number, name or commitment, follow the citation to the source and
   read the surrounding passage before you state it.
 
-Text marked `<!-- superseded: YYYY-MM-DD -->` was true earlier and has since changed; the
-page says what replaced it. Do not report superseded text as current.
+Text between `<!-- superseded: YYYY-MM-DD -->` and `<!-- /superseded -->` was true
+earlier and has since changed; what replaced it is written outside the block. Do not report
+superseded text as current. (Older pages may carry the opening marker alone; it then covers
+the rest of that line.)
 
 If no page covers the question, say so rather than guessing.

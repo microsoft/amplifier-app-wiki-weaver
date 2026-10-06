@@ -119,3 +119,29 @@ that's a signal.
 - OPEN: the heading-prefix match catches a source summary headed
   `## Current state, as Manoj described it (2026-05-15)`; `lint` reports it. Harmless
   until that summary is rewritten.
+
+## 2026-10-06 — Stage 1, Phase A (correctness; e01 stopped after E04)
+
+- Superseded text is a block, `<!-- superseded: DATE -->` … `<!-- /superseded -->`,
+  wrapping only what is no longer true; the replacement sits outside it. A check fails a
+  block that cites the source being ingested. A lone legacy marker covers the rest of
+  its line.
+- Loss guard: no marker exemption for the 15% rule (superseded text stays, so it is not a
+  deletion); a removed heading passes only if its text survives on or next to a marker
+  line; deleting a tracked selected page fails.
+- Source bookkeeping copies first, records and commits, and removes the inbox copy last.
+  Recovery restores every uncommitted path from HEAD (not the index), keyed on
+  `.wiki/work/current.json` or `.wiki/work/inflight`; it drops an inbox copy only when an
+  identical copy is committed in `_sources/`. A failed recovery stops the run (exit 1).
+- Graph parameters reach steps as environment variables (`tool_env`), never as shell
+  text.
+- The run lock is an `flock` on `.wiki/ingest.lock`, held by the open descriptor; the PID
+  in the file is for messages only. Chosen over write-PID-atomically because PID-based
+  stale reclaim still races (two reclaimers can each delete the other's fresh lock);
+  the kernel releases a dead holder's lock. `init` takes the same lock.
+- A failed index step routes to `index_restore`: index.md and log.md back to HEAD, page
+  commits kept, run exits 1.
+- `--source` on a held file commits the move back to `_inbox/` before the write, so the
+  scope check sees only the writer's changes.
+- Every `[s<id>]`, quoted or bare, must resolve through the ledger.
+- current.json, ledger rows and batch JSONL are written via temp file + `os.replace`.

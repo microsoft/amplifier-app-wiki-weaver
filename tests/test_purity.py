@@ -45,7 +45,8 @@ BANNED_IMPORTS = {
     "amplifier_module_loop_pipeline",
     "amplifier_agent_lib",
 }
-STEP_CMD = re.compile(r'^"\$py" -m wiki_weaver\.steps [a-z_]+( "\$[a-z_]+")*$')
+# parameters travel by environment (tool_env), never interpolated into shell text
+STEP_CMD = re.compile(r'^"\$PY" -m wiki_weaver\.steps [a-z_]+$')
 ECHO_EXIT = re.compile(r"^echo '[^']*' >&2; exit 1$")
 MODEL_WORDS = re.compile(
     r"dot-runner|amplifier|claude|anthropic|openai|gpt|gemini|llm|ollama|curl|wget|http",

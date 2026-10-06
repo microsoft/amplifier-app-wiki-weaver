@@ -90,3 +90,32 @@ def page_files(wiki: Path) -> list[Path]:
     return sorted(
         p for p in Path(wiki).glob("*.md") if p.is_file() and p.name not in NON_PAGE_FILES
     )
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write via a temp file in the same directory and os.replace, so a reader or a crash
+    never sees a half-written file."""
+    import os
+    import tempfile
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def atomic_append_line(path: Path, line: str) -> None:
+    """Append one line by rewriting the file atomically (ledger and batch JSONL are small)."""
+    path = Path(path)
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    if old and not old.endswith("\n"):
+        old += "\n"
+    atomic_write_text(path, old + line.rstrip("\n") + "\n")
