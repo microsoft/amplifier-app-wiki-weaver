@@ -151,3 +151,30 @@
     **Fix.** Prior versions retained at `.wiki/source-versions/s<id>.md` so the old id still
     resolves.
     **Status.** Applied (d9a8b6d). Writer input for that source was 112 K characters.
+
+    ### `## Current state` became a second journal, mid-page — 2026-10-06
+    **Problem.** The lens asks for a `## Current state (as of <date>)` section at the top,
+    rewritten each pass. The writer adds it, but integrates into it like any other section
+    and places it where the page already was.
+    **How it showed.** After E03, 18 of 67 topic pages have the section (only pages touched
+    since the lens change). On team-pulse, brian and evaluation it sits at line 55, 75 and
+    48, not at the top. In 11 of the 18 it holds bullets named for a meeting — "Update from
+    the Resolve team meeting recording of 2026-06-09 …" (7 on team-pulse, 6 on resolve) —
+    which is the dated-record pattern the lens says to avoid. resolve.md's heading has no
+    `(as of <date>)`. Median section length 11 lines; the longest topic pages kept growing
+    (brian 68 `##` sections, team-pulse 56, resolve 54).
+    **Fix.** None yet. The one writer line ("the one section you may rewrite") reads as
+    permission, not as an instruction to replace it. Candidates: state it as "replace the
+    whole section each pass; put it first"; or a deterministic check that the section is
+    the first `##` and has no meeting-named bullets.
+    **Status.** OPEN — owner's call before E04.
+
+    ### Writer input reached a million characters — 2026-10-06
+    **Problem.** The writer gets each selected page whole. With no source cap and pages that
+    only grow, the input per source grows with the wiki.
+    **How it showed.** E03 writer input: median 616,917 characters, max 1,006,773, min
+    45,654 (personal corpus: median 61 K). The five largest pages are 118–178 KB each
+    (brian 177,757 bytes, 1,015 live sentences). Wall time per source did not follow
+    (median 196s E01 → 243s E02 → 255s E03; max 443s).
+    **Fix.** None (NOT YET: no splitting, no history files). Measured every report.
+    **Status.** Watching. E04 shows whether wall time starts to track input size.

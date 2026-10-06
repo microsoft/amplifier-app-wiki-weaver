@@ -113,3 +113,14 @@ that's a signal.
 - Citation check's 5-word minimum kept through E03 so the density change is the only
   variable. All 23 misses so far (12 CP3, 11 personal) were short quotes, verbatim in the
   source; zero not-found. Short-quote findings are now counted as their own kind.
+
+## 2026-10-06 — Stage 1, CP4 (E03 into e01)
+
+- E03 ran with no code change after 427d3d4: 33/33 converged, 0 held, 0 model-step
+  timeouts, 1 first write failed (3 short quotes, fixed on rewrite). The 5-word minimum
+  stays; next decision after E04 numbers.
+- REVISIT: writer input is now a median 617 K and a max 1.0 M characters per source (the
+  whole of each selected page is handed over). Wall time stayed flat (median 255s vs 243s
+  in E02), so this is a cost and context-headroom question before it is a time one.
+- OPEN: `## Current state` is not behaving as a rewritten summary — see LEARNINGS
+  2026-10-06. No change made; the owner decides between a writer-prompt fix and a check.
