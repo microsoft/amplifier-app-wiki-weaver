@@ -16,6 +16,7 @@ under a resolver, as a folder on disk locally — under the names callers alread
 _inbox/                      pending sources (markdown, frontmatter optional)
 _sources/<name>              retained raw source; appearing here = ingested
 .wiki/failed/<name>          held source; reason in the ledger
+.wiki/source-versions/s<id>.md   prior text of an edited source; old citations resolve here
 .wiki/.processed.jsonl       ledger, one JSON object per line
 .wiki/runs/ingest-<ts>/result.json    outcome of one run (does not travel)
 lens.md   lens/corrections/   feedback/log.jsonl
@@ -60,8 +61,8 @@ each part means, so any caller can swap the engine underneath without noticing.
    ingested, what changed, and what was skipped and why.
 9. **Upstream-app policy at `.wiki/policy/schema.md` or `policy/schema.md` is read if
    present** and folded into the lens, so an upstream app's page types reach the writer.
-10. **Pages, `_sources/`, the ledger, `.wiki/failed/`, the lens, corrections and
-    feedback round-trip; `.wiki/runs`, `.wiki/snapshots` and every `.git` do not.**
+10. **Pages, `_sources/`, the ledger, `.wiki/failed/`, `.wiki/source-versions/`, the lens,
+    corrections and feedback round-trip; `.wiki/runs`, `.wiki/snapshots` and every `.git` do not.**
     The corpus may carry its own git for page history, but that history does not
     survive Resolve; `init` re-initializes git when `.git` is absent.
 
@@ -84,6 +85,8 @@ each part means, so any caller can swap the engine underneath without noticing.
   boolean `converged`; the one-fixture ingest leaves a line with `converged` true.
 - Re-ingesting an edited file under the same name adds a ledger line with a new `hash`.
 - A fixture forced to hold lands in `.wiki/failed/<name>` with a non-empty `reason`.
+- That file, moved back into `_inbox/`, is ingested on the next run (anything not
+  converged is eligible).
 - A clean one-fixture ingest yields `total == converged == 1` and `counts.failed ==
   counts.blocked == counts.errored == 0` in the newest `result.json`.
 - `lens.md` and `index.md` exist at the root; every page other than `index.md` and

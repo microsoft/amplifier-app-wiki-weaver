@@ -70,49 +70,27 @@ that's a signal.
   it did not arise. Interim: `lint` catches it. REVISIT: on re-ingest of a changed source,
   auto-select every page that cites it.
 - Re-ingest of a changed source (option C): the writer is told the source changed, gets a
-      unified diff of old vs new in its context, and every page citing the source is added to
-      its selection. Stale quotes are marked superseded, not deleted. All in tool-node glue —
-      no new nodes, edges, model calls or checks. REVISIT: superseded-vs-delete when the
-      source itself was corrected (a fixed typo shouldn't be preserved as history); decide
-      with consolidation. The loss guard stays unaware of re-ingests on purpose.
+  unified diff of old vs new in its context, and every page citing the source is added to
+  its selection. Stale quotes are marked superseded, not deleted. All in tool-node glue —
+  no new nodes, edges, model calls or checks. REVISIT: superseded-vs-delete when the
+  source itself was corrected (a fixed typo shouldn't be preserved as history); decide
+  with consolidation. The loss guard stays unaware of re-ingests on purpose.
 
-## 2026-10-05 — Stage 1, CP4 (personal; before E03)
+## 2026-10-05 — Stage 1, CP4 step 1 (personal corpus)
 
-- Citations are `[s<source_id>: "quote"]`; the check resolves the id through the ledger to
-  one exact source version. The check's logic is unchanged.
-- Earlier versions of an edited source are kept at `.wiki/source-versions/s<id>.md`, so a
-  superseded `[s<old>: ...]` still resolves. Reason: the id names a version (hash-based,
-  as in V1); without the old text every superseded quote would fail the check. Kept: state
-  a later run needs, outside the resolver's exclusions; owner adds it to the corpus
-  contract on v4.
-- e01 transformed by the ledger map: 6,609 citations, 0 unknown filenames, `lint` 0
-  errors. Five largest pages −29% bytes; citation share 51–55% → 32–37%.
-- Changed source: every page citing any version of it joins the writer's selection, on
-  top of the brief's ≤8 slugs.
-- Superseded-marker date, stated in the writer prompt: a position that changes in a source
-  carries the source's date; a source file that is itself edited carries the ingest date
-  (given in the assembled context).
-- `## Current state` heading (matched on the heading prefix) is outside the heading-loss
-  rule as well as the 15% rule.
-  Reason: its `(as of <date>)` changes every pass, so keeping it in the heading rule would
-  fail every rewrite. All other headings are guarded as before.
-- `wiki-weaver lint --wiki` added: the per-write checks over every page and index.md. No
-  model.
-- Every box node has a timeout (brief 900s, write 2400s, index 1800s; ask and init 900s);
-  a timeout is a FAIL and ingest routes it to hold. REVISIT: if a legitimate write nears
-  2400s (E02 max was 422s).
-- Ingest starts with `recover`: if a source was in flight, its uncommitted edits are
-  reverted before the pre-run snapshot. Reason: the snapshot would otherwise commit a dead
-  writer's half-page as the owner's edit.
-- A held source dropped back into _inbox/ is retried (V1: failed rows never count as
-  processed). Eligibility excludes converged content only.
-- Personal corpus: ~/.lifeos/memory/**/*.md flattened into _inbox/ with "/" → " - "
-  (two files were both named _index.md).
-- The three team questions are asked on e01 after each epoch, not on personal.
-- tools/measure.py produces checkpoint measurements; repo-only, not in the package.
-- Citation check's 5-word minimum kept through E03 so the density change is the only
-  variable. All 23 misses so far (12 CP3, 11 personal) were short quotes, verbatim in the
-  source; zero not-found. Short-quote findings are now counted as their own kind.
+- Prior versions of edited sources kept at `.wiki/source-versions/s<id>.md` so old
+  citations still resolve. Travels with the corpus. (corpus-package layout, clause 10)
+- Superseded-marker date: a position that changes in a source carries the source's date; a
+  source file that is itself edited carries the ingest date — the closest honest proxy.
+- `## Current state` is exempt from the heading-loss rule, matched on the prefix; its
+  `(as of <date>)` suffix changes every pass.
+- Citation 5-word minimum held through E03 so the density change is the only variable;
+  short-quote failures counted separately. REVISIT after E03: lower to three, or drop.
+- Model-step timeouts: brief 900 s · write 2400 s · index 1800 s · ask/init 900 s.
+  Ingest undoes any half-written source before starting.
+- Retry eligibility: anything not converged is eligible, as in V1 — RepoWeaver's retry
+  path depends on it.
+- The three ask questions run on the team corpus after E03, not on personal.
 
 ## 2026-10-06 — Stage 1, CP4 (E03 into e01)
 
