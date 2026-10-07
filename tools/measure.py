@@ -1,6 +1,9 @@
 """Report measurements for a corpus. Deterministic; reads files only. Not part of the package.
 
-    python tools/measure.py <corpus> [--asks N]   (N = how many latest ask runs to include)
+    python tools/measure.py <corpus> [--asks N] [--run RUN_ID] [--topics] [--markers]
+      --asks N     include the N latest ask runs (pages used, chars read per question)
+      --run ID     Current state metrics for the pages that run touched
+      --markers    a seeded 30-marker superseded sample with heuristic verdicts
 
 Definitions
 - sentences: body lines minus headings and citations, split on . ! ? ; fragments of 3+ words.
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import random
 import re
 import statistics
 import sys
@@ -23,10 +27,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from wiki_weaver.checks import CITE_RE, MARKER_RE
+from wiki_weaver.checks import CITE_RE, MARKER_RE, superseded_spans
 from wiki_weaver.ledger import read_rows
+from wiki_weaver.lens import page_type_for, parse_page_types
 from wiki_weaver.lib import page_files
-from wiki_weaver.sources import read_text, split_frontmatter
+from wiki_weaver.sources import normalize_ws, read_text, split_frontmatter
 
 OLD_CITE_RE = re.compile(r'\[([^\[\]\n]+?\.md): "([^"\n]+)"\]')
 DATE_PAREN = re.compile(r"\([^)]*\d{4}-\d{2}-\d{2}[^)]*\)")
@@ -100,16 +105,20 @@ def current_state_metrics(text: str) -> dict | None:
             lines.append(ln)
     if not found:
         return None
-    src_bullets = 0
+    src_bullets = src_prose = 0
     for ln in lines:
         m = re.match(r"^\s*([-*]|\d+\.)\s+(.*)", ln)
         if not m:
+            # a prose paragraph line: does its opener name a source?
+            opener = re.sub(r"[*_]", "", ln.strip())[:80]
+            if not ln.startswith((" ", "\t")) and SOURCE_WORDS.search(opener):
+                src_prose += 1
             continue
         lead = re.sub(r"[*_]", "", m.group(2))
         lead = lead.split(":", 1)[0][:80] if ":" in lead[:80] else lead[:80]
         if SOURCE_WORDS.search(lead):
             src_bullets += 1
-    return {"lines": len(lines), "source_bullets": src_bullets}
+    return {"lines": len(lines), "source_bullets": src_bullets, "source_prose": src_prose}
 
 
 def _dist(xs: list[int]) -> dict:
@@ -122,6 +131,47 @@ def _dist(xs: list[int]) -> dict:
         "max": max(xs),
         "zero": sum(1 for x in xs if x == 0),
     }
+
+
+def heading_fit(text: str, types: dict) -> dict | None:
+    """## headings on a page against the lens's set for its type."""
+    fm, body = split_frontmatter(text)
+    pt = page_type_for(types, (fm or {}).get("type"))
+    h2 = [ln[3:].strip() for ln in body.splitlines() if ln.startswith("## ")]
+    if pt is None or not pt.heading_rule():
+        return {"type": (fm or {}).get("type"), "h2": len(h2), "in_set": None, "off_set": None}
+    cs = [h for h in h2 if re.match(r"current state\b", h, re.IGNORECASE)]
+    ins = [h for h in h2 if pt.allows(h)]
+    return {
+        "type": pt.name,
+        "h2": len(h2),
+        "in_set": len(ins),
+        "current_state": len(cs),
+        "off_set": len(h2) - len(ins) - len(cs),
+    }
+
+
+SUSPECT = re.compile(
+    r"\b(now|overtaken|replaced|updated|instead|later|since then|as of)\b", re.IGNORECASE
+)
+
+
+def marker_sample(w: Path, pages: list[Path], n: int = 30) -> list[dict]:
+    """A seeded sample of superseded spans with a heuristic verdict: 'suspect' when the
+    wrapped text reads like the replacement (now, overtaken, replaced, ...). Heuristic
+    only: a reader confirms each verdict."""
+    spans = []
+    for p in pages:
+        if p.name.startswith("source-"):
+            continue
+        _, body = split_frontmatter(read_text(p))
+        for a, b in superseded_spans(body):
+            spans.append((p.name, normalize_ws(body[a:b])[:240]))
+    pick = random.Random(0).sample(spans, min(n, len(spans)))
+    return [
+        {"page": pg, "text": t, "verdict": "suspect" if SUSPECT.search(t) else "plausible"}
+        for pg, t in pick
+    ]
 
 
 def ask_stats(ask_dir: Path) -> dict:
@@ -164,6 +214,8 @@ def main() -> None:
     for n in largest:
         t = read_text(w / n)
         live, sup = sentence_split(t)
+        n_cites = len(CITE_RE.findall(t)) + len(OLD_CITE_RE.findall(t))
+        body_lines = [x for x in split_frontmatter(t)[1].splitlines() if x.strip()]
         cite_bytes = sum(len(m.group(0).encode()) for m in CITE_RE.finditer(t))
         cite_bytes += sum(len(m.group(0).encode()) for m in OLD_CITE_RE.finditer(t))
         big.append(
@@ -173,6 +225,7 @@ def main() -> None:
                 "sentences_live": live,
                 "sentences_superseded": sup,
                 "citation_share": round(cite_bytes / max(sizes[n], 1), 3),
+                "citations_per_line": round(n_cites / max(len(body_lines), 1), 2),
             }
         )
     topics = {p.name: topic_stats(read_text(p)) for p in pages if not p.name.startswith("source-")}
@@ -221,6 +274,12 @@ def main() -> None:
             if (w / n).exists() and not n.startswith("source-"):
                 m = current_state_metrics(read_text(w / n))
                 touched_cs[n] = m
+    lens = w / "lens.md"
+    types = parse_page_types(read_text(lens)) if lens.exists() else {}
+    fit = {
+        p.name: heading_fit(read_text(p), types) for p in pages if not p.name.startswith("source-")
+    }
+    ruled = [v for v in fit.values() if v and v["in_set"] is not None]
     idx = w / "index.md"
     asks = sorted((w / ".wiki" / "ask").glob("*"))[-n_asks:] if n_asks else []
     report = {
@@ -248,9 +307,18 @@ def main() -> None:
             "with_section": sum(1 for v in touched_cs.values() if v),
             "lines": _dist([v["lines"] for v in touched_cs.values() if v]),
             "source_bullets": _dist([v["source_bullets"] for v in touched_cs.values() if v]),
+            "source_prose": _dist([v["source_prose"] for v in touched_cs.values() if v]),
             "pages": touched_cs if "--topics" in sys.argv else None,
         },
     }
+    report["headings_vs_lens"] = {
+        "pages_with_a_set": len(ruled),
+        "h2": _dist([v["h2"] for v in ruled]),
+        "off_set": _dist([v["off_set"] for v in ruled]),
+        "pages": fit if "--topics" in sys.argv else None,
+    }
+    if "--markers" in sys.argv:
+        report["superseded_sample"] = marker_sample(w, pages)
     if "--topics" in sys.argv:
         report["topics"] = topics
     print(json.dumps(report, indent=1))
