@@ -92,3 +92,61 @@ that's a signal.
   path depends on it.
 - The three ask questions run on the team corpus after E03, not on personal.
 
+
+## 2026-10-06 — Stage 1, after E04 (two audits)
+
+- Stop e01 after E04; no E05–E07 on it. Stage 1 completes on a fresh corpus built under
+  the final design; e01 is kept as the before-artifact. Reason: a wiki built under three
+  rule sets is not a clean rehearsal; a fresh start removes the consolidation pass and the
+  backfill.
+- Sections become the writer's and the reader's unit of work: Current state + the named
+  aspect sections + a heading outline, never the whole page. Reason: E04 writer input
+  median 825K chars, max 1.51M, +55%/epoch — overflows the window by E06–E07. R11's own
+  lever: less read per pass.
+- Aspect sections per page type, named in the lens (Team Pulse initiatives: Owners ·
+  Commitments · Blockers · Decisions · Open questions; a heading pattern for chronological
+  types); the writer adds dated entries inside, newest first, and never adds a `##`; a
+  deterministic check holds the heading set; source pages exempt. Reason: 637 of 1,252
+  topic-page headings (51%) were meeting-named. Not in PLAN.md as written — §5 updated.
+- The brief names, per selected page, the aspect sections the source adds to. Reason:
+  principle 2, and the extraction step needs to know what to pull.
+- Superseded marker becomes a delimited block; a block may not cite the current source.
+  Reason: 20–35% of markers wrapped the new text.
+- Current state: universal by default; the lens opts decisions out; source pages exempt.
+  `(as of)` = the latest source date on the page. Reason: 20 source pages and 12 of 43
+  decision pages had one; headings said 2026-10-06 over June content.
+- Citation density held at ~69% of body lines; measured for drift, not acted on. Reason:
+  76% → 69% after the specific-claims rule; the content is mostly specific claims.
+- Source-page links dropped from citations; index source entries carry the `s<id>`.
+- Principle-8 exception, recorded: mechanics identical for every lens live in the writer
+  prompt — how the roll-up is treated, how supersession is marked, returning changed
+  sections. What matters and what pages look like live in the lens. Test: would the
+  sentence differ per corpus?
+- §9 person-page attribution: covered by the lens line ("only as the sources state them")
+  and the citation check; no separate rule.
+- Page growth is bounded by readability (Current state + aspects) and cost (sections);
+  splitting is deferred until sections themselves grow. Reason: superseded share is 2–5% —
+  these are live pages, not history bloat.
+- §6 done-when "evaluation baseline recorded" → "measurements recorded," per the 9/30
+  decision to dial evals down; resolves the §6/§7 contradiction.
+- Grep comparison for R10: after Stage 1 closes, not in the critical path.
+- Phase order: A correctness, test-first → independent verification → B shape and section
+  design → fresh run (E01, stop and inspect, then E02–E07). Same builder for A; the audit
+  session verifies.
+
+## 2026-10-07 — Stage 1, Phase A and its verification
+
+- The ingest lock is a kernel flock on `.wiki/ingest.lock`, held by the CLI process for the
+  whole run; `init` takes the same lock. The builder's call over the prescribed atomic PID
+  write, accepted: an atomic PID still races on stale reclaim; the kernel releases on holder
+  death. Contention exits 75.
+- Tool nodes never interpolate data into shell text: every one runs `"$PY" -m
+  wiki_weaver.steps <step>` with parameters as environment variables, and the purity test
+  enforces that form.
+- Recovery rollback is scoped to the in-flight operation's journaled paths — the source, its
+  selected pages, its bookkeeping. Unrelated uncommitted changes are reported, never touched.
+  `init` runs recovery before it commits anything; the index phase is journaled. (Phase A.2)
+- Every corpus-derived read in `ask` goes through one contained-read that rejects paths
+  resolving outside the corpus root. (Phase A.2)
+- Independent verification is a cross-provider code reviewer with clean context, run after
+  every correctness phase; its verdict gates the next phase. Phase A → NOT SAFE → Phase A.2.
