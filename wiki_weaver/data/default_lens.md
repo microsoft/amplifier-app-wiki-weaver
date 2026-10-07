@@ -17,8 +17,11 @@ Anyone named in the sources. Record who they are and what they work on, as the s
 
 ## Page types
 - topics - one page per recurring subject
+  Current state covers: what it is, where it stands, what is open.
 - people - one page per person who recurs
+  Current state covers: what they work on now, what they have committed to.
 - log - dated pages for events that matter on their own
+  Current state covers: what happened and what came of it.
 
 ## Owner
 Unassigned. Whoever edits this file owns it.
