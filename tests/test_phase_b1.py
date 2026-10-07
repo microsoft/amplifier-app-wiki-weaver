@@ -268,3 +268,23 @@ def test_pages_md_gives_each_page_its_latest_source_date(corpus: Path, tmp_path:
     )
     assert "Current state as of" not in pages.split("## source-")[1].split("\n")[0]
     assert "today:" not in (corpus / ".wiki/work/context.md").read_text()
+
+
+# ------------------------------------------------------------------ B-lean 5: index ids
+
+
+def test_index_manifest_carries_source_ids(corpus: Path, tmp_path: Path):
+    run = tmp_path / "r"
+    assert step(corpus, "select", str(run), "0", "-") == (0, "source")
+    step(corpus, "assemble")
+    fake_brief(corpus, [])
+    step(corpus, "page_select")
+    q = cite(corpus, "The orchard sensor rollout ships on Friday")
+    sid = json.loads((corpus / ".wiki/work/current.json").read_text())["source_id"]
+    (corpus / SUMMARY).write_text(page("O", [ORCHARD], q + "\n"))
+    assert step(corpus, "checks") == (0, "pass")
+    step(corpus, "commit", str(run))
+    assert step(corpus, "index_prep", str(run)) == (0, "index")
+    manifest = (corpus / ".wiki/work/index_input.md").read_text()
+    line = next(x for x in manifest.splitlines() if x.startswith(f"- {SUMMARY}"))
+    assert line.endswith(f"| source id: s{sid}")

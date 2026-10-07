@@ -51,7 +51,7 @@ digraph WikiWeaverIngest {
         tool_command="\"$PY\" -m wiki_weaver.steps index_prep", tool_env="py,run_dir"]
 
     index [shape=box, timeout="1800s", class="strong", fidelity="truncate",
-        prompt="Read .wiki/work/index_input.md: what changed in this run, a manifest of every page in the wiki, and the current index.md. Rewrite index.md so it has exactly one line per page in the manifest, in the form - [title](file.md) · date range · one sentence on what the page holds; group the lines under a ## heading per page type. Keep the lines of unchanged pages as they are; read a new or changed page before writing its sentence. Then append to log.md (create it if missing; never edit earlier entries) one dated entry for this run: what was ingested, which pages changed and how, what was held and why. Touch no other file."]
+        prompt="Read .wiki/work/index_input.md: what changed in this run, a manifest of every page in the wiki, and the current index.md. Rewrite index.md so it has exactly one line per page in the manifest, in the form - [title](file.md) · date range · one sentence on what the page holds; a source page's line also carries its source id from the manifest, as - [title](file.md) · s<id> · date range · one sentence; group the lines under a ## heading per page type. Keep the lines of unchanged pages as they are; read a new or changed page before writing its sentence. Then append to log.md (create it if missing; never edit earlier entries) one dated entry for this run: what was ingested, which pages changed and how, what was held and why. Touch no other file."]
 
     finalize [shape=parallelogram, max_retries=0,
         tool_command="\"$PY\" -m wiki_weaver.steps finalize", tool_env="py"]

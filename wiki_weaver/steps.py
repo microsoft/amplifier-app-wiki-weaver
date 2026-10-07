@@ -810,14 +810,21 @@ def step_index_prep(run_dir: str) -> str:
         line += f" (reason: {r['reason']})" if r.get("reason") else ""
         out.append(line + "\n")
     out.append("\n# Page manifest (every page in the wiki)\n\n")
+    ids: dict[str, int] = {}
+    for r in lg.read_rows(WIKI):
+        if r.get("converged") and isinstance(r.get("source_id"), int):
+            ids[r["source"]] = max(ids.get(r["source"], 0), r["source_id"])
     for p in page_files(WIKI):
         fm = page_frontmatter(p) or {}
         srcs = [s for s in (fm.get("sources") or []) if isinstance(s, str)]
         ds = sorted(d for d in (dates.get(s, "") for s in srcs) if d)
         span = f"{ds[0]}..{ds[-1]}" if ds else "undated"
+        sid = ""
+        if p.name.startswith("source-") and len(srcs) == 1 and srcs[0] in ids:
+            sid = f" | source id: s{ids[srcs[0]]}"
         out.append(
             f"- {p.name} | title: {fm.get('title', '?')} | type: {fm.get('type', '?')} | "
-            f"source dates: {span} | last_updated: {fm.get('last_updated', '?')}\n"
+            f"source dates: {span} | last_updated: {fm.get('last_updated', '?')}{sid}\n"
         )
     idx, log = WIKI / "index.md", WIKI / "log.md"
     out += ["\n# Current index.md\n\n", read_text(idx) if idx.exists() else "(none)\n"]
