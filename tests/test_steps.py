@@ -87,6 +87,7 @@ def test_rewrite_then_hold_reverts(corpus: Path, tmp_path: Path):
     assert step(corpus, "checks") == (0, "rewrite")
     findings = (corpus / ".wiki/work/findings.md").read_text()
     assert "outside the selected pages: lens.md" in findings and "not found verbatim" in findings
+    assert step(corpus, "write_guard") == (0, "ok")  # the graph's path to the rewrite
     assert step(corpus, "checks") == (0, "hold")
     assert step(corpus, "hold", str(run)) == (0, "next")
     assert (corpus / ".wiki/failed" / ORCHARD).exists()

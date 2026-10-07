@@ -556,16 +556,40 @@ def step_page_select() -> str:
     out += ["\n\n# index.md\n\n", read_text(idx) if idx else "(empty)\n"]
     (work / "pages.md").write_text("".join(out))
     (work / "selected.txt").write_text("\n".join(selected) + "\n")
-    chars = sum(len(read_text(work / f)) for f in ("context.md", "pages.md", "brief.md"))
-    cur["writer_input_chars"] = chars
-    limit = int(os.environ.get("WIKI_WEAVER_MAX_WRITER_CHARS") or DEFAULT_MAX_WRITER_CHARS)
-    if chars > limit:
+    if _measure_writer_call(cur) == "oversized":
         # held before the write model call: no page entries, nothing for hold to revert
-        cur.update(stage="oversized-context", hold_reason=f"oversized-context: {chars} chars")
-        save_current(cur)
         return "oversized"
     journal_update(paths=selected)
     cur.update(stage="write", model_calls=cur["model_calls"] + 1, selected=selected)
+    save_current(cur)
+    return "ok"
+
+
+def _measure_writer_call(cur: dict) -> str:
+    """Count what the writer is about to read - brief, context, pages and, on a rewrite,
+    the findings - record it as this call's size, and refuse the call over the limit."""
+    work = wiki_work(WIKI)
+    files = ("context.md", "pages.md", "brief.md", "findings.md")
+    chars = sum(len(read_text(work / f)) for f in files if (work / f).exists())
+    calls = cur.setdefault("writer_chars_per_call", [])
+    calls.append(chars)
+    cur["writer_input_chars"] = max(calls)
+    limit = int(os.environ.get("WIKI_WEAVER_MAX_WRITER_CHARS") or DEFAULT_MAX_WRITER_CHARS)
+    if chars > limit:
+        cur.update(stage="oversized-context", hold_reason=f"oversized-context: {chars} chars")
+        save_current(cur)
+        return "oversized"
+    save_current(cur)
+    return "ok"
+
+
+def step_write_guard() -> str:
+    """Before the rewrite: the same measurement and limit as the first write call."""
+    cur = current()
+    if _measure_writer_call(cur) == "oversized":
+        return "oversized"
+    cur = current()
+    cur.update(stage="write", model_calls=cur["model_calls"] + 1)
     save_current(cur)
     return "ok"
 
@@ -603,9 +627,7 @@ def step_checks() -> str:
         kinds[ck.check_kind(e)] = kinds.get(ck.check_kind(e), 0) + 1
     cur.setdefault("failed_checks", {})[f"write_{cur['attempts']}"] = kinds
     if cur["attempts"] < 2:
-        cur["model_calls"] += 1
-        cur["stage"] = "write"
-        save_current(cur)
+        save_current(cur)  # write_guard measures and counts the rewrite call
         return "rewrite"
     save_current(cur)
     return "hold"
@@ -745,6 +767,7 @@ def step_hold(run_dir: str) -> str:
             model_calls=cur.get("model_calls", 0),
             failed_checks=cur.get("failed_checks", {}),
             writer_input_chars=cur.get("writer_input_chars", 0),
+            writer_chars_per_call=cur.get("writer_chars_per_call", []),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -781,6 +804,7 @@ def step_commit(run_dir: str) -> str:
             model_calls=cur.get("model_calls", 0),
             failed_checks=cur.get("failed_checks", {}),
             writer_input_chars=cur.get("writer_input_chars", 0),
+            writer_chars_per_call=cur.get("writer_chars_per_call", []),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -970,6 +994,7 @@ STEPS = {
     "assemble": step_assemble,
     "page_select": step_page_select,
     "checks": step_checks,
+    "write_guard": step_write_guard,
     "hold": step_hold,
     "recover": step_recover,
     "commit": step_commit,

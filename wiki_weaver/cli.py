@@ -281,6 +281,9 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
                 "pages_created": len({p for p in touched if p not in before_pages}),
                 "model_calls": sum(per_node.values()),
                 "model_calls_by_node": per_node,
+                "writer_chars_max": max(
+                    (c for r in rows for c in r.get("writer_chars_per_call") or []), default=0
+                ),
                 "batches": batches,
                 "max_cycles": a.max_cycles,
                 "limit": a.limit,
