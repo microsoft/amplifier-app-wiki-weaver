@@ -96,3 +96,25 @@ def page_type_for(types: dict[str, PageType], fm_type) -> PageType | None:
     if not isinstance(fm_type, str) or not fm_type.strip():
         return None
     return types.get(type_key(fm_type))
+
+
+def describe(types: dict[str, PageType]) -> list[dict]:
+    """What the parser resolved, per page type: shown at ingest start and in result.json,
+    so the heading rule is seen to be live rather than assumed."""
+    out = []
+    for key, pt in types.items():
+        if pt.sections:
+            rule = "sections: " + " · ".join(pt.sections)
+        elif pt.pattern:
+            rule = f"pattern: {pt.pattern}"
+        else:
+            rule = "no heading rule"
+        out.append(
+            {
+                "type": pt.name,
+                "key": key,
+                "rule": rule,
+                "current_state": "on" if pt.current_state else "opted out",
+            }
+        )
+    return out

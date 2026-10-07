@@ -81,3 +81,30 @@ def test_a_rewrite_under_the_limit_proceeds_and_is_recorded(corpus: Path, tmp_pa
     step(corpus, "commit", str(run))
     row = json.loads((corpus / ".wiki/.processed.jsonl").read_text().splitlines()[-1])
     assert row["writer_input_chars"] == max(row["writer_chars_per_call"])
+
+
+def test_ingest_shows_the_lens_page_types_it_parsed(corpus: Path):
+    for f in (corpus / "_inbox").glob("*.md"):
+        f.unlink()
+    lens = corpus / "lens.md"
+    lens.write_text(
+        lens.read_text().replace(
+            "- topics - one page per recurring subject\n",
+            "- topics - one page per recurring subject\n  Sections: What it is · Open questions\n",
+        )
+    )
+    env = {**os.environ, "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", "x")}
+    r = subprocess.run(
+        [sys.executable, "-m", "wiki_weaver.cli", "ingest", "--wiki", str(corpus)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 3, r.stderr
+    assert "lens page types as parsed" in r.stderr
+    assert "topics: sections: What it is · Open questions; Current state on" in r.stderr
+    res = json.loads(next((corpus / ".wiki/runs").glob("ingest-*/result.json")).read_text())
+    by_type = {t["type"]: t for t in res["lens_page_types"]}
+    assert by_type["topics"]["rule"] == "sections: What it is · Open questions"
+    assert by_type["people"]["rule"] == "no heading rule"

@@ -23,7 +23,9 @@ from . import checks as ck
 from . import result as rs
 from .dashboard import build_dashboard
 from .ledger import eligible, source_versions
+from .lens import describe, parse_page_types
 from .lib import (
+    contained_file,
     feedback_log,
     lens_path,
     page_files,
@@ -259,6 +261,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
     trace: list[dict] = []
     before_pages = {p.name for p in page_files(corpus)}
     batches = 0
+    lens_view: list[dict] = []
 
     def snapshot(status: str) -> dict:
         per_node = {
@@ -281,6 +284,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
                 "pages_created": len({p for p in touched if p not in before_pages}),
                 "model_calls": sum(per_node.values()),
                 "model_calls_by_node": per_node,
+                "lens_page_types": lens_view,
                 "writer_chars_max": max(
                     (c for r in rows for c in r.get("writer_chars_per_call") or []), default=0
                 ),
@@ -311,6 +315,14 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             print(f"wiki-weaver: {msg}", file=sys.stderr)
         scaffold(corpus)
         commit_pending(corpus, "chore: snapshot before ingest")
+        lens_file = contained_file(corpus, "lens.md")
+        lens_view[:] = describe(parse_page_types(lens_file.read_text())) if lens_file else []
+        print("wiki-weaver: lens page types as parsed:", file=sys.stderr)
+        for t in lens_view or [{"type": "(none)", "rule": "-", "current_state": "-"}]:
+            print(
+                f"  {t['type']}: {t['rule']}; Current state {t['current_state']}",
+                file=sys.stderr,
+            )
         only = Path(a.source).name if a.source else None
         if only:
             if not ((wiki_inbox(corpus) / only).exists() or (wiki_failed(corpus) / only).exists()):
