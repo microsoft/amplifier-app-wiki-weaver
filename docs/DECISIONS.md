@@ -174,3 +174,34 @@ that's a signal.
 - full/ staging: E01 only. OPEN: 11 E02 chat slices share a name with an E01 slice once
   `__slice-E0x` is stripped, and their contents are disjoint windows (3–23% shared
   lines); both cannot sit in _inbox/ under one name.
+
+## 2026-10-07 — Stage 1, B-lean.2 (third review: deferred findings)
+
+- Stage 1 precondition: the corpus is one we construct, contains no symlinks, and is not
+  edited while a run is in progress. READING.md and `ingest --help` say so.
+- Every writer call is measured, rewrites included (`write_guard`); the largest call per
+  source is `writer_input_chars`, the run's largest is `writer_chars_max` in result.json.
+- Personal decisions opt out of Current state, as in e01. Both lenses' Current state
+  covers "what this is and who owns it" first.
+- E02 for full/ is staged in `full/_staged-E02/` (11 cumulative chat files - the E01
+  window byte-identical, then the E02 window without its header - plus the 23 other E02
+  files), to move into _inbox/ after the E01 inspection.
+
+Deferred - fix only if it fires during the run (reviewer's file:line against 30c1b15):
+- Headings inside fenced code blocks, and closing-ATX `## X ##`, are judged as newly added
+  headings (checks.py:193-198). Out of scope: the writer emits neither in practice.
+- A declared-but-empty `Sections:` value disables the rule silently (lens.py:33-34). Out
+  of scope: our two lenses declare non-empty sets; the ingest-start printout shows it.
+- Normalized page-type keys can collide (lens.py:55, 78). Out of scope: no collision in
+  either lens; the printout would show one.
+- A malformed lens bullet is slow to parse. Out of scope: the lenses are ours and small.
+
+Stage 2 blockers - removed by the splice milestone, must be fixed before Resolve:
+- The commit-to-marker crash window (steps.py:788-789): a crash after the commit and
+  before `committed` is written leaves an uncommitted-looking journal for a landed commit.
+- Summary-page containment: `_summary_page` reads frontmatter before validation
+  (steps.py:272-276), and page_select includes the summary unconditionally (:528).
+- index.md and log.md are read without containment (steps.py:829-833).
+- Already-staged scratch can enter a snapshot commit (cli.py:152-157).
+Why deferred: each needs a crash, a symlink or a human edit during a run, none of which
+the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
