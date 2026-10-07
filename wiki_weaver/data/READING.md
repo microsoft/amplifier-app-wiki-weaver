@@ -22,3 +22,4 @@ and has since changed; what replaced it sits outside the block. Do not report it
 (An older page may carry the opening marker alone; it covers the rest of that line.)
 
 If no page covers the question, say so rather than guessing.
+Never edit the corpus during an ingest: such an edit looks like writer output and is reverted.

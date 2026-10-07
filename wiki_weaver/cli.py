@@ -518,7 +518,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-sample-inbox", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_init)
 
-    s = sub.add_parser("ingest", help="integrate _inbox/ sources")
+    s = sub.add_parser(
+        "ingest",
+        help="integrate _inbox/ sources",
+        description=(
+            "Integrate _inbox/ sources. Do not modify the corpus while an ingest is running: "
+            "an edit made during a run is indistinguishable from writer output and will be "
+            "reverted."
+        ),
+    )
     s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
     s.add_argument("--source", default=None, help="ingest one source (also retries a held one)")
     s.add_argument(
