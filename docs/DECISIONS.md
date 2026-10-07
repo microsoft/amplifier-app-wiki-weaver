@@ -150,3 +150,34 @@ that's a signal.
   resolving outside the corpus root. (Phase A.2)
 - Independent verification is a cross-provider code reviewer with clean context, run after
   every correctness phase; its verdict gates the next phase. Phase A → NOT SAFE → Phase A.2.
+
+## 2026-10-07 — Stage 1, after the second review
+
+- Second review of A.2 (same reviewer, same repros): the four original findings are fixed;
+  four new ones, two sharing a root cause — model nodes can write files, so "whose change is
+  this" was forensic. Verdict NOT SAFE. No Phase A.3.
+- The small fixes fold into B-lean: hold with no writer baseline reverts nothing (hold reverts
+  the journal's owned paths plus what the scope check named — known lists, no snapshot); the
+  journal gets a committed marker, a missing journal with scratch present is an error, entries
+  are validated; contained reads in ingest; a size guard that holds oversized writer input
+  with an explicit reason before the model call.
+- The splice — sections as the unit, brief names sections, `ask` reads sections, tools off
+  model nodes — is deferred to the first post-Stage-1 milestone, on a branch (PLAN §6).
+  Reason: the fresh run is "run it end to end"; the splice is "find the biggest friction,
+  whack it" — that ordering is Brian's. An untested mechanism comes off the critical path.
+  Brian has not seen the mechanism; §5's paragraph postdates his review.
+- Stage 1 done-when rescoped, owner's call: two epochs on a fresh corpus under the final page
+  design. The full 215 under that design moves to the splice milestone, which is what makes
+  215 fit. e01's 129 unattended sources stand as the scale evidence under the predecessor
+  shape.
+- Section sets per page type approved. e01: initiatives — Owners · Commitments · Blockers ·
+  Decisions · Open questions; people — Current work · Commitments · Blockers · Positions;
+  topics — What it is · Decisions · Open questions · Related; weekly — `## Week of
+  YYYY-MM-DD`; decisions — no set, opt out of Current state; source pages exempt from both.
+  personal: projects — Status · Decisions · Learnings · Next; people — Working on · Open
+  threads; topics — What I know · Open questions.
+- The builder's hold-during-write rule (changes that appear during the write are the writer's;
+  pre-existing changes are the owner's) accepted for B-lean; moot under glue-writes.
+- Phase ledger within Stage 1: CP1 → CP2–CP3 → CP4 → A → A.2 → B-lean → fresh run (E01, stop
+  and look; E02 incremental; fresh personal with the interview; one edit re-read, append and
+  removal) → close.

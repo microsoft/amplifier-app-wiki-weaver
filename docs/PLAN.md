@@ -307,7 +307,9 @@ deterministic step splices them back. Input is bounded by section size, which is
 constant, instead of page size, which is not. The same shape serves the reader: an
 answering agent reads Current state first and opens a section only when it needs one, so
 cost to answer stops scaling with page size too. This is R11's lever — less read per pass —
-built into the structure rather than tuned.
+built into the structure rather than tuned. Stage 1 runs with whole-page writes;
+sections as the unit is the first change after Stage 1, built on a branch against the full
+fresh corpus.
 
 **Supersession is a block.** Text that is no longer true is wrapped in
 `<!-- superseded: YYYY-MM-DD -->` … `<!-- /superseded -->`, covering exactly the old words;
@@ -422,13 +424,34 @@ to something that already works.
 
 | Stage | What ships | Done when | Target |
 |---|---|---|---|
-| **1 — the working pipeline** | The three graphs, installable and runnable end to end. Lens delivered to the writer. Checks route. Pages accumulate. The writer reads `lens/corrections/` from day one (empty at first); a `feedback` verb appends to `feedback/log.jsonl`. Run first on a 7-file smoke slice, then one epoch (E01, 31 sources), then a second epoch incrementally, then the full 215; and on a second, personal corpus with a different lens and no code changes | Purity acceptance passes · smoke, epoch and incremental slices pass · full corpus ingests unattended · measurements recorded per epoch — wall time, model calls, page sizes, writer input, ask cost (the scored eval against grep and V2 is deferred per the 9/30 decision; §7's "no stage waits on evals" holds) | **days, from 9/30** |
+| **1 — the working pipeline** | The three graphs, installable and runnable end to end. Lens delivered to the writer. Checks route. Pages accumulate. The writer reads `lens/corrections/` from day one (empty at first); a `feedback` verb appends to `feedback/log.jsonl`. Run first on a 7-file smoke slice, then one epoch (E01, 31 sources), then a second epoch incrementally, then two epochs on a fresh corpus under the final page design (e01 — 129 sources under the predecessor shape — retained as the before-artifact); and on a second, personal corpus with a different lens and no code changes | Purity acceptance passes · smoke, epoch and incremental slices pass · two epochs ingest unattended on a fresh corpus under the final page design (the full corpus under that design is the first post-Stage-1 milestone) · measurements recorded per epoch — wall time, model calls, page sizes, writer input, ask cost (the scored eval against grep and V2 is deferred per the 9/30 decision; §7's "no stage waits on evals" holds) | **days, from 9/30** |
 | **2 — running in Resolve** | The four verbs and the tarball package over the same pipeline, called the way Team Pulse's current version is called. The command-line path is the bridge that keeps Team Pulse unaffected; running the graph directly is the destination, unlocked by the graph being pure — timing with Marc and Ken | One job executes in Resolve; Team Pulse can call it without noticing what changed underneath | days after Stage 1 complete |
 | **3 — the learning loop** | The correct path end to end, plus interactive mode for the brief | A correction given at source N is honored at source N+1, demonstrated | week 2 |
 | **4 — corrections become lens** | Lens edits proposed from accumulated corrections; the owner accepts or declines with a reason; declines feed the next pass | An owner reviews and accepts a proposed lens edit end to end | week 2–3 (gated on Stage 3 having run long enough to accumulate corrections) |
 | **5 — cross-check views** *(optional)* | A second extraction technique run in parallel with the summarizer; disagreements surface as findings | Measured against Stage 3 — adopted only if it wins | later |
 
-The evaluation runs in parallel from Stage 1; every stage gets an arm.
+Measurements run from Stage 1; the scored evaluation is deferred per the 9/30 decision.
+
+**First after Stage 1 — sections as the unit.** One branch, one milestone. The writer receives
+and returns sections, not pages; glue does every write. The brief names the sections. `ask`
+reads Current state first and drills on demand. Tools come off model nodes where the engine
+allows. Then the full 215 under the final design — the scale validation Stage 1 handed off —
+with anything held for size re-ingested through the retry path. It closes:
+- writer input growing with the wiki — 825K median, 1.51M max, +55% per epoch at 129 sources
+  (LEARNINGS, "Writer input grows with the wiki");
+- model nodes writing files, and the forensic snapshot that forced — the reviewer drove the
+  engine's shell tool outside the corpus with no model call; a name-only snapshot let a writer
+  overwrite of a dirty owner file pass (LEARNINGS, "The snapshot was detecting what should be
+  prevented");
+- `ask` reading whole pages — 383K–549K characters per answer at E04;
+- aspect misfiling, by moving that judgment to the brief (a Stage 1 watch).
+*Done when:* writer characters per source stop tracking wiki size; 215 converge; `ask`
+characters per question measured before and after. *Watch:* whether the writer needs a
+"request more sections" turn; index.md at ~250 lines.
+
+**Owed for Stage 2** — conformance tests from both contracts, if not finished during the Stage 1
+run; `--limit ≤ 0` → exit 2, and hold logging when a batch is all-held; the `update` verb (OPEN
+for Marc); CI fixed before the `main` merge; the merge sequence `v4-build` → `v4` → `main`.
 
 **Later, not scheduled** — picked up as the earlier stages close out:
 
@@ -442,6 +465,16 @@ The evaluation runs in parallel from Stage 1; every stage gets an arm.
   second most-reported failure, so this sits early on the list, not as an afterthought.
 
 ---
+- Page splitting, only if sections themselves grow — superseded share is 2–5%; these are live
+  pages, not history bloat.
+- The grep comparison for R10 and the scored evaluation, when Brian re-prioritizes them.
+
+**Housekeeping** — retire the `smoke` corpus; the pyright error; `git add -A` in the CLI
+snapshot commit.
+
+**Watches, no action** — citation density (hold at ~69% of body lines); uncited hard-number
+lines (28%); wiki/source size ratio (47%); the builder's hold-during-write rule, which
+glue-writes make moot.
 
 ## 7. How we'll know it's working
 

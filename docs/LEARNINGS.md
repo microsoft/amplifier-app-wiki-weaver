@@ -169,7 +169,7 @@ agents drop current facts. Found by an audit sampling pages; every check passed.
 wrapping exactly the old words; one writer sentence (the replacement goes outside the
 block, as its own entry); a deterministic check: a block may not contain the current
 source's citation id — you cannot supersede what you just wrote.
-**Status.** Phase A, test-first. The E03 removal test must be re-read against this.
+**Status.** Applied in 580639a; verified by the independent pass. The E03 removal test must be re-read against this.
 
 ### Crash recovery could lose a source — 2026-10-06
 **Problem.** The source left `_inbox/` (gitignored) before the ledger row and commit were
@@ -180,7 +180,7 @@ recovery itself failed.
 and the commit, the file was in neither place.
 **Fix.** Commit first; the move out of `_inbox/` is the last step. Recover from HEAD.
 Recovery failure exits 1 and the run does not start.
-**Status.** Phase A, test-first.
+**Status.** Applied in 580639a; verified by the independent pass.
 
 ### The loss guard had two holes — 2026-10-06
 **Problem.** A deleted tracked page passed, because the check skipped files that no longer
@@ -191,14 +191,14 @@ explained by the second hole — the guard was not fully armed.
 **Fix.** A deleted tracked `.md` fails. The 15% rule has no marker exemption — marked lines
 stay; they are not deletions. Heading-loss passes only when the marker is adjacent to the
 lost heading.
-**Status.** Phase A, test-first.
+**Status.** Applied in 580639a; verified by the independent pass.
 
 ### Shell injection through filenames — 2026-10-06
 **Problem.** DOT tool commands interpolated parameters into shell text.
 **How it showed.** A fixture whose filename contained `$(...)` executed it. Teams export
 names carry spaces, parentheses and apostrophes.
 **Fix.** Every parameter shell-quoted, or passed by file or environment.
-**Status.** Phase A, test-first.
+**Status.** Applied in 580639a; verified by the independent pass.
 
 ### The ingest lock could be held twice — 2026-10-06
 **Problem.** The lock file was created empty and the PID written a moment later. A second
@@ -208,7 +208,7 @@ run reading it in that gap found no PID, called the lock stale, deleted it, and 
 contract promise; RepoWeaver sync and a scheduled ingest can start within milliseconds.
 **Fix.** The PID is written atomically (temp file + rename, or O_EXCL with the content in
 one write). `init` takes the lock.
-**Status.** Phase A, test-first.
+**Status.** Applied in 580639a; verified by the independent pass.
 
 ### Current state worked; one residual habit — 2026-10-06
 **What happened.** The roll-up instruction, with no length cap, produced a Current state on
@@ -224,7 +224,7 @@ June content.
 **Fix.** One sentence: "Current state describes the page, not the source you are
 integrating." Measure prose openers that name a source. Source pages exempt; decisions opt
 out via the lens; `(as of)` is the latest source date on the page.
-**Status.** Phase B.
+**Status.** B-lean.
 
 ### Citation density is the content's nature — 2026-10-06
 **Problem.** We expected "specific claims cite; synthesis does not" to cut the share of
@@ -254,7 +254,7 @@ instead of filenames (done) and dropping the redundant source-page links (Phase 
 inside these links — the epoch label from the test corpus's filenames echoed into prose.
 **Fix.** Cite by id only. Index source entries carry the id so the id → summary-page hop
 stays one grep. Strip `__slice-E0x` from filenames for the fresh run.
-**Status.** Phase B.
+**Status.** B-lean.
 
 ### Reports are not evidence — 2026-10-06
 **Problem.** Checkpoints were approved from the builder's reports.
@@ -283,7 +283,7 @@ sections the brief named, and a heading-only outline — never the whole page �
 the changed sections; a deterministic step splices them back. Input is bounded by section
 size, not page size. The answering agent reads the same way. PLAN.md §5 "Why sections are
 the unit of work" and §9.
-**Status.** Phase B. The fresh run measures writer characters per source and ask characters
+**Status.** The splice milestone, first after Stage 1 (PLAN §6). It measures writer characters per source and ask characters
 per answer against these numbers.
 
 ### The independent pass found what the author's tests missed — 2026-10-07
@@ -299,4 +299,30 @@ and the next run committed the partial index.md and log.md; ask's index.md and R
 reads followed symlinks out of the root. One test kept the heading it claimed to remove.
 **Fix.** Phase A.2, same discipline — failing test from each repro first — then the same
 reviewer re-verifies before Phase B.
-**Status.** In progress.
+**Status.** A.2 applied in 1cb82cc; the second pass verified it and found four more — see the next two entries. No A.3: the small fixes are in B-lean; the root cause is the splice milestone's.
+
+### The snapshot was detecting what should be prevented — 2026-10-07
+**Problem.** The brief and write nodes run as model sessions with a shell and a filesystem
+tool, and the writer writes pages itself. Everything downstream — scope check, hold, the
+pre-writer snapshot — infers after the fact what the model changed.
+**How it showed.** The second review drove the engine's shell tool outside the corpus with no
+model call (success=True). A selected slug that resolved to an external symlink was read into
+context and written through, invisible to git. The snapshot stored path names only, so a
+writer overwrite of an already-dirty owner file passed as "pre-existing." A brief failure
+routed to hold with no baseline and destroyed an uncommitted lens.md edit and an untracked
+draft. V1 met the same exposure with a 4,000-word prompt (HARD PROHIBITION, two self-reported
+manifests); V2 with validate, retention_check and a reviewer agent. Each added supervision;
+none removed the pen.
+**Fix.** The writer returns text; a deterministic step writes exactly the named sections —
+the splice milestone. Interim in B-lean: hold reverts only journaled and scope-named paths;
+reads in ingest are contained.
+**Status.** Interim in B-lean; structural fix in the splice milestone.
+
+### The second verification found the root cause under the first one's fixes — 2026-10-07
+**Problem.** Phase A fixed six reproduced bugs; A.2 fixed the verifier's four; both verified.
+**How it showed.** The second pass re-ran its own repros — all passed — then ran new ones:
+hold with no baseline, the name-only snapshot, a stale or missing journal, an ingest symlink
+escape. Two trace to the same cause the first round's fixes had worked around.
+**Fix.** Verify every phase, not only the first. When a second round finds a shared cause,
+change the design instead of patching again — which is why there is no Phase A.3.
+**Status.** Adopted; the design change is the splice milestone.

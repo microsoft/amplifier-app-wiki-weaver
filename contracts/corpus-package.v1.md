@@ -16,6 +16,7 @@ under a resolver, as a folder on disk locally — under the names callers alread
 _inbox/                      pending sources (markdown, frontmatter optional)
 _sources/<name>              retained raw source; appearing here = ingested
 .wiki/failed/<name>          held source; reason in the ledger
+.wiki/skipped/<name>         skipped source (e.g. empty); reason in the ledger
 .wiki/source-versions/s<id>.md   prior text of an edited source; old citations resolve here
 .wiki/.processed.jsonl       ledger, one JSON object per line
 .wiki/runs/ingest-<ts>/result.json    outcome of one run (does not travel)
@@ -36,9 +37,10 @@ each part means, so any caller can swap the engine underneath without noticing.
    job that works on one machine and forgets its history in a fresh container.
 2. **`_inbox/` takes markdown, and frontmatter is optional.** Date, title and kind fall
    back to header lines and the filename. Upstream apps write here; ingest drains it.
-3. **`_sources/<name>`, under the original filename, means ingested.** Kept byte-for-
-   byte, never modified. RepoWeaver uses it as its success signal and derives each
-   repository's last-sync date from these filenames.
+3. **`_sources/<name>`, under the original filename, means ingested.** It holds the most
+   recently ingested version of that file, byte-for-byte as it arrived. When a source is
+   edited and re-dropped, this copy is replaced and the prior text is kept at
+   `.wiki/source-versions/s<id>.md`, so older citations still resolve.
 4. **A held source moves to `.wiki/failed/<name>`, and the ledger says why.** A
    caller retries or reports it; the resolver sees it as `counts.failed` (clause 6),
    and the file itself travels.
