@@ -150,3 +150,27 @@ that's a signal.
   resolving outside the corpus root. (Phase A.2)
 - Independent verification is a cross-provider code reviewer with clean context, run after
   every correctness phase; its verdict gates the next phase. Phase A → NOT SAFE → Phase A.2.
+
+## 2026-10-07 — Stage 1, B-lean (builder's calls)
+
+- Hold reverts the journal's owned paths plus the paths the scope check named; the
+  pre/post snapshot is gone. Consequence: an owner edit that is dirty while a writer runs
+  is named and reverted on hold (the run's opening snapshot makes that a mid-run window).
+- Finished operations clear .wiki/work/, so scratch with no journal reliably means a run
+  died; that state exits 1 and touches nothing.
+- Writer-input limit: env WIKI_WEAVER_MAX_WRITER_CHARS, default 3,500,000.
+- The page-type parser matches lens names to frontmatter types by a normalized key
+  (plural/singular, first word): initiatives/initiative, people/person,
+  weekly commitments and blockers/weekly-commitments.
+- Added `##` headings only are judged against the set; existing off-set headings are not
+  re-judged (no backfill). `lint` does not run the set rule (it has no before-state).
+  A type that opts out of Current state fails a newly added `## Current state`.
+- Writer prompt: `(as of <today>)` became `(as of <date>)` with the per-page date given in
+  pages.md; "Open with one or two lines on what this is" removed (it produced the
+  "Initiative page. Source: ..." openers); citations "in no other form (no links to
+  source pages)". OPEN: owner confirms these readings of item 3.
+- Personal lens: decisions keep Current state (the opt-out was specified for e01 only).
+  OPEN: owner confirms.
+- full/ staging: E01 only. OPEN: 11 E02 chat slices share a name with an E01 slice once
+  `__slice-E0x` is stripped, and their contents are disjoint windows (3–23% shared
+  lines); both cannot sit in _inbox/ under one name.
