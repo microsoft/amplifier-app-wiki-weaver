@@ -170,7 +170,10 @@ CURRENT_STATE_FORMAT = re.compile(r"^## Current state \(as of \d{4}-\d{2}-\d{2}\
 
 def check_current_state(name: str, text: str) -> list[str]:
     """A page that has a `## Current state` section: the heading reads exactly
-    `## Current state (as of YYYY-MM-DD)` and it is the first `##` section."""
+    `## Current state (as of YYYY-MM-DD)` and it is the first `##` section. Source
+    summary pages are exempt."""
+    if name.startswith("source-"):
+        return []
     _, body = split_frontmatter(text)
     h2 = [ln.strip() for ln in body.splitlines() if ln.startswith("## ")]
     cs = [h for h in h2 if CURRENT_STATE_RE.match(h)]
@@ -184,6 +187,44 @@ def check_current_state(name: str, text: str) -> list[str]:
             )
     if not CURRENT_STATE_RE.match(h2[0]):
         errs.append(f"{name}: current state is not the first ## section (first is '{h2[0]}')")
+    return errs
+
+
+def _h2(text: str) -> list[str]:
+    _, body = split_frontmatter(text)
+    out = []
+    for ln in body.splitlines():
+        if ln.startswith("## "):
+            out.append(normalize_ws(CLOSE_RE.sub("", MARKER_RE.sub("", ln[3:]))).strip())
+    return out
+
+
+def check_section_headings(name: str, before: str | None, after: str, types: dict) -> list[str]:
+    """A `##` the write added must be one the lens names for the page's type - one of its
+    `Sections`, or matching its `Sections pattern`. `## Current state` is allowed unless
+    the type opts out. Source pages are exempt; a type with no set or pattern has no rule."""
+    if name.startswith("source-"):
+        return []
+    from .lens import page_type_for
+
+    fm, _ = split_frontmatter(after)
+    pt = page_type_for(types, (fm or {}).get("type"))
+    if pt is None:
+        return []
+    old = {h.lower() for h in _h2(before)} if before is not None else set()
+    errs = []
+    for h in _h2(after):
+        if h.lower() in old:
+            continue
+        if CURRENT_STATE_RE.match(f"## {h}"):
+            if not pt.current_state:
+                errs.append(f"{name}: page type '{pt.name}' has no Current state; added '## {h}'")
+            continue
+        if pt.heading_rule() and not pt.allows(h):
+            allowed = " · ".join(pt.sections) if pt.sections else f"'{pt.pattern}'"
+            errs.append(
+                f"{name}: added '## {h}', not a section the lens names for '{pt.name}' ({allowed})"
+            )
     return errs
 
 
@@ -237,6 +278,8 @@ CHECK_KINDS = (
     ("duplicate ## heading", "duplicate_headings"),
     ("current state heading must read", "current_state"),
     ("current state is not the first", "current_state"),
+    ("has no Current state; added", "sections"),
+    ("not a section the lens names", "sections"),
     ("frontmatter", "frontmatter"),
     ("wrote outside the selected pages", "write_scope"),
     ("was not written", "summary_missing"),
@@ -256,6 +299,7 @@ def run_page_checks(
     before_dir: Path,
     sources: dict[int, tuple[str, str]],
     current_id: int | None = None,
+    types: dict | None = None,
 ) -> list[str]:
     errs: list[str] = []
     for name in pages:
@@ -272,6 +316,10 @@ def run_page_checks(
         errs += check_links(name, text, wiki)
         errs += check_current_state(name, text)
         errs += check_superseded_blocks(name, text, current_id)
+        if types:
+            errs += check_section_headings(
+                name, read_text(prior) if prior.exists() else None, text, types
+            )
         if prior.exists():
             errs += check_content_loss(name, read_text(prior), text)
     return errs

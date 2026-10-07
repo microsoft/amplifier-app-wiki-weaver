@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import checks as ck
 from . import ledger as lg
+from .lens import parse_page_types
 from .lib import (
     MAX_SOURCE_CHARS,
     NON_PAGE_FILES,
@@ -540,7 +541,9 @@ def step_page_select() -> str:
         p = contained_file(WIKI, name)
         if p is not None and p.parent == root:
             shutil.copy2(p, before / name)
-            srcs = [x for x in (page_frontmatter(p) or {}).get("sources") or [] if isinstance(x, str)]
+            srcs = [
+                x for x in (page_frontmatter(p) or {}).get("sources") or [] if isinstance(x, str)
+            ]
             as_of = _latest_source_date(srcs, this_date)
             head = f"existing, {len(srcs)} sources"
             body = read_text(p)
@@ -581,8 +584,10 @@ def step_checks() -> str:
         errs.append(f"source summary {cur['summary_page']} was not written")
     pages = [p for p in changed if p in selected]
     pages += [p for p in selected if p not in pages and (work / "before" / p).exists()]
+    lens = contained_file(WIKI, "lens.md")
+    types = parse_page_types(read_text(lens)) if lens else {}
     errs += ck.run_page_checks(
-        WIKI, pages, work / "before", check_sources(cur), cur.get("source_id")
+        WIKI, pages, work / "before", check_sources(cur), cur.get("source_id"), types
     )
     if not errs:
         save_current(cur)
