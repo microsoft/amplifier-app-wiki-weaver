@@ -119,3 +119,17 @@ def atomic_append_line(path: Path, line: str) -> None:
     if old and not old.endswith("\n"):
         old += "\n"
     atomic_write_text(path, old + line.rstrip("\n") + "\n")
+
+
+def contained_file(root: Path, rel: str | Path) -> Path | None:
+    """The file ``rel`` names under ``root``, after resolving symlinks - or None if it is
+    missing or resolves anywhere outside ``root``. Every corpus-derived input that ask
+    reads goes through this."""
+    root = Path(root).resolve()
+    try:
+        target = (root / rel).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not target.is_file() or not target.is_relative_to(root):
+        return None
+    return target

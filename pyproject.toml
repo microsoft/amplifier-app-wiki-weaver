@@ -15,7 +15,11 @@ authors = [{ name = "Microsoft Corporation" }]
 dependencies = ["pyyaml>=6"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[dependency-groups]
+# `uv run` installs this group by default, so `uv run ruff check .` and `uv run pytest` work.
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 wiki-weaver = "wiki_weaver.cli:main"

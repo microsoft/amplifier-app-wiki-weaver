@@ -131,6 +131,24 @@ def scaffold(corpus: Path) -> None:
     commit_pending(corpus, "chore: scaffold wiki")
 
 
+def recover(corpus: Path) -> tuple[bool, str]:
+    """Undo whatever a dead run left half-done (wiki_weaver.steps recover), before any
+    scaffold or snapshot commit can stage it. Returns (ok, message)."""
+    if not (corpus / ".git").exists():
+        return True, ""
+    r = subprocess.run(
+        [sys.executable, "-m", "wiki_weaver.steps", "recover"],
+        cwd=corpus,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        tail = (r.stderr.strip().splitlines() or ["no output"])[-1]
+        return False, f"recover failed (exit {r.returncode}): {tail}"
+    return True, r.stderr.strip() if r.stdout.strip().endswith("recovered") else ""
+
+
 def commit_pending(corpus: Path, message: str) -> None:
     if git(corpus, "status", "--porcelain").stdout.strip():
         git(corpus, "add", "-A")
@@ -157,6 +175,12 @@ def cmd_init(a: argparse.Namespace) -> int:
 
 
 def _init_locked(corpus: Path, a: argparse.Namespace) -> int:
+    ok, msg = recover(corpus)
+    if not ok:
+        print(f"wiki-weaver: {msg}; not initializing", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    if msg:
+        print(f"wiki-weaver: {msg}", file=sys.stderr)
     scaffold(corpus)
     if lens_path(corpus).exists():
         print(f"wiki-weaver: {corpus} already initialized; lens.md kept as is")
@@ -273,20 +297,13 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
         # A run that died mid-source leaves that writer's edits uncommitted; undo them
         # before the snapshot below would commit them as if they were the owner's.
-        rec = subprocess.run(
-            [sys.executable, "-m", "wiki_weaver.steps", "recover"],
-            cwd=corpus,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if rec.returncode != 0:
-            tail = (rec.stderr.strip().splitlines() or ["no output"])[-1]
-            errored.append({"reason": f"recover failed (exit {rec.returncode}): {tail}"})
-            print(f"wiki-weaver: recover failed; not starting: {tail}", file=sys.stderr)
+        ok, msg = recover(corpus)
+        if not ok:
+            errored.append({"reason": msg})
+            print(f"wiki-weaver: {msg}; not starting", file=sys.stderr)
             return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
-        if rec.stdout.strip().endswith("recovered"):
-            print(f"wiki-weaver: {rec.stderr.strip()}", file=sys.stderr)
+        if msg:
+            print(f"wiki-weaver: {msg}", file=sys.stderr)
         scaffold(corpus)
         commit_pending(corpus, "chore: snapshot before ingest")
         only = Path(a.source).name if a.source else None

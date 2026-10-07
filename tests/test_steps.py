@@ -334,11 +334,11 @@ def test_recover_undoes_a_half_written_source(corpus: Path, tmp_path: Path):
     fake_brief(corpus, ["orchard-rollout"])
     step(corpus, "page_select")
     (corpus / "source-2031-03-02-orchard-sync.md").write_text("half written")
-    (corpus / "lens.md").write_text("half written")
+    (corpus / "lens.md").write_text("an owner edit")
     # the run dies here; the next ingest starts with recover
     assert step(corpus, "recover") == (0, "recovered")
     assert not (corpus / "source-2031-03-02-orchard-sync.md").exists()
-    assert (corpus / "lens.md").read_text() != "half written"
+    assert (corpus / "lens.md").read_text() == "an owner edit"  # not the run's; untouched
     assert (corpus / "_inbox" / ORCHARD).exists()
     assert not (corpus / ".wiki/work").exists()
     assert step(corpus, "recover") == (0, "clean")

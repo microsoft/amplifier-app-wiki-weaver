@@ -130,13 +130,16 @@ def test_crash_after_commit_before_inbox_removal(corpus: Path, tmp_path: Path, m
 
 
 def test_recover_restores_from_head_not_the_index(corpus: Path, tmp_path: Path):
-    _to_write(corpus, [], tmp_path / "r")
+    (corpus / "orchard-rollout.md").write_text(page("R", [], "## Plan\nkept\n"))
+    subprocess.run([*GIT, "add", "-A"], cwd=corpus, check=True)
+    subprocess.run([*GIT, "commit", "-qm", "page"], cwd=corpus, check=True)
+    _to_write(corpus, ["orchard-rollout"], tmp_path / "r")
     (corpus / "source-2031-03-02-orchard-sync.md").write_text("half a page")
-    (corpus / "lens.md").write_text("half a lens")
+    (corpus / "orchard-rollout.md").write_text("half an edit")
     subprocess.run([*GIT, "add", "-A"], cwd=corpus, check=True)  # staged, not committed
     assert step(corpus, "recover") == (0, "recovered")
     assert not (corpus / "source-2031-03-02-orchard-sync.md").exists()
-    assert (corpus / "lens.md").read_text() != "half a lens"
+    assert "## Plan" in (corpus / "orchard-rollout.md").read_text()
     assert _git_clean(corpus) == ""
 
 
@@ -148,7 +151,7 @@ def test_ingest_does_not_start_when_recovery_fails(tmp_path: Path):
     scaffold(w)
     (w / "lens.md").write_text("## Purpose\nx\n")
     (w / ".wiki/work").mkdir(parents=True)
-    (w / ".wiki/work/current.json").write_text("{not json")
+    (w / ".wiki/work/journal.json").write_text("{not json")  # an unreadable journal
     env = {**os.environ, "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", "x")}
     r = subprocess.run(
         [sys.executable, "-m", "wiki_weaver.cli", "ingest", "--wiki", str(w)],
@@ -190,14 +193,22 @@ def test_one_marker_does_not_exempt_line_loss():
 
 
 def test_heading_loss_needs_an_adjacent_marker():
-    before = FM + "## Plan\nkept\n## Budget\nkept too\n"
-    far = FM + "## Plan\nkept\n<!-- superseded: 2031-03-05 -->x<!-- /superseded -->\nkept too\n"
+    body = "".join(f"plan line {i}\n" for i in range(12))
+    before = FM + "## Plan\n" + body + "## Budget\nkept too\n"
+    far = (
+        FM + "## Plan\n" + body + "<!-- superseded: 2031-03-05 -->x<!-- /superseded -->\nkept too\n"
+    )
     assert any("budget" in e for e in ck.check_content_loss("p.md", before, far))
+    # the heading itself is gone; its text survives on a line next to a marker
     adjacent = (
-        FM + "## Plan\nkept\n<!-- superseded: 2031-03-05 -->\n## Budget\n"
+        FM + "## Plan\n" + body + "<!-- superseded: 2031-03-05 -->\nBudget (the old section)\n"
         "<!-- /superseded -->\nkept too\n"
     )
+    assert "budget" not in ck._headings(adjacent)
     assert ck.check_content_loss("p.md", before, adjacent) == []
+    # the same removal with the text kept but no marker near it fails
+    unmarked = FM + "## Plan\n" + body + "Budget (the old section)\nkept too\n"
+    assert any("budget" in e for e in ck.check_content_loss("p.md", before, unmarked))
 
 
 # ------------------------------------------------------------------ 4. shell injection

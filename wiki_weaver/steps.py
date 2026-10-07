@@ -23,6 +23,7 @@ from .lib import (
     NON_PAGE_FILES,
     atomic_append_line,
     atomic_write_text,
+    contained_file,
     corrections_dir,
     is_valid_slug,
     lens_path,
@@ -118,12 +119,19 @@ def record(run_dir: Path, row: dict) -> None:
     jappend(run_dir / "changes.jsonl", row)
 
 
-def commit_state(message: str) -> None:
-    """Commit bookkeeping (ledger, held files) so the next write's scope check sees
-    only what that write changed."""
-    git("add", "-A")
-    if git("diff", "--cached", "--name-only").strip():
-        git("commit", "-q", "-m", message)
+LEDGER_REL = ".wiki/.processed.jsonl"
+
+
+def commit_paths(paths, message: str) -> None:
+    """Stage and commit exactly these paths (additions, edits and deletions). Nothing
+    else in the corpus is staged or committed - an owner's unrelated work is left alone."""
+    keep = sorted({p for p in paths if p and ((WIKI / p).exists() or _in_head(p))})
+    if not keep:
+        return
+    git("add", "-A", "--", *keep)
+    staged = git("diff", "--cached", "--name-only", "--", *keep).strip()
+    if staged:
+        git("commit", "-q", "--only", "-m", message, "--", *keep)
 
 
 def check_sources(cur: dict) -> dict[int, tuple[str, str]]:
@@ -148,7 +156,40 @@ def pages_citing(name: str) -> list[str]:
 # ---------------------------------------------------------------- ingest
 
 
-INFLIGHT = "inflight"  # .wiki/work/inflight: tracked state is being changed right now
+JOURNAL = "journal.json"
+
+
+def journal() -> dict | None:
+    """The in-flight operation: what it is, its source, where that source is being
+    placed, and every corpus path it owns. Recovery touches only these paths."""
+    j = wiki_work(WIKI) / JOURNAL
+    return jread(j, None) if j.exists() else None
+
+
+def journal_open(op: str, source: str | None, dest: str | None, paths) -> None:
+    jwrite(
+        wiki_work(WIKI) / JOURNAL,
+        {"op": op, "source": source, "dest": dest, "paths": sorted({p for p in paths if p})},
+    )
+
+
+def journal_update(op: str | None = None, dest: str | None = None, paths=()) -> None:
+    j = journal() or {"op": op, "source": None, "dest": None, "paths": []}
+    if op:
+        j["op"] = op
+    if dest:
+        j["dest"] = dest
+    j["paths"] = sorted(set(j["paths"]) | {p for p in paths if p})
+    jwrite(wiki_work(WIKI) / JOURNAL, j)
+
+
+def journal_close() -> None:
+    (wiki_work(WIKI) / JOURNAL).unlink(missing_ok=True)
+
+
+def owned_paths() -> set[str]:
+    j = journal()
+    return set(j["paths"]) if j else set()
 
 
 def _place(src: Path, dest_dir: Path) -> Path:
@@ -165,16 +206,6 @@ def _place(src: Path, dest_dir: Path) -> Path:
 def _finish(src: Path) -> None:
     """Last step of a source's bookkeeping: drop the inbox copy."""
     src.unlink(missing_ok=True)
-
-
-def _mark_inflight() -> None:
-    work = wiki_work(WIKI)
-    work.mkdir(parents=True, exist_ok=True)
-    (work / INFLIGHT).write_text(now())
-
-
-def _clear_inflight() -> None:
-    (wiki_work(WIKI) / INFLIGHT).unlink(missing_ok=True)
 
 
 def _summary_page(filename: str) -> str:
@@ -215,11 +246,12 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
             if not (inbox / name).exists() and held.exists():
                 # retry: the held copy comes back to _inbox/; record that in git now so
                 # the write's scope check sees only the writer's changes
-                _mark_inflight()
+                rel = f".wiki/failed/{name}"
+                journal_open("retry", name, rel, [rel])
                 _place(held, inbox)
                 held.unlink()
-                commit_state(f"retry: {name}")
-                _clear_inflight()
+                commit_paths([rel], f"retry: {name}")
+                journal_close()
             p = inbox / name
             if not p.exists() or sha256_file(p) in lg.converged_hashes(lg.read_rows(WIKI)):
                 return "drained"
@@ -230,7 +262,8 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
             p = cands[0]
         sha = sha256_file(p)
         if p.stat().st_size == 0:
-            _mark_inflight()
+            rel = f".wiki/skipped/{p.name}"
+            journal_open("skip", p.name, rel, [rel, LEDGER_REL])
             _place(p, WIKI / ".wiki" / "skipped")
             record(
                 run,
@@ -245,14 +278,15 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
                     model_calls=0,
                 ),
             )
-            commit_state(f"skip: {p.name} (empty)")
+            commit_paths([rel, LEDGER_REL], f"skip: {p.name} (empty)")
             _finish(p)
-            _clear_inflight()
+            journal_close()
             if only and only != "-":
                 return "drained"
             continue
         if lg.is_oversized(p):
-            _mark_inflight()
+            rel = f".wiki/failed/{p.name}"
+            journal_open("oversized", p.name, rel, [rel, LEDGER_REL])
             dest = _place(p, wiki_failed(WIKI))
             record(
                 run,
@@ -268,9 +302,9 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
                     model_calls=0,
                 ),
             )
-            commit_state(f"hold: {p.name} (oversized)")
+            commit_paths([rel, LEDGER_REL], f"hold: {p.name} (oversized)")
             _finish(p)
-            _clear_inflight()
+            journal_close()
             continue
         rows = lg.read_rows(WIKI)
         prev = wiki_sources(WIKI) / p.name
@@ -290,6 +324,19 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
                 "model_calls": 0,
                 "stage": "select",
             }
+        )
+        cur = current()
+        journal_open(
+            "source",
+            p.name,
+            f"_sources/{p.name}",
+            [
+                LEDGER_REL,
+                f"_sources/{p.name}",
+                f".wiki/failed/{p.name}",
+                f".wiki/source-versions/s{cur['prev_source_id']}.md" if changed else None,
+                cur["summary_page"],
+            ],
         )
         return "source"
 
@@ -392,6 +439,9 @@ def step_page_select() -> str:
     (work / "pages.md").write_text("".join(out))
     (work / "selected.txt").write_text("\n".join(selected) + "\n")
     chars = sum(len(read_text(work / f)) for f in ("context.md", "pages.md", "brief.md"))
+    journal_update(paths=selected)
+    owned = owned_paths()
+    cur["preexisting"] = [p for p in changed_paths() if p not in owned]
     cur.update(stage="write", model_calls=cur["model_calls"] + 1, selected=selected)
     cur["writer_input_chars"] = chars
     save_current(cur)
@@ -404,7 +454,8 @@ def step_checks() -> str:
     cur["attempts"] += 1
     cur["stage"] = "checks"
     selected = cur["selected"]
-    changed = changed_paths()
+    preexisting = set(cur.get("preexisting", []))
+    changed = [p for p in changed_paths() if p not in preexisting]
     errs = [f"wrote outside the selected pages: {p}" for p in changed if p not in selected]
     if cur["summary_page"] not in changed:
         errs.append(f"source summary {cur['summary_page']} was not written")
@@ -442,13 +493,15 @@ def _in_head(path: str) -> bool:
     return r.returncode == 0
 
 
-def _revert_writes(keep: tuple[str, ...] = ()) -> list[str]:
-    """Return every uncommitted path (tracked, staged or untracked; ignored paths are
-    untouched) to its state at HEAD. Restores from HEAD, not the index, so a staged
-    half-page does not survive."""
-    reverted = []
+def _revert_writes(only: set[str]) -> tuple[list[str], list[str]]:
+    """Return the uncommitted paths in ``only`` (the in-flight operation's own paths) to
+    their state at HEAD - from HEAD, not the index, so a staged half-page does not
+    survive. Every other uncommitted change is reported and left alone.
+    Returns (reverted, untouched)."""
+    reverted, untouched = [], []
     for p in changed_paths():
-        if p in keep:
+        if p not in only:
+            untouched.append(p)
             continue
         if _in_head(p):
             git("checkout", "HEAD", "--", p)
@@ -456,43 +509,46 @@ def _revert_writes(keep: tuple[str, ...] = ()) -> list[str]:
             git("rm", "-q", "--cached", "--ignore-unmatch", "--", p, check=False)
             (WIKI / p).unlink(missing_ok=True)
         reverted.append(p)
-    return reverted
+    return reverted, untouched
+
+
+def _head_bytes_hash(path: str) -> str | None:
+    r = subprocess.run(["git", "show", f"HEAD:{path}"], cwd=WIKI, capture_output=True, check=False)
+    if r.returncode != 0:
+        return None
+    import hashlib
+
+    return hashlib.sha256(r.stdout).hexdigest()
 
 
 def step_recover() -> str:
-    """Undo a source left half-processed by a run that died: if a source or its
-    bookkeeping was in flight, return every uncommitted change to HEAD and clear the
-    scratch space. The source is then in exactly one place: still in _inbox/ (picked up
-    again), or committed (its leftover inbox copy, identical to _sources/, is dropped)."""
+    """Undo an operation a dead run left half-done, touching only what it owned.
+
+    The journal (.wiki/work/journal.json) names the operation's own paths: its source's
+    retained copy, the pages it was given, the ledger, index.md/log.md for the index
+    phase. Those return to HEAD; every other uncommitted change - an owner's edit, an
+    untracked draft - is reported and left exactly as it is. Then the source is in one
+    place: if the operation committed before dying, its leftover inbox copy (identical to
+    the committed copy at the journal's destination) is dropped; otherwise it stays in
+    _inbox/ and is picked up again."""
     work = wiki_work(WIKI)
-    did = False
-    if (work / "current.json").exists() or (work / INFLIGHT).exists():
-        cur = jread(work / "current.json", {}) if (work / "current.json").exists() else {}
-        reverted = _revert_writes()
+    j = journal()
+    if j is None:  # nothing was in flight; scratch space from a finished run
         shutil.rmtree(work, ignore_errors=True)
-        print(
-            f"recovered interrupted source {cur.get('filename', '(bookkeeping)')}: "
-            f"reverted {reverted}",
-            file=sys.stderr,
-        )
-        did = True
-    done = lg.converged_hashes(lg.read_rows(WIKI))
-    for p in sorted(wiki_inbox(WIKI).glob("*.md")) if wiki_inbox(WIKI).is_dir() else []:
-        kept = wiki_sources(WIKI) / p.name
-        h = sha256_file(p)
-        if (
-            h in done
-            and kept.is_file()
-            and sha256_file(kept) == h
-            and _in_head(f"_sources/{p.name}")
-        ):
+        return "clean"
+    reverted, untouched = _revert_writes(set(j.get("paths") or []))
+    msg = f"recovered interrupted {j.get('op')} ({j.get('source') or 'no source'}): reverted {reverted}"
+    if untouched:
+        msg += f"; left untouched (not this operation's): {untouched}"
+    print(msg, file=sys.stderr)
+    src, dest = j.get("source"), j.get("dest")
+    if src and dest and dest.split("/")[-1] == src:
+        p = wiki_inbox(WIKI) / src
+        if p.exists() and _head_bytes_hash(dest) == sha256_file(p):
             p.unlink()
-            print(
-                f"recovered: {p.name} was already committed; dropped its inbox copy",
-                file=sys.stderr,
-            )
-            did = True
-    return "recovered" if did else "clean"
+            print(f"recover: {src} is committed at {dest}; dropped its inbox copy", file=sys.stderr)
+    shutil.rmtree(work, ignore_errors=True)
+    return "recovered"
 
 
 def step_hold(run_dir: str) -> str:
@@ -513,8 +569,17 @@ def step_hold(run_dir: str) -> str:
     kind = lg.KIND_CHECKS if stage == "checks" else lg.KIND_MODEL_STEP
     if stage not in ("checks", "brief", "write"):
         kind = lg.KIND_UNKNOWN
-    _revert_writes()
+    # Undo this source's pages, and anything that appeared while its writer ran (the
+    # scope check already named those). Changes that predate the write are the owner's
+    # and are left as they are.
+    preexisting = set(cur.get("preexisting", []))
+    writer_window = {p for p in changed_paths() if p not in preexisting}
+    _, untouched = _revert_writes((owned_paths() | writer_window) - {LEDGER_REL})
+    if untouched:
+        print(f"hold: left untouched (changed before this write): {untouched}", file=sys.stderr)
     src = wiki_inbox(WIKI) / cur["filename"]
+    rel = f".wiki/failed/{cur['filename']}"
+    journal_update(op="hold", dest=rel, paths=[rel])
     dest = _place(src, wiki_failed(WIKI)) if src.exists() else wiki_failed(WIKI) / cur["filename"]
     record(
         Path(run_dir),
@@ -533,14 +598,16 @@ def step_hold(run_dir: str) -> str:
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
-    commit_state(f"hold: {cur['filename']} ({kind})")
+    commit_paths(owned_paths(), f"hold: {cur['filename']} ({kind})")
     _finish(src)
+    journal_close()
     return "next"
 
 
 def step_commit(run_dir: str) -> str:
     cur = current()
-    pages = root_md_changes()
+    selected = set(cur.get("selected", []))
+    pages = [p for p in root_md_changes() if p in selected]
     srcs = wiki_sources(WIKI)
     srcs.mkdir(exist_ok=True)
     dest = srcs / cur["filename"]
@@ -566,9 +633,10 @@ def step_commit(run_dir: str) -> str:
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
-    git("add", "-A")
-    git("commit", "-q", "-m", f"ingest: {cur['filename']}")
+    journal_update(op="commit")
+    commit_paths(owned_paths(), f"ingest: {cur['filename']}")
     _finish(src)  # last: until here a crash leaves the source in _inbox/
+    journal_close()
     return "next"
 
 
@@ -603,6 +671,7 @@ def step_index_prep(run_dir: str) -> str:
     (work / "index_input.md").write_text("".join(out))
     if log.exists():
         shutil.copy2(log, work / "log_before.md")
+    journal_open("index", None, None, ["index.md", "log.md"])
     return "index"
 
 
@@ -616,18 +685,17 @@ def step_finalize() -> str:
         print("log.md was rewritten, not appended; restored prior history", file=sys.stderr)
     extras = [p for p in changed_paths() if p not in ("index.md", "log.md")]
     if extras:
-        print(f"index step touched {', '.join(extras)}; reverting those", file=sys.stderr)
-        _revert_writes(keep=("index.md", "log.md"))
-    git("add", "-A")
-    if changed_paths() or git("diff", "--cached", "--name-only").strip():
-        git("commit", "-q", "-m", "index: update index.md and log.md")
+        print(f"finalize: left untouched (not index.md/log.md): {extras}", file=sys.stderr)
+    commit_paths(["index.md", "log.md"], "index: update index.md and log.md")
+    journal_close()
     return "done"
 
 
 def step_index_restore() -> str:
-    """The index step failed: keep the per-source page commits, return index.md, log.md
-    and anything else the index step touched to HEAD, and fail the run."""
-    reverted = _revert_writes()
+    """The index step failed: keep the per-source page commits, return index.md and log.md
+    to HEAD, and fail the run. Nothing else is touched."""
+    reverted, _ = _revert_writes({"index.md", "log.md"})
+    journal_close()
     print(
         f"index step failed; restored from HEAD: {reverted or 'nothing to restore'}",
         file=sys.stderr,
@@ -672,13 +740,13 @@ def step_lens_check() -> str:
 
 def step_ask_assemble(ask_dir: str) -> str:
     d = Path(ask_dir)
-    reading = WIKI / "READING.md"
-    idx = WIKI / "index.md"
+    reading = contained_file(WIKI, "READING.md")
+    idx = contained_file(WIKI, "index.md")
     parts = [
         "# READING.md\n\n",
-        read_text(reading) if reading.exists() else "(no READING.md)\n",
+        read_text(reading) if reading else "(no READING.md)\n",
         "\n# index.md\n\n",
-        read_text(idx) if idx.exists() else "(the wiki has no index yet)\n",
+        read_text(idx) if idx else "(the wiki has no index yet)\n",
         "\n# Question\n\n",
         read_text(d / "question.txt"),
         "\n",
@@ -694,12 +762,9 @@ def step_ask_read(ask_dir: str) -> str:
     chosen = []
     for s in picks:
         name = s if s.endswith(".md") else f"{s}.md"
-        try:
-            target = (root / name).resolve()
-        except (OSError, ValueError):
-            continue
+        target = contained_file(WIKI, name)
         # a page is a file directly under the corpus root; anything else is refused
-        if target.parent != root or not target.is_file():
+        if target is None or target.parent != root:
             continue
         name = target.name
         if name not in NON_PAGE_FILES and name not in chosen:

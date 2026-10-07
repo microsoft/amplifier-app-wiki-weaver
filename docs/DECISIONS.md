@@ -145,3 +145,22 @@ that's a signal.
   scope check sees only the writer's changes.
 - Every `[s<id>]`, quoted or bare, must resolve through the ledger.
 - current.json, ledger rows and batch JSONL are written via temp file + `os.replace`.
+
+## 2026-10-07 — Stage 1, Phase A re-verification
+
+- Every pipeline operation that changes tracked state first writes a journal
+  (`.wiki/work/journal.json`: op, source, destination, owned paths). Recovery returns only
+  owned paths to HEAD and reports every other uncommitted change untouched. Owned: the
+  source's retained copy, `.wiki/failed/<name>`, the source-version copy, the ledger, the
+  summary page and the selected pages; `index.md` and `log.md` for the index phase.
+- Pipeline commits stage and commit only owned paths (`git commit --only`), never `-A`.
+- Hold reverts owned paths plus changes that appeared while the writer ran (the scope
+  check names them); changes that existed before the write are the owner's and stay.
+  The scope check ignores those pre-existing changes too.
+- `init` runs recovery under the run lock before scaffolding; a failed recovery exits 1.
+- After a committed hold, skip or ingest, recovery drops the inbox copy only when it is
+  byte-identical to the copy committed at the journal's destination. A held file
+  re-dropped into `_inbox/` with no journal is left alone (RepoWeaver's retry path).
+- ask reads READING.md, index.md and every page through one contained-read: resolved,
+  a regular file, inside the corpus root.
+- `ruff` is in the `dev` dependency group (`uv run ruff check .`).
