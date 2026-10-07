@@ -251,3 +251,20 @@ def test_snapshot_commit_never_stages_scratch(corpus: Path):
     commit_pending(corpus, "snapshot")
     assert _head(corpus, "owner.md") == "owner"
     assert _head(corpus, ".wiki/work/scratch.md") is None
+
+
+# ------------------------------------------------------------------ B-lean 3: the (as of) date
+
+
+def test_pages_md_gives_each_page_its_latest_source_date(corpus: Path, tmp_path: Path):
+    assert step(corpus, "select", str(tmp_path / "r"), "0", "-") == (0, "source")
+    step(corpus, "assemble")
+    fake_brief(corpus, ["orchard-rollout"])
+    assert step(corpus, "page_select") == (0, "ok")
+    pages = (corpus / ".wiki/work/pages.md").read_text()
+    assert (
+        "## orchard-rollout.md (new page - does not exist yet; Current state as of 2031-03-02"
+        in pages
+    )
+    assert "Current state as of" not in pages.split("## source-")[1].split("\n")[0]
+    assert "today:" not in (corpus / ".wiki/work/context.md").read_text()

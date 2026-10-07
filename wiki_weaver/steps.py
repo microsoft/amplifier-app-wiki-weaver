@@ -437,8 +437,7 @@ def step_assemble() -> str:
         parts += [f"\n# Wrapper policy fragment ({frag.as_posix()})\n", read_text(safe).strip()]
     sid = cur["source_id"]
     parts += [
-        f"\n\ntoday: {now()[:10]}\n",
-        "\n# Source\n",
+        "\n\n# Source\n",
         f"filename: {cur['filename']}\n",
         f'source id: s{sid} - cite this source as [s{sid}: "five or more words quoted exactly"]\n',
         *(f"{k}: {v}\n" for k, v in meta.items() if k != "filename" and v),
@@ -476,6 +475,17 @@ def step_assemble() -> str:
 
 
 DEFAULT_MAX_WRITER_CHARS = 3_500_000
+
+
+def _latest_source_date(sources: list[str], this_date: str) -> str:
+    """The `(as of)` date for a page: the latest date among its sources and this one."""
+    dates = [this_date] if this_date else []
+    for name in sources:
+        f = contained_file(WIKI, Path("_sources") / name)
+        d = str(source_meta(f).get("date") or "") if f else ""
+        if d:
+            dates.append(d)
+    return max(dates) if dates else ""
 
 
 def _escapes(rel: str) -> bool:
@@ -525,14 +535,20 @@ def step_page_select() -> str:
     out = ["# Selected pages\n", "You may write ONLY these files:\n"]
     out += [f"- {n}\n" for n in selected]
     out += [f"\n({n})\n" for n in notes]
+    this_date = str(source_meta(wiki_inbox(WIKI) / cur["filename"]).get("date") or "")
     for name in selected:
         p = contained_file(WIKI, name)
         if p is not None and p.parent == root:
             shutil.copy2(p, before / name)
-            n_src = len((page_frontmatter(p) or {}).get("sources") or [])
-            out += [f"\n\n## {name} (existing, {n_src} sources)\n\n", read_text(p)]
+            srcs = [x for x in (page_frontmatter(p) or {}).get("sources") or [] if isinstance(x, str)]
+            as_of = _latest_source_date(srcs, this_date)
+            head = f"existing, {len(srcs)} sources"
+            body = read_text(p)
         else:
-            out += [f"\n\n## {name} (new page - does not exist yet)\n"]
+            as_of, head, body = this_date, "new page - does not exist yet", ""
+        if not name.startswith("source-") and as_of:
+            head += f"; Current state as of {as_of} (the latest source date on the page)"
+        out += [f"\n\n## {name} ({head})\n\n", body]
     idx = contained_file(WIKI, "index.md")
     out += ["\n\n# index.md\n\n", read_text(idx) if idx else "(empty)\n"]
     (work / "pages.md").write_text("".join(out))
