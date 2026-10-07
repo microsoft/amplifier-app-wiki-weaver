@@ -78,8 +78,9 @@ digraph WikiWeaverIngest {
     brief -> page_select
     brief -> hold [condition="outcome=fail", label="model step failed"]
 
-    page_select -> write
-    page_select -> hold [condition="outcome=fail", label="no usable slugs"]
+    page_select -> write [condition="context.tool.last_line=ok && outcome=success"]
+    page_select -> hold  [condition="context.tool.last_line=oversized && outcome=success", label="writer input over the limit"]
+    page_select -> hold  [condition="outcome=fail", label="no usable slugs"]
 
     write -> checks
     write -> hold [condition="outcome=fail", label="model step failed"]

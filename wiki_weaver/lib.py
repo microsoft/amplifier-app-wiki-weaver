@@ -86,10 +86,17 @@ def is_valid_slug(slug: str) -> bool:
 
 
 def page_files(wiki: Path) -> list[Path]:
-    """Every page at the corpus root (``*.md`` minus the non-page files)."""
-    return sorted(
-        p for p in Path(wiki).glob("*.md") if p.is_file() and p.name not in NON_PAGE_FILES
-    )
+    """Every page at the corpus root (``*.md`` minus the non-page files). A page that is
+    a link resolving outside the corpus root is not a page and is never read."""
+    root = Path(wiki).resolve()
+    out = []
+    for p in Path(wiki).glob("*.md"):
+        if p.name in NON_PAGE_FILES or not p.is_file():
+            continue
+        target = p.resolve()
+        if target.is_relative_to(root):
+            out.append(p)
+    return sorted(out)
 
 
 def atomic_write_text(path: Path, text: str) -> None:

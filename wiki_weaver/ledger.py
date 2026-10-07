@@ -39,6 +39,7 @@ KIND_CHECKS = "checks_failed"
 KIND_MODEL_STEP = "model_step_failed"
 KIND_EMPTY = "empty_source"
 KIND_UNKNOWN = "unknown"
+KIND_OVERSIZED_CONTEXT = "oversized_context"
 
 
 def read_rows(wiki: Path) -> list[dict]:

@@ -150,9 +150,11 @@ def recover(corpus: Path) -> tuple[bool, str]:
 
 
 def commit_pending(corpus: Path, message: str) -> None:
+    """Snapshot the owner's pending work. Stages explicitly and never .wiki/work/."""
     if git(corpus, "status", "--porcelain").stdout.strip():
-        git(corpus, "add", "-A")
-        git(corpus, "commit", "-q", "-m", message)
+        git(corpus, "add", "-A", "--", ".", ":(exclude).wiki/work")
+        if git(corpus, "diff", "--cached", "--name-only").stdout.strip():
+            git(corpus, "commit", "-q", "-m", message)
 
 
 # ---------------------------------------------------------------- verbs

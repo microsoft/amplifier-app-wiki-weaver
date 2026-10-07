@@ -77,23 +77,24 @@ def test_recovery_leaves_unrelated_owner_changes_alone(corpus: Path, tmp_path: P
     assert "lens.md" in r.stderr and "draft-notes.md" in r.stderr  # reported, not touched
 
 
-def test_hold_leaves_unrelated_owner_changes_alone(corpus: Path, tmp_path: Path):
-    """An owner's uncommitted edit made before this source's write (here: while its brief
-    ran) is neither reverted nor committed by the pipeline's bookkeeping."""
+def test_hold_reverts_what_the_scope_check_named_even_an_owner_edit(corpus: Path, tmp_path: Path):
+    """B-lean rule (replaces the pre/post snapshot): hold reverts the journal's owned paths
+    and the paths the scope check named. An owner edit that is dirty while a writer runs is
+    indistinguishable from writer output, is named, and is reverted. The run's opening
+    snapshot commit makes this window exist only for edits made mid-run."""
     assert step(corpus, "select", str(tmp_path / "r"), "0", "-") == (0, "source")
     step(corpus, "assemble")
-    lens_edit = (corpus / "lens.md").read_text() + "\n## Owner note\nmine\n"
-    (corpus / "lens.md").write_text(lens_edit)
+    (corpus / "lens.md").write_text((corpus / "lens.md").read_text() + "\n## Owner note\nmine\n")
     fake_brief(corpus, [])
     assert step(corpus, "page_select") == (0, "ok")
     (corpus / SUMMARY).write_text(
         page("O", [ORCHARD], cite(corpus, "words not in the source at all") + "\n")
     )
     assert step(corpus, "checks") == (0, "rewrite")
+    assert "outside the selected pages: lens.md" in (corpus / ".wiki/work/findings.md").read_text()
     assert step(corpus, "checks") == (0, "hold")
     assert step(corpus, "hold", str(tmp_path / "r")) == (0, "next")
-    assert (corpus / "lens.md").read_text() == lens_edit
-    assert "## Owner note" not in (_head(corpus, "lens.md") or "")
+    assert "## Owner note" not in (corpus / "lens.md").read_text()
     assert (corpus / ".wiki/failed" / ORCHARD).exists()
 
 
@@ -211,5 +212,6 @@ def test_a_redropped_held_source_is_not_dropped_by_recovery(corpus: Path, tmp_pa
     step(corpus, "checks")
     step(corpus, "hold", str(tmp_path / "r"))
     (corpus / "_inbox" / ORCHARD).write_bytes((corpus / ".wiki/failed" / ORCHARD).read_bytes())
-    assert step(corpus, "recover") == (0, "clean")
-    assert (corpus / "_inbox" / ORCHARD).exists()
+    token = step(corpus, "recover")
+    assert (corpus / "_inbox" / ORCHARD).exists()  # the file first, then the routing token
+    assert token == (0, "clean")
