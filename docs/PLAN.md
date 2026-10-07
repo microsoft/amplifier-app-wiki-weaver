@@ -116,8 +116,13 @@ The design itself was over-steered, and we're loosening it:
   losses that a model judge missed entirely.
 - **Citations become thread-following, not proof.** A specific claim — a date, a number, a
   name, a commitment, a position — names its source and quotes a few of its words, so an
-  agent can jump to the exact spot; orientation and synthesis need no citation. Nothing to verify,
-  nothing that can fail a publish.
+  agent can jump to the exact spot; orientation and synthesis need no citation. No model grades a
+  sentence. The only check on a citation is mechanical: the quoted words must appear in
+  the named source. If they don't, the write fails and the writer gets one more attempt
+  with the finding; if it fails again, the source is set aside with its reason in the
+  ledger and the run continues. Nothing is lost and nothing waits on a person: the hold
+  is a signal to the retry path, and in Stage 3 a standing correction can change the
+  outcome.
 - **Pages accumulate rather than being replaced.** V3's renderer overwrote each page with
   the most recent source's view, silently hiding nearly half of everything it had
   extracted — pages that looked completely fine. We found it by counting rows against
@@ -146,7 +151,7 @@ Each traces to something measured or decided, not to taste.
    calls independently matched a competent human on 19–20 of 21 cases. Grading a finished
    write cannot change how the write happened.*
 3. **The writer is the quality node.** It gets the lens, the standing corrections, the
-   disagreement contract, a source cap, and the citation convention.
+   disagreement contract, the lens's page structure, and the citation convention.
    *Evidence: tracing where information was lost put the overwhelming majority of loss at
    ingest — the first read of a source — not at composition or retrieval.*
 4. **Pages accumulate; history stays visible.** New material is integrated, not
@@ -260,11 +265,13 @@ no model calls. The purity test covers all of it: no model call anywhere outside
       → select_source   shell   next source, keyed on content
       → brief           MODEL   lens + standing corrections + the source →
                                 what is this about, what matters here, what to watch for
-      → write           MODEL   brief + lens + corrections + index + only the pages it
-                                touches → source summary, and integration into topic pages;
-                                disagreement contract; source cap; citation convention
+      → write           MODEL   brief + lens + corrections + index + only the sections it
+                                touches → source summary, and dated entries into the aspect
+                                sections of topic pages; disagreement contract; citation
+                                convention; returns changed sections only
       → checks          shell   citations resolve · content-loss guard · duplicate headings ·
-                                source cap · link integrity
+                                heading set · Current state format · superseded blocks ·
+                                write scope · link integrity
                                 → ROUTES: pass | rewrite-once | hold (→ .wiki/failed/<name>)
       → commit          shell   git commit; record the source as done
       → (loop)
@@ -277,6 +284,41 @@ readable rather than disappearing. The content-loss guard enforces this mechanic
 page that loses material without a supersession marker doesn't commit. The disagreement
 contract keeps a two-sided exchange from collapsing into a settled conclusion, and keeps
 *decided* distinct from *proposed* and *still open*.
+
+**Page shape — general, set by the lens.** Every accumulating page, in any corpus, opens
+with a `## Current state (as of <latest source date>)` roll-up: a synthesis of the page as it
+stands, replaced in full on every pass, written for a reader who reads nothing else. Below
+it, the record is organized into sections the lens names for that page type. The *mechanism*
+is the same for every deployment; only the *section names* come from the lens. A team
+status wiki might name Owners · Commitments · Blockers · Decisions · Open questions; a
+personal journal might name Decisions · Learnings · Next; a repository wiki whatever its
+wrapper's schema says. New material becomes dated entries inside those sections, newest
+first. A source is never a section — its narrative lives on its summary page. A
+deterministic check holds whatever heading set the lens defines.
+
+**Why sections are the unit of work.** The writer used to receive every selected page
+whole. Pages grow with every source that touches them, so the writer's input grew with the
+wiki — a median of 825K characters per source at 129 sources, 1.5M at the maximum, rising
+55% an epoch, on course to exceed the model's window before the full corpus. But one source
+only ever changes a few sections of a page: the roll-up, and the aspects it has something to
+add to. So the writer now receives exactly those — Current state, the sections the brief
+named, and a heading-only outline of the rest — and returns the changed sections in full; a
+deterministic step splices them back. Input is bounded by section size, which is roughly
+constant, instead of page size, which is not. The same shape serves the reader: an
+answering agent reads Current state first and opens a section only when it needs one, so
+cost to answer stops scaling with page size too. This is R11's lever — less read per pass —
+built into the structure rather than tuned.
+
+**Supersession is a block.** Text that is no longer true is wrapped in
+`<!-- superseded: YYYY-MM-DD -->` … `<!-- /superseded -->`, covering exactly the old words;
+the replacement goes outside the block as its own entry. A block may not cite the source
+being ingested — you cannot supersede what you just wrote. The date is the source's when a
+position changed in a source, and the ingest date when the source file itself was edited.
+
+*Added 2026-10-06 after E04. None of the three was in the original design; each answers a
+measured failure — 51% of topic-page sections named for a meeting, writer input at 1.51M
+characters and rising 55% per epoch, 20–35% of superseded markers wrapping the new text.
+See docs/LEARNINGS.md.*
 
 **Oversized sources — the call, made here rather than discovered later.** Long transcripts
 don't fit one pass with a small model. We use a large-context model for the write step and
@@ -380,7 +422,7 @@ to something that already works.
 
 | Stage | What ships | Done when | Target |
 |---|---|---|---|
-| **1 — the working pipeline** | The three graphs, installable and runnable end to end. Lens delivered to the writer. Checks route. Pages accumulate. The writer reads `lens/corrections/` from day one (empty at first); a `feedback` verb appends to `feedback/log.jsonl`. Run first on a 7-file smoke slice, then one epoch (E01, 31 sources), then a second epoch incrementally, then the full 215; and on a second, personal corpus with a different lens and no code changes | Purity acceptance passes · smoke, epoch and incremental slices pass · full corpus ingests unattended · evaluation baseline recorded: synthesis and cost, against grep and V2 | **days, from 9/30** |
+| **1 — the working pipeline** | The three graphs, installable and runnable end to end. Lens delivered to the writer. Checks route. Pages accumulate. The writer reads `lens/corrections/` from day one (empty at first); a `feedback` verb appends to `feedback/log.jsonl`. Run first on a 7-file smoke slice, then one epoch (E01, 31 sources), then a second epoch incrementally, then the full 215; and on a second, personal corpus with a different lens and no code changes | Purity acceptance passes · smoke, epoch and incremental slices pass · full corpus ingests unattended · measurements recorded per epoch — wall time, model calls, page sizes, writer input, ask cost (the scored eval against grep and V2 is deferred per the 9/30 decision; §7's "no stage waits on evals" holds) | **days, from 9/30** |
 | **2 — running in Resolve** | The four verbs and the tarball package over the same pipeline, called the way Team Pulse's current version is called. The command-line path is the bridge that keeps Team Pulse unaffected; running the graph directly is the destination, unlocked by the graph being pure — timing with Marc and Ken | One job executes in Resolve; Team Pulse can call it without noticing what changed underneath | days after Stage 1 complete |
 | **3 — the learning loop** | The correct path end to end, plus interactive mode for the brief | A correction given at source N is honored at source N+1, demonstrated | week 2 |
 | **4 — corrections become lens** | Lens edits proposed from accumulated corrections; the owner accepts or declines with a reason; declines feed the next pass | An owner reviews and accepts a proposed lens edit end to end | week 2–3 (gated on Stage 3 having run long enough to accumulate corrections) |
@@ -592,8 +634,12 @@ in the build and how it was fixed, in `docs/LEARNINGS.md`; caller-facing promise
   deployment.
 - **Improvements are not additive.** Two individually positive changes measured together once
   came out negative. Combinations get measured.
-- **Aggregate claims about people are the highest-risk inference class.** Person pages get the
-  source cap and the strictest attribution rule.
+- **Aggregate claims about people are the highest-risk inference class.** Person pages are
+  covered by the lens's instruction to record roles only as the sources state them, and by
+  the citation check; no separate rule.
+- **Writer input grows with page size.** At 129 sources the writer's median input was 825K
+  characters, max 1.51M, rising ~55% per epoch — on course to exceed the model's window
+  before 215. Mitigation: sections as the unit of work (§5). Watched per epoch.
 - **No migration path.** V4 re-ingests from sources; there's no converter from an existing V1
   or V2 wiki. For anyone holding a wiki that took a week to build, that's a real cost and we're
   stating it rather than discovering it later. Sources are retained in every version, so

@@ -92,75 +92,61 @@ that's a signal.
   path depends on it.
 - The three ask questions run on the team corpus after E03, not on personal.
 
-## 2026-10-06 — Stage 1, CP4 (E03 into e01)
 
-- E03 ran with no code change after 427d3d4: 33/33 converged, 0 held, 0 model-step
-  timeouts, 1 first write failed (3 short quotes, fixed on rewrite). The 5-word minimum
-  stays; next decision after E04 numbers.
-- REVISIT: writer input is now a median 617 K and a max 1.0 M characters per source (the
-  whole of each selected page is handed over). Wall time stayed flat (median 255s vs 243s
-  in E02), so this is a cost and context-headroom question before it is a time one.
-- OPEN: `## Current state` is not behaving as a rewritten summary — see LEARNINGS
-  2026-10-06. No change made; the owner decides between a writer-prompt fix and a check.
+## 2026-10-06 — Stage 1, after E04 (two audits)
 
-## 2026-10-06 — Stage 1, CP4 (E04 into e01)
+- Stop e01 after E04; no E05–E07 on it. Stage 1 completes on a fresh corpus built under
+  the final design; e01 is kept as the before-artifact. Reason: a wiki built under three
+  rule sets is not a clean rehearsal; a fresh start removes the consolidation pass and the
+  backfill.
+- Sections become the writer's and the reader's unit of work: Current state + the named
+  aspect sections + a heading outline, never the whole page. Reason: E04 writer input
+  median 825K chars, max 1.51M, +55%/epoch — overflows the window by E06–E07. R11's own
+  lever: less read per pass.
+- Aspect sections per page type, named in the lens (Team Pulse initiatives: Owners ·
+  Commitments · Blockers · Decisions · Open questions; a heading pattern for chronological
+  types); the writer adds dated entries inside, newest first, and never adds a `##`; a
+  deterministic check holds the heading set; source pages exempt. Reason: 637 of 1,252
+  topic-page headings (51%) were meeting-named. Not in PLAN.md as written — §5 updated.
+- The brief names, per selected page, the aspect sections the source adds to. Reason:
+  principle 2, and the extraction step needs to know what to pull.
+- Superseded marker becomes a delimited block; a block may not cite the current source.
+  Reason: 20–35% of markers wrapped the new text.
+- Current state: universal by default; the lens opts decisions out; source pages exempt.
+  `(as of)` = the latest source date on the page. Reason: 20 source pages and 12 of 43
+  decision pages had one; headings said 2026-10-06 over June content.
+- Citation density held at ~69% of body lines; measured for drift, not acted on. Reason:
+  76% → 69% after the specific-claims rule; the content is mostly specific claims.
+- Source-page links dropped from citations; index source entries carry the `s<id>`.
+- Principle-8 exception, recorded: mechanics identical for every lens live in the writer
+  prompt — how the roll-up is treated, how supersession is marked, returning changed
+  sections. What matters and what pages look like live in the lens. Test: would the
+  sentence differ per corpus?
+- §9 person-page attribution: covered by the lens line ("only as the sources state them")
+  and the citation check; no separate rule.
+- Page growth is bounded by readability (Current state + aspects) and cost (sections);
+  splitting is deferred until sections themselves grow. Reason: superseded share is 2–5% —
+  these are live pages, not history bloat.
+- §6 done-when "evaluation baseline recorded" → "measurements recorded," per the 9/30
+  decision to dial evals down; resolves the §6/§7 contradiction.
+- Grep comparison for R10: after Stage 1 closes, not in the critical path.
+- Phase order: A correctness, test-first → independent verification → B shape and section
+  design → fresh run (E01, stop and inspect, then E02–E07). Same builder for A; the audit
+  session verifies.
 
-- `## Current state` is the page's roll-up, replaced in full every pass, first `##`
-  section, heading exactly `## Current state (as of YYYY-MM-DD)`. Writer prompt states the
-  shape; each lens says what it covers per page type; the checks node enforces the
-  heading format and position on any page that has the section (fail → rewrite once). No
-  length rule; no backfill (the pages without one are a post-E07 step).
-- The 5-word quote minimum stays; the REVISIT is closed (3 findings in 33 sources at E03,
-  6 in 31 at E04, all fixed on rewrite).
-- Writer input unchanged. REVISIT: at E04 the median is 825 K characters, 19 of 31
-  sources exceed 800 K, the max is 1.51 M, and wall time now tracks it (r = 0.64).
-- OPEN: `(as of <date>)` is filled with the ingest date (today), not the latest source
-  date the section reflects; the sections say "as of 2026-06-26" in their text instead.
-- OPEN: the heading-prefix match catches a source summary headed
-  `## Current state, as Manoj described it (2026-05-15)`; `lint` reports it. Harmless
-  until that summary is rewritten.
+## 2026-10-07 — Stage 1, Phase A and its verification
 
-## 2026-10-06 — Stage 1, Phase A (correctness; e01 stopped after E04)
-
-- Superseded text is a block, `<!-- superseded: DATE -->` … `<!-- /superseded -->`,
-  wrapping only what is no longer true; the replacement sits outside it. A check fails a
-  block that cites the source being ingested. A lone legacy marker covers the rest of
-  its line.
-- Loss guard: no marker exemption for the 15% rule (superseded text stays, so it is not a
-  deletion); a removed heading passes only if its text survives on or next to a marker
-  line; deleting a tracked selected page fails.
-- Source bookkeeping copies first, records and commits, and removes the inbox copy last.
-  Recovery restores every uncommitted path from HEAD (not the index), keyed on
-  `.wiki/work/current.json` or `.wiki/work/inflight`; it drops an inbox copy only when an
-  identical copy is committed in `_sources/`. A failed recovery stops the run (exit 1).
-- Graph parameters reach steps as environment variables (`tool_env`), never as shell
-  text.
-- The run lock is an `flock` on `.wiki/ingest.lock`, held by the open descriptor; the PID
-  in the file is for messages only. Chosen over write-PID-atomically because PID-based
-  stale reclaim still races (two reclaimers can each delete the other's fresh lock);
-  the kernel releases a dead holder's lock. `init` takes the same lock.
-- A failed index step routes to `index_restore`: index.md and log.md back to HEAD, page
-  commits kept, run exits 1.
-- `--source` on a held file commits the move back to `_inbox/` before the write, so the
-  scope check sees only the writer's changes.
-- Every `[s<id>]`, quoted or bare, must resolve through the ledger.
-- current.json, ledger rows and batch JSONL are written via temp file + `os.replace`.
-
-## 2026-10-07 — Stage 1, Phase A re-verification
-
-- Every pipeline operation that changes tracked state first writes a journal
-  (`.wiki/work/journal.json`: op, source, destination, owned paths). Recovery returns only
-  owned paths to HEAD and reports every other uncommitted change untouched. Owned: the
-  source's retained copy, `.wiki/failed/<name>`, the source-version copy, the ledger, the
-  summary page and the selected pages; `index.md` and `log.md` for the index phase.
-- Pipeline commits stage and commit only owned paths (`git commit --only`), never `-A`.
-- Hold reverts owned paths plus changes that appeared while the writer ran (the scope
-  check names them); changes that existed before the write are the owner's and stay.
-  The scope check ignores those pre-existing changes too.
-- `init` runs recovery under the run lock before scaffolding; a failed recovery exits 1.
-- After a committed hold, skip or ingest, recovery drops the inbox copy only when it is
-  byte-identical to the copy committed at the journal's destination. A held file
-  re-dropped into `_inbox/` with no journal is left alone (RepoWeaver's retry path).
-- ask reads READING.md, index.md and every page through one contained-read: resolved,
-  a regular file, inside the corpus root.
-- `ruff` is in the `dev` dependency group (`uv run ruff check .`).
+- The ingest lock is a kernel flock on `.wiki/ingest.lock`, held by the CLI process for the
+  whole run; `init` takes the same lock. The builder's call over the prescribed atomic PID
+  write, accepted: an atomic PID still races on stale reclaim; the kernel releases on holder
+  death. Contention exits 75.
+- Tool nodes never interpolate data into shell text: every one runs `"$PY" -m
+  wiki_weaver.steps <step>` with parameters as environment variables, and the purity test
+  enforces that form.
+- Recovery rollback is scoped to the in-flight operation's journaled paths — the source, its
+  selected pages, its bookkeeping. Unrelated uncommitted changes are reported, never touched.
+  `init` runs recovery before it commits anything; the index phase is journaled. (Phase A.2)
+- Every corpus-derived read in `ask` goes through one contained-read that rejects paths
+  resolving outside the corpus root. (Phase A.2)
+- Independent verification is a cross-provider code reviewer with clean context, run after
+  every correctness phase; its verdict gates the next phase. Phase A → NOT SAFE → Phase A.2.
