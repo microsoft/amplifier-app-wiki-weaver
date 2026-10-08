@@ -300,3 +300,15 @@ reads followed symlinks out of the root. One test kept the heading it claimed to
 **Fix.** Phase A.2, same discipline — failing test from each repro first — then the same
 reviewer re-verifies before Phase B.
 **Status.** In progress.
+
+### init's lens draft knows nothing of section sets — 2026-10-07
+**Problem.** init's draft node asks only for page type names and one line each; it knows
+nothing about `Sections:`, `Sections pattern:`, `Current state covers:` or
+`Current state: none`.
+**How it showed.** Found while staging the smoke run. A smoke run on an init-generated lens
+would have reported heading counts with no rule in force — the measure that says the design
+works would have meant nothing.
+**Fix.** None in the draft node: section sets are deployment policy (DECISIONS 2026-10-07).
+Smoke and full/ take e01's `## Page types` verbatim after init.
+**Status.** Recorded. Post-Stage-1: the init interview path is the right place to ask a
+human what each page type should track; the purpose path should not have a model invent it.
