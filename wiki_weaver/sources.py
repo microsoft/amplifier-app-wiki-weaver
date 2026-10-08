@@ -13,6 +13,8 @@ import yaml
 
 _FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.DOTALL)
 _DATE_RE = re.compile(r"(20\d\d-\d\d-\d\d)")
+_SLICE_RE = re.compile(r"^_Slice:\s*(20\d\d-\d\d-\d\d)\s+to\s+(20\d\d-\d\d-\d\d)")
+_RANGE_RE = re.compile(r"(20\d\d-\d\d-\d\d)_to_(20\d\d-\d\d-\d\d)")
 
 
 def sha256_file(path: Path) -> str:
@@ -59,6 +61,12 @@ def source_meta(path: Path, text: str | None = None) -> dict:
             meta["date"] = m.group(1) if m else s.split(":", 1)[1].strip() or None
         elif s.lower().startswith("speakers:") and "speakers" not in meta:
             meta["speakers"] = s.split(":", 1)[1].strip()
+        elif meta["date"] is None and (m := _SLICE_RE.match(s)):
+            # a windowed export is dated by the END of the window it covers
+            meta["date_start"], meta["date"] = m.group(1), m.group(2)
+    # No slice header: a filename range "A_to_B" is the window; date it by B.
+    if meta["date"] is None and (m := _RANGE_RE.search(path.name)):
+        meta["date_start"], meta["date"] = m.group(1), m.group(2)
     dates = _DATE_RE.findall(path.name)
     if meta["date"] is None and dates:
         # "pulled-" dates are export dates, not content dates; prefer the others.

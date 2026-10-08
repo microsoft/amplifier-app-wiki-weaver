@@ -108,3 +108,22 @@ def test_ingest_shows_the_lens_page_types_it_parsed(corpus: Path):
     by_type = {t["type"]: t for t in res["lens_page_types"]}
     assert by_type["topics"]["rule"] == "sections: What it is · Open questions"
     assert by_type["people"]["rule"] == "no heading rule"
+
+
+def test_a_windowed_source_is_dated_by_its_window_end(tmp_path: Path):
+    from wiki_weaver.sources import source_meta
+
+    sliced = tmp_path / "Orchard chat__chat__pulled-2031-04-01-1200__2031-03-01_to_2031-03-31.md"
+    sliced.write_text(
+        "# Chat: Orchard\n\nChat type: Group\n\n---\n\n"
+        "_Slice: 2031-03-02 to 2031-03-06 (epoch E01 of a larger export)._\n\n## 2031-03-02\nhi\n"
+    )
+    m = source_meta(sliced)
+    assert (m["date"], m.get("date_start")) == ("2031-03-06", "2031-03-02")
+    ranged = tmp_path / "Orchard chat__chat__pulled-2031-04-01-1200__2031-03-01_to_2031-03-31.md"
+    ranged.write_text("# Chat: Orchard\n\n## 2031-03-02\nhi\n")
+    m = source_meta(ranged)
+    assert (m["date"], m.get("date_start")) == ("2031-03-31", "2031-03-01")
+    plain = tmp_path / "2031-03-02 Orchard Sync.md"
+    plain.write_text("Date: 2031-03-02\n")
+    assert source_meta(plain)["date"] == "2031-03-02"

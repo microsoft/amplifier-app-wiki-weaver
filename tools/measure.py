@@ -111,6 +111,10 @@ def current_state_metrics(text: str) -> dict | None:
         if not m:
             # a prose paragraph line: does its opener name a source?
             opener = re.sub(r"[*_]", "", ln.strip())[:80]
+            # "(Brian Krabach in the chat)" says where a name appeared, not a source as subject
+            opener = re.sub(
+                r"\([^()]*\bin the (chat|call|meeting|recording|transcript)\)", "", opener
+            )
             if not ln.startswith((" ", "\t")) and SOURCE_WORDS.search(opener):
                 src_prose += 1
             continue
