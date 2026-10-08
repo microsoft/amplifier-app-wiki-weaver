@@ -10,7 +10,7 @@ from wiki_weaver import checks as ck
 def test_transcript_header_date_m_d_yyyy_becomes_iso(tmp_path: Path):
     from wiki_weaver.sources import source_meta
 
-    t = tmp_path / "Orchard Sync__rec-2031-03-07-1545-ab12cd__pulled-2031-04-01-1200.transcript.md"
+    t = tmp_path / "Orchard Sync recording 2031-03.md"
     t.write_text("# Transcript: Orchard Sync\n\nDate: 3/7/2031, 3:45:31 PM\nSpeakers: Wren\n")
     assert source_meta(t)["date"] == "2031-03-07"
     t.write_text("# Transcript: Orchard Sync\n\nDate: 12/15/2031, 9:05:00 AM\n")
