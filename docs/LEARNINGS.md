@@ -312,3 +312,15 @@ works would have meant nothing.
 Smoke and full/ take e01's `## Page types` verbatim after init.
 **Status.** Recorded. Post-Stage-1: the init interview path is the right place to ask a
 human what each page type should track; the purpose path should not have a model invent it.
+
+### Model-step timeouts bound awake time, not wall time — 2026-10-08
+**Problem.** The engine's per-node timeout runs on a monotonic clock that stops while the
+machine sleeps. On a sleeping laptop the 900s brief timeout never fires, and a run hangs
+indefinitely while looking alive — a fail-loud guard that silently did not fire.
+**How it showed.** Smoke run on smoke-b: a brief request sent 03:49:46 UTC returned
+05:37:17 with no timeout; the power log shows a lid-closed sleep at 05:32. An earlier
+attempt sat about 3 hours on one brief request the same way.
+**Fix.** Operational for Stage 1: sleep disabled for the duration of a run. A wall-clock
+deadline alongside the step timeout is a candidate for later, not now — Resolve containers
+don't sleep, so this is laptop-only.
+**Status.** Recorded; operational fix in force for the Stage 1 runs.
