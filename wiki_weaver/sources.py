@@ -13,6 +13,7 @@ import yaml
 
 _FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.DOTALL)
 _DATE_RE = re.compile(r"(20\d\d-\d\d-\d\d)")
+_MDY_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(20\d\d)\b")
 _SLICE_RE = re.compile(r"^_Slice:\s*(20\d\d-\d\d-\d\d)\s+to\s+(20\d\d-\d\d-\d\d)")
 _RANGE_RE = re.compile(r"(20\d\d-\d\d-\d\d)_to_(20\d\d-\d\d-\d\d)")
 
@@ -58,7 +59,14 @@ def source_meta(path: Path, text: str | None = None) -> dict:
             meta["title"], meta["kind"] = s.split(":", 1)[1].strip(), meta["kind"] or "chat"
         elif meta["date"] is None and s.lower().startswith("date:"):
             m = _DATE_RE.search(s)
-            meta["date"] = m.group(1) if m else s.split(":", 1)[1].strip() or None
+            mdy = _MDY_RE.search(s)
+            if m:
+                meta["date"] = m.group(1)
+            elif mdy:  # transcript headers: "Date: 5/15/2026, 2:20:15 PM"
+                mo, dd, yy = mdy.groups()
+                meta["date"] = f"{yy}-{int(mo):02d}-{int(dd):02d}"
+            else:
+                meta["date"] = s.split(":", 1)[1].strip() or None
         elif s.lower().startswith("speakers:") and "speakers" not in meta:
             meta["speakers"] = s.split(":", 1)[1].strip()
         elif meta["date"] is None and (m := _SLICE_RE.match(s)):

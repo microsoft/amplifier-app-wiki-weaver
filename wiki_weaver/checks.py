@@ -100,6 +100,10 @@ def check_citations(name: str, text: str, sources: dict[int, tuple[str, str]]) -
             errs.append(f'{name}: quote not found verbatim in s{sid} ({fname}): "{quote[:80]}"')
         if listed and fname not in listed:
             errs.append(f"{name}: cites s{sid} ({fname}) but it is not in frontmatter sources")
+    for m in MD_LINK_RE.finditer(body):
+        target = m.group(1).strip("<>").split("#")[0]
+        if re.fullmatch(r"(\./)?source-[^/]*\.md", target):
+            errs.append(f'{name}: links to a source page ({target}); cite as [s<id>: "quote"] only')
     for m in BARE_CITE_RE.finditer(body):
         if int(m.group(1)) in sources:
             errs.append(f"{name}: citation without a quote: [s{m.group(1)}]")
@@ -268,6 +272,7 @@ CHECK_KINDS = (
     ("quote under 5 words", "short_quote"),
     ("not found verbatim", "citations"),
     ("not in frontmatter sources", "citations"),
+    ("links to a source page", "source_link"),
     ("citation without a quote", "citations"),
     ("broken link", "links"),
     ("broken wikilink", "links"),
