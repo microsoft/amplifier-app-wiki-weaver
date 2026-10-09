@@ -324,3 +324,17 @@ attempt sat about 3 hours on one brief request the same way.
 deadline alongside the step timeout is a candidate for later, not now — Resolve containers
 don't sleep, so this is laptop-only.
 **Status.** Recorded; operational fix in force for the Stage 1 runs.
+
+### A new page check needs a corpus migration before it is armed — 2026-10-09
+**Problem.** The source-link check (a markdown link to a `source-*.md` page fails the
+write) was armed on a corpus that already carried 8 such links on 4 pages.
+**How it showed.** E02's first changed-source re-ingests selected `workstream-chats.md`,
+whose 3 legacy links sat inline. Removing them changed 3 of its 17 lines (18%), which the
+15% loss guard rejects; keeping them fails the new check. 3 of the first 4 E02 sources
+were held, all on that page, about 8 minutes and two writer calls each.
+**Fix.** A deterministic corpus migration removed the 8 links (no model; citations
+unchanged; `lint` 0 errors), then the held sources were re-dropped. Rule: a new
+deterministic check on page content needs a corpus migration before it is armed, or every
+source touching legacy content is held. The citation-id change did this (transform, then
+lint); the source-link check didn't.
+**Status.** Applied to full/ (corpus commit e2273b0) before resuming E02.
