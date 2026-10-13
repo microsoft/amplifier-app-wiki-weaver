@@ -425,7 +425,7 @@ to something that already works.
 | Stage | What ships | Done when | Target |
 |---|---|---|---|
 | **1 — the working pipeline** | The three graphs, installable and runnable end to end. Lens delivered to the writer. Checks route. Pages accumulate. The writer reads `lens/corrections/` from day one (empty at first); a `feedback` verb appends to `feedback/log.jsonl`. Run first on a 7-file smoke slice, then one epoch (E01, 31 sources), then a second epoch incrementally, then two epochs on a fresh corpus under the final page design (e01 — 129 sources under the predecessor shape — retained as the before-artifact); and on a second, personal corpus with a different lens and no code changes | Purity acceptance passes · smoke, epoch and incremental slices pass · two epochs ingest unattended on a fresh corpus under the final page design (the full corpus under that design is the first post-Stage-1 milestone) · measurements recorded per epoch — wall time, model calls, page sizes, writer input, ask cost (the scored eval against grep and V2 is deferred per the 9/30 decision; §7's "no stage waits on evals" holds) | **days, from 9/30** |
-| **2 — running in Resolve** | The four verbs and the tarball package over the same pipeline, called the way Team Pulse's current version is called. The command-line path is the bridge that keeps Team Pulse unaffected; running the graph directly is the destination, unlocked by the graph being pure — timing with Marc and Ken | One job executes in Resolve; Team Pulse can call it without noticing what changed underneath | days after Stage 1 complete |
+| **2 — running in Resolve** | The four verbs and the tarball package over the same pipeline, called the way Team Pulse's current version is called. The command-line path is the bridge that keeps Team Pulse unaffected; running the graph directly is the destination, unlocked by the graph being pure — timing with Marc and Ken | One job executes in Resolve; Team Pulse can call it without noticing what changed underneath | weeks after Stage 1 — the rebuild of Team Pulse's history alone is days of jobs; see `docs/STAGE2.md` |
 | **3 — the learning loop** | The correct path end to end, plus interactive mode for the brief | A correction given at source N is honored at source N+1, demonstrated | week 2 |
 | **4 — corrections become lens** | Lens edits proposed from accumulated corrections; the owner accepts or declines with a reason; declines feed the next pass | An owner reviews and accepts a proposed lens edit end to end | week 2–3 (gated on Stage 3 having run long enough to accumulate corrections) |
 | **5 — cross-check views** *(optional)* | A second extraction technique run in parallel with the summarizer; disagreements surface as findings | Measured against Stage 3 — adopted only if it wins | later |
@@ -437,7 +437,7 @@ splice is triggered by what the full-corpus rebuild shows rather than built firs
 triggered it is inside Stage 2; the merge to `main` moves to the switch; the four data-safety
 items move from Stage 2 to the switch, which is Team Pulse's decision and not part of Stage 2.
 
-**First after Stage 1 — sections as the unit.** One branch, one milestone. The writer receives
+**First after Stage 1 — sections as the unit.** One branch, one milestone — triggered, not scheduled: the Stage 2 rebuild stops at its first oversized-context hold, the splice is built on that measurement, and the rebuild resumes from the held source (`docs/STAGE2.md`, Phase 3). The writer receives
 and returns sections, not pages; glue does every write. The brief names the sections. `ask`
 reads Current state first and drills on demand. Tools come off model nodes where the engine
 allows. Then the full 215 under the final design — the scale validation Stage 1 handed off —
@@ -456,7 +456,7 @@ characters per question measured before and after. *Watch:* whether the writer n
 
 **Owed for Stage 2** — conformance tests from both contracts, if not finished during the Stage 1
 run; `--limit ≤ 0` → exit 2, and hold logging when a batch is all-held; the `update` verb (OPEN
-for Marc); CI fixed before the `main` merge; the merge sequence `v4-build` → `v4` → `main`.
+for Marc); CI fixed before the `main` merge; the merge sequence `v4-build` → `v4`; `→ main` moves to the switch (`docs/STAGE2.md`, addendum).
 
 **Later, not scheduled** — picked up as the earlier stages close out:
 
@@ -689,8 +689,10 @@ in the build and how it was fixed, in `docs/LEARNINGS.md`; caller-facing promise
 **Plan, where a question was open**
 
 - **Repository.** V4 is built on the canonical `amplifier-app-wiki-weaver` repo — on a branch,
-  merged to `main` once Stage 2 passes. That repo is what the Resolve worker image builds from,
-  so landing there *is* the transparent swap for Team Pulse. V1 and V2 remain as tags, and the
+  merged to `main` at the switch (`docs/STAGE2.md`, addendum), after any lane whose worker image
+  builds from `main` is pinned, so that landing there cannot swap anything by accident. The swap
+  is not transparent: Team Pulse's wiki is rebuilt from sources (§9), and the switch is theirs to
+  make. V1 and V2 remain as tags, and the
   version-numbered repo naming ends.
 - **Who adjudicates lens edits.** The person responsible for that particular system, per the
   sync. For Team Pulse specifically, we should name who that is.
