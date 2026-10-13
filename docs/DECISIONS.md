@@ -247,3 +247,35 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
   corpus git.
 - Staged E02 lives beside full/ (`ww-corpora/full_staged-E02/`), not inside it: the corpus
   contract covers _inbox/, _sources/, .wiki/ and root pages only.
+
+## 2026-10-13 — Stage 2 scope
+
+- Stage 2 is "V4 running in Resolve, consistently": a complete V4 wiki of Team Pulse's history
+  built inside Resolve, and every V1 job since the snapshot also run through V4. It is not
+  "Team Pulse has switched." The switch is an addendum — Team Pulse's decision, later.
+  Execution plan: docs/STAGE2.md.
+- Four phases, named by outcome: V4 is ready to run where we don't control the environment;
+  V4 runs a job inside Resolve; Team Pulse's wiki exists in V4, built inside Resolve; V4 runs
+  alongside V1 on Team Pulse's live inputs.
+- Brian's method governs: end to end first; fix what the run shows; every deferred item has a
+  trigger.
+- The splice is triggered, not built first: any oversized-context hold in the Phase 3 rebuild
+  starts it, inside Stage 2, and Stage 2 is not done until the held sources are re-ingested. We
+  expect it to fire — on the current page shape, writer input quadrupled from 31 to 65 sources
+  (LEARNINGS, "Writer input quadrupled in one epoch").
+- The four data-safety items recorded as Stage 2 blockers move to the switch addendum: none is
+  reachable on the Resolve path (a code-built zip has no symlinks; nobody edits between jobs;
+  .git does not travel). Closed by the splice if built, or by direct fixes, before V4 is offered
+  beyond Team Pulse. Phase 1 verifies the two symlink claims rather than assuming them.
+- The shadow runs every V1 job since the rebuild snapshot, in order, on our trigger — a skipped
+  batch or a gap makes the comparison meaningless. Five runs or a week.
+- The scored evaluation stays deferred (9/30). The shadow's side-by-side is observation, not a
+  gate.
+- V4 stays on the v4 branch; Resolve's runtime pin points at a v4 commit; merging to main moves
+  to the addendum, after the VM lane's worker image is pinned.
+- Current state drift (LEARNINGS, 2026-10-13) is recorded in Stage 1 and fixed in Stage 2
+  Phase 1: the cheap fix first, tested on E02's busiest pages; the separate roll-up step before
+  Phase 3 if the test says so.
+- `.wiki/work/` joins the corpus contract's round-trip exclusions (clause 10). The resolver's
+  exclude list follows the contract. V4's fallback clears scratch only when init has just
+  created .git from nothing.

@@ -416,3 +416,30 @@ cites them.
   close is a refinement, not a supersession. 0 of 44 single-line blocks.
 **Fix.** None in Stage 1; the three defects go to the next milestone as listed.
 **Status.** Meets the bar; Stage 1 closes on this run.
+
+### Current state drifts back into a log on busy pages — 2026-10-13
+**Problem.** The writer is one model call with two opposite jobs on the same page. For every
+other section: integrate, never delete — enforced by the loss guard, which rejects a write
+that loses more than 15% of a page's lines. For Current state: replace in full — a sentence in
+the prompt, with no check behind it and no exemption from the 15% rule.
+**How it showed.** In E02, on pages touched by many sources, the writer kept the previous
+roll-up under a heading like "Earlier roll-up, kept for history" and stacked new paragraphs led
+by the latest meeting on top. Median roll-up length 2,572 → 4,088 characters; maximum 10,618.
+The loss guard fired on 8 first writes in E02, so the writer watched "deleting gets rejected"
+repeatedly and applied it to the one section where we wanted the opposite. It was complying,
+not disobeying. A second pressure pushes the same way: the writer works one source at a time,
+so each pass leads with what that meeting said. It looked fixed after E04 (meeting-named
+bullets went from a median of 5 to 0) and in the smoke run and E01 (few sources per page, no
+old roll-up to protect — one clean paragraph of ~2,500 characters). Three prompt sentences were
+tried — "replace in full," "describes the page, not the source," "where things stand, not how
+they got there" — and none held, for the same reason the source-link rule needed a check: a
+prose rule loses to a rule with a check behind it. Third instance of that lesson here.
+**Fix.** Remove the conflict instead of arguing with it. Cheap: strip Current state from the
+writer's input and ask for a new one — it cannot keep what it never received — and exclude that
+section from the loss guard's comparison so a shorter roll-up does not read as lost lines. No
+new model call. Structural: a separate step writes Current state after the batch's sections are
+finished — reads the sections, never sees the previous roll-up, one job; one call per touched
+page per batch, not per source; composes with the splice; can regenerate every roll-up over an
+existing wiki without re-ingesting.
+**Status.** Recorded at Stage 1 close; fixed in Stage 2 Phase 1 (cheap, tested on E02's busiest
+pages), with the structural step before Phase 3 if the test says so. See docs/STAGE2.md.

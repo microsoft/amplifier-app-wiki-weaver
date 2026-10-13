@@ -432,6 +432,11 @@ to something that already works.
 
 Measurements run from Stage 1; the scored evaluation is deferred per the 9/30 decision.
 
+**Stage 2's execution plan is `docs/STAGE2.md`.** It records three changes to this section: the
+splice is triggered by what the full-corpus rebuild shows rather than built first, and when
+triggered it is inside Stage 2; the merge to `main` moves to the switch; the four data-safety
+items move from Stage 2 to the switch, which is Team Pulse's decision and not part of Stage 2.
+
 **First after Stage 1 — sections as the unit.** One branch, one milestone. The writer receives
 and returns sections, not pages; glue does every write. The brief names the sections. `ask`
 reads Current state first and drills on demand. Tools come off model nodes where the engine
