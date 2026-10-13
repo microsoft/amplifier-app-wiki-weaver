@@ -326,3 +326,93 @@ escape. Two trace to the same cause the first round's fixes had worked around.
 **Fix.** Verify every phase, not only the first. When a second round finds a shared cause,
 change the design instead of patching again — which is why there is no Phase A.3.
 **Status.** Adopted; the design change is the splice milestone.
+**Status.** In progress.
+
+### init's lens draft knows nothing of section sets — 2026-10-07
+**Problem.** init's draft node asks only for page type names and one line each; it knows
+nothing about `Sections:`, `Sections pattern:`, `Current state covers:` or
+`Current state: none`.
+**How it showed.** Found while staging the smoke run. A smoke run on an init-generated lens
+would have reported heading counts with no rule in force — the measure that says the design
+works would have meant nothing.
+**Fix.** None in the draft node: section sets are deployment policy (DECISIONS 2026-10-07).
+Smoke and full/ take e01's `## Page types` verbatim after init.
+**Status.** Recorded. Post-Stage-1: the init interview path is the right place to ask a
+human what each page type should track; the purpose path should not have a model invent it.
+
+### Model-step timeouts bound awake time, not wall time — 2026-10-08
+**Problem.** The engine's per-node timeout runs on a monotonic clock that stops while the
+machine sleeps. On a sleeping laptop the 900s brief timeout never fires, and a run hangs
+indefinitely while looking alive — a fail-loud guard that silently did not fire.
+**How it showed.** Smoke run on smoke-b: a brief request sent 03:49:46 UTC returned
+05:37:17 with no timeout; the power log shows a lid-closed sleep at 05:32. An earlier
+attempt sat about 3 hours on one brief request the same way.
+**Fix.** Operational for Stage 1: sleep disabled for the duration of a run. A wall-clock
+deadline alongside the step timeout is a candidate for later, not now — Resolve containers
+don't sleep, so this is laptop-only.
+**Status.** Recorded; operational fix in force for the Stage 1 runs.
+
+### A new page check needs a corpus migration before it is armed — 2026-10-09
+**Problem.** The source-link check (a markdown link to a `source-*.md` page fails the
+write) was armed on a corpus that already carried 8 such links on 4 pages.
+**How it showed.** E02's first changed-source re-ingests selected `workstream-chats.md`,
+whose 3 legacy links sat inline. Removing them changed 3 of its 17 lines (18%), which the
+15% loss guard rejects; keeping them fails the new check. 3 of the first 4 E02 sources
+were held, all on that page, about 8 minutes and two writer calls each.
+**Fix.** A deterministic corpus migration removed the 8 links (no model; citations
+unchanged; `lint` 0 errors), then the held sources were re-dropped. Rule: a new
+deterministic check on page content needs a corpus migration before it is armed, or every
+source touching legacy content is held. The citation-id change did this (transform, then
+lint); the source-link check didn't.
+**Status.** Applied to full/ (corpus commit e2273b0) before resuming E02.
+
+### Current state slid back into a journal at 64 sources — 2026-10-13
+**Problem.** The roll-up instruction and the one added sentence ("It says where things
+stand, not how they got there; chronology belongs in the sections below") did not hold it.
+**How it showed.** full/, E01 → E02: Current state median 2,572 → 4,088 characters, max
+10,618 (team-pulse.md); lines per section 1 → 5. On busy pages it became a stack of "As of
+<date> (<meeting>): …" paragraphs plus an "Earlier roll-up, kept for history:" block inside
+the section (team-pulse, context-intelligence, resolve, chris). Likely cause: content loss
+was E02's most common first-write failure (8 of the 10 first-write failures that hit
+sources); the writer appears to keep old roll-ups to avoid it, not knowing Current state
+lines are exempt from the 15% rule.
+**Fix.** Structural, not another sentence: Current state is written by a separate step that
+reads the record sections and writes the roll-up fresh — a different call with a different
+instruction. Goes with the splice milestone.
+**Status.** Deferred to the splice milestone; no rule change in Stage 1.
+
+### Writer input quadrupled in one epoch — 2026-10-13
+**Problem.** The writer reads whole pages, and pages grow with every source.
+**How it showed.** full/, E01 → E02: writer input per call median 126K → 518K characters,
+max 805K; one call over 800K. The 11 changed-source re-ingests also pull in every page that
+cites them.
+**Fix.** The splice milestone: the writer reads and returns sections, not whole pages.
+**Status.** The urgency of the splice, in numbers. The 3.5M size guard holds nothing yet.
+
+### The Stage 1 cross-check — 2026-10-13
+**Problem.** Builder reports are not evidence; the generated wiki needed an independent read.
+**How it showed.**
+- Structure, counted independently against the lens sets: 28/28 accumulating pages open
+  with Current state; 0 off-set headings; 9 decision and 54 source pages correctly without
+  one; no duplicate headings, no broken links; 54/54 index source entries carry their id;
+  no meeting-named sections.
+- Evidence, verified against _sources/ by a reviewer starting cold: 8/8 sampled citations
+  exact; 6/6 uncited specific claims in Current state supported; the disagreement contract
+  held (resolve.md:281 keeps Gurkaran's and Brian's positions attributed, "open
+  disagreement, not decided").
+- Supersession: across ~100 block reads by three readers, 0 blocks wrapping the new fact —
+  the information-hiding failure that ran 20–35% on the old corpus.
+- Three placement defects, deferred: (a) misfiled entries — context-intelligence.md:75 has
+  page-generation meta under Owners, :137 a description the writer itself labelled "not a
+  new decision" under Decisions → the brief-names-sections item in the splice milestone;
+  (b) entries inside a section sit in integration order, not date order —
+  context-intelligence.md:72–74 and :148–151, team-pulse.md:74–77 → a deterministic sort in
+  the lint pass; (c) paul.md:90 supersedes a whole dated entry when only the approach inside
+  it changed → the content-based guard.
+- A reviewer's blocking finding cited a line that, on inspection, was a correct
+  supersession (the E01 coverage statement, superseded when the export was extended).
+  Reviewer verdicts get the same verification as builder reports.
+- Candidate lint rule, not armed: a block whose wrapped text reappears verbatim after the
+  close is a refinement, not a supersession. 0 of 44 single-line blocks.
+**Fix.** None in Stage 1; the three defects go to the next milestone as listed.
+**Status.** Meets the bar; Stage 1 closes on this run.

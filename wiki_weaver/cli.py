@@ -1,310 +1,496 @@
-# pyright: reportMissingImports=false
-#!/usr/bin/env python3
-"""wiki-weaver CLI.
+"""wiki-weaver CLI: a dispatcher.
 
-Thin argparse wrapper around the importable lib API (wiki_weaver.lib).
-
-Subcommands:
-    init <wiki_dir>            scaffold a fresh wiki
-    ingest [--wiki] [--source] integrate inbox sources via the engine
-    lint   [--wiki]            run the structural validator
-    doctor                     environment diagnostics
-    update [--check]           refresh @main sources to latest
-    ask    <question> [--wiki] answer a question by reading the compiled wiki
-    build-dashboard <corpus>   build a self-contained HTML dashboard
-    migrate <corpus>           relocate an old-layout corpus to the .wiki/ layout
-    supervise <wiki_dir>       observe-only health monitor for a live ingest run
+Verbs that need a model (init --purpose / interview, ingest, ask) launch
+``dot-runner run pipeline/<graph>.dot``. Everything else is plain Python.
+This module never calls a model.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
 
-from wiki_weaver._version import __version__
-from wiki_weaver._version_resolve import resolve_version
+from . import __version__, pidlock
+from . import checks as ck
+from . import result as rs
+from .dashboard import build_dashboard
+from .ledger import eligible, source_versions
+from .lens import describe, parse_page_types
+from .lib import (
+    contained_file,
+    feedback_log,
+    lens_path,
+    page_files,
+    wiki_failed,
+    wiki_inbox,
+    wiki_ledger,
+    wiki_runs,
+    wiki_sources,
+)
+from .steps import GIT_ID, jlines
+from .version import resolve_version
 
-# ---------------------------------------------------------------------------
-# Re-exports: symbols imported by tests from wiki_weaver.cli
-# ---------------------------------------------------------------------------
-from wiki_weaver.lib import (
-    SOURCES,
-    FAILED,
-    INBOX,
-    REGISTRY_NAME,
-    _assign_source_id,
-    _fail,
-    _parse_transcript_header,
-    _read_source_frontmatter,
-    ask,
-    doctor,
-    ingest,
-    init,
-    lint,
-    migrate,
-    preflight,
-    update,
+PKG = Path(__file__).resolve().parent
+CORPUS_IGNORES = (
+    "_inbox/",
+    ".wiki/work/",
+    ".wiki/runs/",
+    ".wiki/ask/",
+    ".wiki/init/",
+    ".wiki/ingest.lock",
+    ".DS_Store",
 )
 
-__all__ = [
-    # constants (test imports)
-    "SOURCES",
-    "FAILED",
-    "INBOX",
-    "REGISTRY_NAME",
-    # helpers (test imports)
-    "_assign_source_id",
-    "_parse_transcript_header",
-    "_read_source_frontmatter",
-    # clean lib API (re-exported for convenience)
-    "init",
-    "ingest",
-    "lint",
-    "doctor",
-    "update",
-    "ask",
-    "migrate",
-]
+
+def pipeline_dir() -> Path:
+    for cand in (PKG / "pipeline", PKG.parent / "pipeline"):
+        if (cand / "ingest.dot").is_file():
+            return cand
+    raise SystemExit("wiki-weaver: pipeline/*.dot not found (broken install)")
 
 
-# ---------------------------------------------------------------------------
-# cmd_* wrappers: unpack argparse.Namespace → call lib function
-# ---------------------------------------------------------------------------
-# These stay here (not in lib) so they remain importable from wiki_weaver.cli,
-# which is what tests and the main() dispatch expect.
+def stamp() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _gate(*, require_api_key: bool) -> int:
-    """Run the HARD-prereq preflight; return 0 if OK, nonzero if not.
-
-    On failure, print the clean one/two-line message(s) + a doctor hint so a
-    broken environment fails UPFRONT instead of crashing minutes into an
-    engine/LLM run. preflight() catches ImportError etc. internally, so nothing
-    bubbles up as a traceback.
-    """
-    failures = preflight(require_api_key=require_api_key)
-    if not failures:
-        return 0
-    for msg in failures:
-        _fail(msg)
-    print("Run `wiki-weaver doctor` for full diagnostics.")
-    return 1
+def die(msg: str, code: int = 1) -> None:
+    print(f"wiki-weaver: {msg}", file=sys.stderr)
+    raise SystemExit(code)
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    # init drives the engine + LLM (schema design) -> full preflight w/ key.
-    if rc := _gate(require_api_key=True):
-        return rc
+def run_graph(
+    graph: str,
+    corpus: Path,
+    params: dict[str, str],
+    logs_root: Path,
+    human_gate: str = "fail",
+    log_file: Path | None = None,
+) -> int:
+    """Launch one graph on the dot-runner engine with the corpus as cwd."""
+    exe = shutil.which("dot-runner")
+    if not exe:
+        die("dot-runner not found on PATH (run `wiki-weaver doctor`)")
+    cmd = [exe, "run", str(pipeline_dir() / f"{graph}.dot"), "--cwd", "."]
+    cmd += ["--logs-root", str(logs_root), "--on-human-gate", human_gate]
+    for k, v in {"py": sys.executable, **params}.items():
+        cmd += ["--param", f"{k}={v}"]
+    logs_root.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_file or logs_root.parent / f"{graph}.engine.log"
+    if human_gate == "console":
+        return subprocess.run(cmd, cwd=corpus, check=False).returncode
+    with log_file.open("a") as fh:
+        return subprocess.run(
+            cmd,
+            cwd=corpus,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        ).returncode
 
-    from wiki_weaver.engine_runner import run_init
 
-    return run_init(
-        args.wiki_dir,
-        purpose=args.purpose,
-        sample_inbox=not args.no_sample_inbox,
-        plain=args.plain,
+def git(corpus: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *GIT_ID, *args], cwd=corpus, capture_output=True, text=True, check=False
     )
 
 
-def cmd_ingest(args: argparse.Namespace) -> int:
-    # ingest drives the engine + LLM convergence loop -> full preflight w/ key.
-    if rc := _gate(require_api_key=True):
-        return rc
+def scaffold(corpus: Path) -> None:
+    """Create the layout. Idempotent: never overwrites anything that exists."""
+    for d in (
+        wiki_inbox(corpus),
+        wiki_sources(corpus),
+        wiki_failed(corpus),
+        wiki_runs(corpus),
+        corpus / "lens" / "corrections",
+        corpus / "feedback",
+    ):
+        d.mkdir(parents=True, exist_ok=True)
+    for keep in (wiki_sources(corpus), wiki_failed(corpus), corpus / "lens" / "corrections"):
+        (keep / ".gitkeep").touch()
+    feedback_log(corpus).touch()
+    reading = corpus / "READING.md"
+    if not reading.exists():
+        shutil.copy2(PKG / "data" / "READING.md", reading)
+    gi = corpus / ".gitignore"
+    have = gi.read_text().splitlines() if gi.exists() else []
+    missing = [line for line in CORPUS_IGNORES if line not in have]
+    if missing:
+        with gi.open("a") as f:
+            if have and have[-1].strip():
+                f.write("\n")
+            f.write("\n".join(missing) + "\n")
+    if not (corpus / ".git").exists():
+        git(corpus, "init", "-q")
+    commit_pending(corpus, "chore: scaffold wiki")
 
-    # Acquire the per-wiki ingest lock (D3) so a manual `wiki-weaver ingest` and a
-    # scheduled `schedule run-now` tick on the same wiki cannot run concurrently.
-    # This is a triggering-layer concern only -- `ingest()` itself stays lock-free.
-    from wiki_weaver import instances as _inst
-    from wiki_weaver import pidlock as _lock
-    from wiki_weaver.schedule import EXIT_SKIP, validate_limit
 
-    try:
-        limit = validate_limit(args.limit)
-    except ValueError as exc:
-        _fail(str(exc))
-        return 2
+def recover(corpus: Path) -> tuple[bool, str]:
+    """Undo whatever a dead run left half-done (wiki_weaver.steps recover), before any
+    scaffold or snapshot commit can stage it. Returns (ok, message)."""
+    if not (corpus / ".git").exists():
+        return True, ""
+    r = subprocess.run(
+        [sys.executable, "-m", "wiki_weaver.steps", "recover"],
+        cwd=corpus,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        tail = (r.stderr.strip().splitlines() or ["no output"])[-1]
+        return False, f"recover failed (exit {r.returncode}): {tail}"
+    return True, r.stderr.strip() if r.stdout.strip().endswith("recovered") else ""
 
-    lock = _inst.ingest_lock_path(args.wiki)
-    res = _lock.try_acquire(lock)
-    if not res.acquired:
-        _fail(
-            f"another ingest is already running for this wiki (PID {res.holder_pid}); "
-            f"skipping to avoid a concurrent-write race."
+
+def commit_pending(corpus: Path, message: str) -> None:
+    """Snapshot the owner's pending work. Stages explicitly and never .wiki/work/."""
+    if git(corpus, "status", "--porcelain").stdout.strip():
+        git(corpus, "add", "-A", "--", ".", ":(exclude).wiki/work")
+        if git(corpus, "diff", "--cached", "--name-only").stdout.strip():
+            git(corpus, "commit", "-q", "-m", message)
+
+
+# ---------------------------------------------------------------- verbs
+
+
+def cmd_init(a: argparse.Namespace) -> int:
+    corpus = Path(a.wiki_dir).expanduser().resolve()
+    corpus.mkdir(parents=True, exist_ok=True)
+    lock = pidlock.lock_path(corpus)
+    if not pidlock.acquire(lock):
+        print(
+            f"wiki-weaver: another run holds {corpus} (PID {pidlock.holder(lock)}); skipping",
+            file=sys.stderr,
         )
-        return EXIT_SKIP
+        return rs.EXIT_LOCKED
     try:
-        return ingest(
-            args.wiki,
-            source=args.source,
-            max_cycles=args.max_cycles,
-            keep_going=args.keep_going,
-            limit=limit,
-        )
+        return _init_locked(corpus, a)
     finally:
-        _lock.release(lock)
+        pidlock.release(lock)
 
 
-def cmd_lint(args: argparse.Namespace) -> int:
-    # lint runs validate_wiki.py deterministically through the engine -- no LLM
-    # call, so it needs foundation + the validator but NOT an API key.
-    if rc := _gate(require_api_key=False):
-        return rc
-
-    from wiki_weaver.engine_runner import run_lint
-
-    return run_lint(args.wiki)
-
-
-def cmd_doctor(args: argparse.Namespace) -> int:
-    return doctor(wiki=args.wiki)
-
-
-def cmd_update(args: argparse.Namespace) -> int:
-    return update(check_only=args.check)
-
-
-def cmd_ask(args: argparse.Namespace) -> int:
-    # ask spawns an engine sub-session that reads the wiki + calls the LLM ->
-    # full preflight w/ key.
-    if rc := _gate(require_api_key=True):
-        return rc
-
-    return ask(args.wiki, args.question, json_out=args.json_out)
-
-
-def cmd_migrate(args: argparse.Namespace) -> int:
-    """Migrate a corpus from the OLD (pre-0.5.0) layout to the NEW layout.
-
-    Deterministic — no LLM, no Amplifier runtime required.
-    """
-    from pathlib import Path
-
-    corpus = Path(args.corpus).expanduser().resolve()
-    return migrate(corpus, dry_run=args.dry_run, force=args.force)
-
-
-def cmd_supervise(args: argparse.Namespace) -> int:
-    """Observe-only health monitor for a live ingest run.
-
-    Deterministic -- no LLM, no Amplifier runtime required (like migrate),
-    and read-only against the run except the two supervisor files it owns
-    inside the run dir.
-    """
-    from pathlib import Path
-
-    from wiki_weaver.supervisor import SupervisorConfig, run_supervise
-
-    wiki = Path(args.wiki_dir).expanduser().resolve()
-    if not wiki.is_dir():
-        _fail(f"wiki directory not found: {wiki}")
-        return 2
-    run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else None
-    config = SupervisorConfig(
-        interval_s=args.interval,
-        stall_after_s=args.stall_after,
-        pace_factor=args.pace_factor,
-        llm_call_ceiling=args.llm_call_ceiling,
-        context_limit_tokens=args.context_limit,
-        budget_usd=args.budget,
-    )
-    return run_supervise(wiki, run_dir=run_dir, config=config, once=args.once)
-
-
-def cmd_schedule(args: argparse.Namespace) -> int:
-    """Dispatch a `schedule` subcommand (install/remove/status/list/run-now).
-
-    Deterministic dispatch only -- the schedule module owns all logic.
-    """
-    from wiki_weaver import schedule as sched
-
-    cmd = args.schedule_command
-    if cmd == "install":
-        return sched.install(
-            args.wiki,
-            every=args.every,
-            cron=args.cron,
-            alert_after=args.alert_after,
-            limit=args.limit,
-        )
-    if cmd == "remove":
-        if not args.wiki and not args.instance_id:
-            _fail("schedule remove: pass --wiki or --id")
-            return 2
-        return sched.remove(args.wiki, instance_id=args.instance_id, purge=args.purge)
-    if cmd == "status":
-        if not args.wiki and not args.instance_id:
-            _fail("schedule status: pass --wiki or --id")
-            return 2
-        return sched.status(args.wiki, instance_id=args.instance_id)
-    if cmd == "list":
-        return sched.list_all()
-    if cmd == "run-now":
-        return sched.run_now(args.wiki, limit=args.limit)
-    # no subcommand -> print schedule help
-    _fail("schedule: specify install|remove|status|list|run-now")
-    return 2
-
-
-def cmd_build_dashboard(args: argparse.Namespace) -> int:
-    """Build a self-contained HTML dashboard from a wiki corpus.
-
-    Deterministic — no LLM, no Amplifier runtime required.  Builds corpus
-    indexes first (unless --skip-index), then renders the Almanac-themed
-    dashboard HTML.
-    """
-    import json
-    from pathlib import Path
-
-    from wiki_weaver.dashboard import build_dashboard
-    from wiki_weaver.index import build_indexes
-
-    corpus = Path(args.corpus).expanduser().resolve()
-    out = Path(args.out).expanduser().resolve()
-
-    if not corpus.is_dir():
-        _fail(f"corpus directory not found: {corpus}")
-        return 1
-
-    theme: dict | None = None
-    if args.theme:
-        theme_path = Path(args.theme).expanduser().resolve()
-        try:
-            theme = json.loads(theme_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            _fail(f"theme file not found: {theme_path}")
-            return 1
-        except json.JSONDecodeError as exc:
-            _fail(f"invalid JSON in theme file {theme_path}: {exc}")
-            return 1
-
-    if not args.skip_index:
-        build_indexes(corpus)
-
-    build_dashboard(
-        corpus,
-        out,
-        theme=theme,
-        group_by=args.group_by,
-        group_link_template=args.group_link_template,
-    )
-    print(f"Dashboard written \u2192 {out}")
+def _init_locked(corpus: Path, a: argparse.Namespace) -> int:
+    ok, msg = recover(corpus)
+    if not ok:
+        print(f"wiki-weaver: {msg}; not initializing", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    if msg:
+        print(f"wiki-weaver: {msg}", file=sys.stderr)
+    scaffold(corpus)
+    if lens_path(corpus).exists():
+        print(f"wiki-weaver: {corpus} already initialized; lens.md kept as is")
+        return 0
+    if a.plain:
+        mode = "plain"
+    elif a.purpose:
+        mode = "purpose"
+        p = corpus / ".wiki" / "init" / "purpose.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(a.purpose.strip() + "\n")
+    else:
+        mode = "interview" if sys.stdin.isatty() else "plain"
+    run_dir = wiki_runs(corpus) / f"init-{stamp()}"
+    gate = "console" if mode == "interview" else "fail"
+    rc = run_graph("init", corpus, {"mode": mode}, run_dir / "engine", human_gate=gate)
+    if rc != 0 or not lens_path(corpus).exists():
+        die(f"init failed (engine exit {rc}); logs in {run_dir}")
+    commit_pending(corpus, "init: lens.md")
+    print(f"wiki-weaver: initialized {corpus} (lens: {mode})")
     return 0
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+def _trace(logs_root: Path) -> list[dict]:
+    rows: list[dict] = []
+    for tr in sorted(logs_root.rglob("trace.jsonl")):
+        rows += jlines(tr)
+    return rows
+
+
+def _preflight(corpus: Path) -> list[str]:
+    problems = []
+    if not lens_path(corpus).exists():
+        problems.append(f"{corpus} has no lens.md; run `wiki-weaver init {corpus}` first")
+    if not shutil.which("dot-runner"):
+        problems.append("dot-runner not found on PATH")
+    if not shutil.which("git"):
+        problems.append("git not found on PATH")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        problems.append("ANTHROPIC_API_KEY is not set")
+    return problems
+
+
+BATCH = 40  # sources per engine run; the engine caps steps at 50 x node count per run
+
+
+def cmd_ingest(a: argparse.Namespace) -> int:
+    corpus = Path(a.wiki).expanduser().resolve()
+    if not corpus.is_dir():
+        print(f"wiki-weaver: wiki dir not found: {corpus}", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    lock = pidlock.lock_path(corpus)
+    if not pidlock.acquire(lock):
+        print(
+            f"wiki-weaver: another ingest holds {corpus} (PID {pidlock.holder(lock)}); skipping",
+            file=sys.stderr,
+        )
+        return rs.EXIT_LOCKED
+    prev = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(1)))
+    try:
+        return _ingest_locked(corpus, a)
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+        pidlock.release(lock)
+
+
+def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
+    started, t0 = datetime.now(UTC), time.time()
+    run_id = f"ingest-{stamp()}"
+    run_dir = wiki_runs(corpus) / run_id
+    run_dir.mkdir(parents=True)
+    rows: list[dict] = []
+    errored: list[dict] = []
+    trace: list[dict] = []
+    before_pages = {p.name for p in page_files(corpus)}
+    batches = 0
+    lens_view: list[dict] = []
+
+    def snapshot(status: str) -> dict:
+        per_node = {
+            n: sum(1 for t in trace if t.get("node_id") == n) for n in ("brief", "write", "index")
+        }
+        conv = [r for r in rows if r.get("converged")]
+        touched = {p for r in conv for p in r.get("pages_touched", [])}
+        data = rs.build(
+            run_id=run_id,
+            status=status,
+            rows=rows,
+            errored=errored,
+            extra={
+                "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "finished": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if status == "final"
+                else None,
+                "wall_seconds": round(time.time() - t0, 1),
+                "pages_written": len(touched),
+                "pages_created": len({p for p in touched if p not in before_pages}),
+                "model_calls": sum(per_node.values()),
+                "model_calls_by_node": per_node,
+                "lens_page_types": lens_view,
+                "writer_chars_max": max(
+                    (c for r in rows for c in r.get("writer_chars_per_call") or []), default=0
+                ),
+                "batches": batches,
+                "max_cycles": a.max_cycles,
+                "limit": a.limit,
+                "source": a.source,
+            },
+        )
+        rs.write(run_dir / "result.json", data)
+        return data
+
+    try:
+        problems = _preflight(corpus)
+        if problems:
+            errored += [{"reason": f"preflight: {p}"} for p in problems]
+            for p in problems:
+                print(f"wiki-weaver: {p}", file=sys.stderr)
+            return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
+        # A run that died mid-source leaves that writer's edits uncommitted; undo them
+        # before the snapshot below would commit them as if they were the owner's.
+        ok, msg = recover(corpus)
+        if not ok:
+            errored.append({"reason": msg})
+            print(f"wiki-weaver: {msg}; not starting", file=sys.stderr)
+            return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
+        if msg:
+            print(f"wiki-weaver: {msg}", file=sys.stderr)
+        scaffold(corpus)
+        commit_pending(corpus, "chore: snapshot before ingest")
+        lens_file = contained_file(corpus, "lens.md")
+        lens_view[:] = describe(parse_page_types(lens_file.read_text())) if lens_file else []
+        print("wiki-weaver: lens page types as parsed:", file=sys.stderr)
+        for t in lens_view or [{"type": "(none)", "rule": "-", "current_state": "-"}]:
+            print(
+                f"  {t['type']}: {t['rule']}; Current state {t['current_state']}",
+                file=sys.stderr,
+            )
+        only = Path(a.source).name if a.source else None
+        if only:
+            if not ((wiki_inbox(corpus) / only).exists() or (wiki_failed(corpus) / only).exists()):
+                errored.append({"reason": f"--source {only}: not in _inbox/ or .wiki/failed/"})
+                print(f"wiki-weaver: --source {only} not found", file=sys.stderr)
+                return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
+        elif not eligible(corpus):
+            # decided once, before any batching
+            print("wiki-weaver: nothing to do (no new sources in _inbox/)")
+            snapshot("final")
+            return rs.EXIT_EMPTY
+        snapshot("in_progress")
+        remaining = a.limit if a.limit and a.limit > 0 else None
+        while True:
+            batches += 1
+            cap = BATCH if remaining is None else min(BATCH, remaining)
+            bdir = run_dir / f"batch-{batches:02d}"
+            bdir.mkdir()
+            params = {"run_dir": str(bdir), "cap": str(cap), "only": only or "-"}
+            rc = run_graph("ingest", corpus, params, bdir / "engine", log_file=bdir / "engine.log")
+            brows = jlines(bdir / "changes.jsonl")
+            rows += brows
+            btrace = _trace(bdir / "engine")
+            trace += btrace
+            if rc != 0:
+                errored.append(
+                    {
+                        "reason": f"engine run failed in batch {batches} (exit {rc}); see {bdir}/engine.log"
+                    }
+                )
+            if any(t.get("node_id") == "index" and t.get("status") != "success" for t in btrace):
+                errored.append(
+                    {
+                        "reason": f"index step failed in batch {batches}; pages were committed, index.md/log.md may be stale"
+                    }
+                )
+            attempted = sum(1 for r in brows if r.get("status") != "skipped")
+            if remaining is not None:
+                remaining -= attempted
+            snapshot("in_progress")
+            if rc != 0 or only or attempted < cap or (remaining is not None and remaining <= 0):
+                break
+        data = snapshot("final")
+        print(
+            json.dumps(
+                {k: data[k] for k in ("run_id", "verdict", "counts", "model_calls", "wall_seconds")}
+            )
+        )
+        return rs.EXIT_FOR_VERDICT[data["verdict"]]
+    except BaseException as exc:
+        errored.append({"reason": f"ingest interrupted: {type(exc).__name__}: {exc}"})
+        snapshot("final")
+        if isinstance(exc, Exception):
+            print(f"wiki-weaver: {exc}", file=sys.stderr)
+            return rs.EXIT_ERRORED
+        raise
+
+
+def cmd_ask(a: argparse.Namespace) -> int:
+    corpus = Path(a.wiki).expanduser().resolve()
+    if not corpus.is_dir():
+        die(f"{corpus} is not a directory")
+    ask_dir = corpus / ".wiki" / "ask" / stamp()
+    ask_dir.mkdir(parents=True)
+    (ask_dir / "question.txt").write_text(a.question.strip() + "\n")
+    fmt = "json" if a.json_out else "text"
+    rc = run_graph("ask", corpus, {"ask_dir": str(ask_dir), "fmt": fmt}, ask_dir / "engine")
+    out = ask_dir / "out.txt"
+    if rc != 0 or not out.exists():
+        die(f"ask failed (engine exit {rc}); logs in {ask_dir}")
+    sys.stdout.write(out.read_text())
+    return 0
+
+
+def cmd_lint(a: argparse.Namespace) -> int:
+    """Run the deterministic page checks over the whole wiki. No model."""
+    corpus = Path(a.wiki).expanduser().resolve()
+    if not corpus.is_dir():
+        print(f"wiki-weaver: wiki dir not found: {corpus}", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    sources = source_versions(corpus)
+    errs: list[str] = []
+    pages = page_files(corpus)
+    for p in pages:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        errs += ck.check_frontmatter(p.name, text)
+        errs += ck.check_duplicate_headings(p.name, text)
+        errs += ck.check_citations(p.name, text, sources)
+        errs += ck.check_links(p.name, text, corpus)
+        errs += ck.check_current_state(p.name, text)
+    idx = corpus / "index.md"
+    if idx.exists():
+        errs += ck.check_links("index.md", idx.read_text(encoding="utf-8"), corpus)
+    kinds: dict[str, int] = {}
+    for e in errs:
+        kinds[ck.check_kind(e)] = kinds.get(ck.check_kind(e), 0) + 1
+    cites = sum(len(ck.CITE_RE.findall(p.read_text(encoding="utf-8"))) for p in pages)
+    for e in errs[:50]:
+        print(e)
+    summary = {"pages": len(pages), "citations": cites, "errors": len(errs), "by_check": kinds}
+    print(json.dumps(summary))
+    return 0 if not errs else 1
+
+
+def cmd_feedback(a: argparse.Namespace) -> int:
+    corpus = Path(a.wiki).expanduser().resolve()
+    if not corpus.is_dir():
+        die(f"{corpus} is not a directory")
+    row = {"ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "text": a.text, "why": a.why}
+    if a.page:
+        row["page"] = a.page
+    log = feedback_log(corpus)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"wiki-weaver: feedback recorded in {log}")
+    return 0
+
+
+def cmd_dashboard(a: argparse.Namespace) -> int:
+    corpus = Path(a.corpus).expanduser().resolve()
+    if not corpus.is_dir():
+        die(f"{corpus} is not a directory")
+    out = build_dashboard(corpus, Path(a.out), a.group_by, a.group_link_template, a.theme)
+    print(f"wiki-weaver: dashboard written to {out}")
+    return 0
+
+
+def cmd_doctor(a: argparse.Namespace) -> int:
+    ok = True
+
+    def report(good: bool, msg: str) -> None:
+        nonlocal ok
+        ok = ok and good
+        print(f"[{'ok' if good else 'FAIL'}] {msg}")
+
+    report(True, f"wiki-weaver {resolve_version(__version__)}")
+    exe = shutil.which("dot-runner")
+    report(bool(exe), f"dot-runner on PATH: {exe or 'not found'}")
+    if exe:
+        r = subprocess.run([exe, "doctor"], capture_output=True, text=True, check=False)
+        report(r.returncode == 0, "dot-runner doctor")
+    report(bool(shutil.which("git")), "git on PATH")
+    report(bool(os.environ.get("ANTHROPIC_API_KEY")), "ANTHROPIC_API_KEY set")
+    try:
+        report(True, f"graphs: {pipeline_dir()}")
+    except SystemExit:
+        report(False, "graphs: pipeline/*.dot not found")
+    if a.wiki:
+        w = Path(a.wiki).expanduser()
+        report(lens_path(w).exists(), f"{w}/lens.md present")
+        report(wiki_inbox(w).is_dir(), f"{w}/_inbox present")
+        report(wiki_ledger(w).parent.is_dir(), f"{w}/.wiki present")
+        print(f"     pages: {len(page_files(w))}")
+    return 0 if ok else 1
+
+
+def cmd_update(a: argparse.Namespace) -> int:
+    print(f"wiki-weaver {resolve_version(__version__)}")
+    if not a.check:
+        print("wiki-weaver: update is not wired in V4 Stage 1; nothing fetched")
+    return 0
+
+
+# ---------------------------------------------------------------- parser
 
 
 class _VersionAction(argparse.Action):
-    """Resolves + prints the version lazily, only when --version is passed.
-
-    Unlike argparse's built-in "version" action (which formats its string
-    eagerly at add_argument() time), this defers resolve_version() until the
-    flag is actually invoked -- so a possible dev-mode git subprocess call
-    (see wiki_weaver._version_resolve) never runs on ordinary command
-    invocations, only on `wiki-weaver --version` itself.
-    """
-
     def __init__(self, option_strings, dest=argparse.SUPPRESS, **kwargs) -> None:
         kwargs.setdefault("nargs", 0)
         kwargs.setdefault("help", "show program's version number and exit")
@@ -315,313 +501,86 @@ class _VersionAction(argparse.Action):
         parser.exit()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="wiki-weaver",
-        description="LLM-wiki ingest pipeline driven by the attractor engine.",
-    )
-    parser.add_argument("--version", action=_VersionAction)
-    sub = parser.add_subparsers(dest="command")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="wiki-weaver", description="WikiWeaver V4")
+    p.add_argument("--version", action=_VersionAction)
+    sub = p.add_subparsers(dest="command")
 
-    p_init = sub.add_parser(
-        "init", help="scaffold a wiki directory and design its schema"
-    )
-    p_init.add_argument("wiki_dir")
-    p_init.add_argument(
-        "--purpose",
-        default=None,
-        metavar="TEXT",
-        help=(
-            "Rich free-text description of the wiki's intended use and desired outcomes. "
-            "When provided (and ANTHROPIC_API_KEY is set), the LLM designs a domain-fit "
-            "schema and writes it to <wiki>/.wiki/policy/schema.md. "
-            "Example: --purpose 'AI coding tools second brain for answering which tool "
-            "to use for X and comparing alternatives'"
+    s = sub.add_parser("doctor", help="environment diagnostics")
+    s.add_argument("--wiki", default=None, help="also check this wiki's layout")
+    s.set_defaults(func=cmd_doctor)
+
+    s = sub.add_parser("init", help="scaffold a wiki and seed its lens")
+    s.add_argument("wiki_dir")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--purpose", default=None, metavar="TEXT", help="draft lens.md from this")
+    g.add_argument("--plain", action="store_true", help="default lens, no model")
+    s.add_argument("--no-sample-inbox", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser(
+        "ingest",
+        help="integrate _inbox/ sources",
+        description=(
+            "Integrate _inbox/ sources. Do not modify the corpus while an ingest is running: "
+            "an edit made during a run is indistinguishable from writer output and will be "
+            "reverted."
         ),
     )
-    p_init.add_argument(
-        "--plain",
-        action="store_true",
-        help="scaffold only — no LLM schema design, use the generic built-in schema",
-    )
-    p_init.add_argument(
-        "--no-sample-inbox",
-        action="store_true",
-        dest="no_sample_inbox",
-        help="do not sample existing _inbox/ sources to inform schema design",
-    )
-
-    p_ingest = sub.add_parser("ingest", help="integrate inbox sources via the engine")
-    p_ingest.add_argument("--wiki", default=".", help="wiki directory (default: .)")
-    p_ingest.add_argument("--source", default=None, help="ingest a single source file")
-    p_ingest.add_argument(
+    s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    s.add_argument("--source", default=None, help="ingest one source (also retries a held one)")
+    s.add_argument(
         "--max-cycles",
         type=int,
         default=None,
-        help="convergence budget (default: from wiki.config.yaml or 3)",
+        help="accepted for V1 compatibility; V4 rewrites at most once",
     )
-    p_ingest.add_argument(
-        "--keep-going",
-        action="store_true",
-        help="continue to next source after a failure",
-    )
-    p_ingest.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="cap real-ingest sources this run (default: unlimited)",
-    )
+    s.add_argument("--keep-going", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--limit", type=int, default=None, help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_ingest)
 
-    p_lint = sub.add_parser("lint", help="run the structural validator")
-    p_lint.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    s = sub.add_parser("ask", help="answer a question from the wiki")
+    s.add_argument("question")
+    s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    s.add_argument(
+        "--json", dest="json_out", action="store_true", help="{answer, pages_used, refused}"
+    )
+    s.set_defaults(func=cmd_ask)
 
-    p_doctor = sub.add_parser("doctor", help="environment diagnostics")
-    p_doctor.add_argument(
-        "--wiki", default=None, help="also check this wiki's structure"
-    )
+    s = sub.add_parser("build-dashboard", help="write a minimal HTML page list")
+    s.add_argument("corpus")
+    s.add_argument("--out", required=True, metavar="PATH")
+    s.add_argument("--theme", default=None, metavar="PATH")
+    s.add_argument("--group-by", dest="group_by", default="type", metavar="FIELD")
+    s.add_argument("--group-link-template", dest="group_link_template", default=None, metavar="T")
+    s.add_argument("--skip-index", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_dashboard)
 
-    p_update = sub.add_parser(
-        "update",
-        help=(
-            "refresh wiki-weaver and its @main engine sources to latest "
-            "(Layer 1: uv reinstall; Layer 2: engine bundle re-clone)"
-        ),
-    )
-    p_update.add_argument(
-        "--check",
-        action="store_true",
-        help=(
-            "detect and report drift only — ls-remote each @main source and compare "
-            "to local commit; no reinstall, no rmtree (safe, read-only)"
-        ),
-    )
-    # --dry-run is an alias for --check (spec names both)
-    p_update.add_argument(
-        "--dry-run",
-        dest="check",
-        action="store_true",
-        help="alias for --check",
-    )
+    s = sub.add_parser("lint", help="run the deterministic checks over every page")
+    s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    s.set_defaults(func=cmd_lint)
 
-    p_ask = sub.add_parser(
-        "ask", help="answer a question by reading the compiled wiki (no embeddings)"
-    )
-    p_ask.add_argument("question", help="question to answer")
-    p_ask.add_argument("--wiki", default=".", help="wiki directory (default: .)")
-    p_ask.add_argument(
-        "--json",
-        dest="json_out",
-        action="store_true",
-        help="output JSON: {answer, pages_used, refused}",
-    )
+    s = sub.add_parser("feedback", help="record feedback with a why")
+    s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    s.add_argument("text")
+    s.add_argument("--why", required=True)
+    s.add_argument("--page", default=None)
+    s.set_defaults(func=cmd_feedback)
 
-    p_build_dashboard = sub.add_parser(
-        "build-dashboard",
-        help="build a self-contained HTML dashboard from a wiki corpus",
-    )
-    p_build_dashboard.add_argument("corpus", help="wiki corpus directory")
-    p_build_dashboard.add_argument(
-        "--out",
-        required=True,
-        metavar="PATH",
-        help="destination .html file",
-    )
-    p_build_dashboard.add_argument(
-        "--theme",
-        default=None,
-        metavar="PATH",
-        help="path to theme.json (optional; overrides .wiki/dashboard/theme.json in corpus)",
-    )
-    p_build_dashboard.add_argument(
-        "--group-by",
-        default="type",
-        metavar="FIELD",
-        dest="group_by",
-        help="frontmatter field to group sidebar nav by (default: type)",
-    )
-    p_build_dashboard.add_argument(
-        "--group-link-template",
-        default=None,
-        metavar="TEMPLATE",
-        dest="group_link_template",
-        help=(
-            "URL template for group header links.  {group} is replaced by the "
-            "URL-encoded group value.  Only http:// and https:// schemes are "
-            "accepted; non-http templates are ignored with a warning.  "
-            "Example: --group-link-template 'https://github.com/{group}'"
-        ),
-    )
-    p_build_dashboard.add_argument(
-        "--skip-index",
-        action="store_true",
-        dest="skip_index",
-        help="skip index rebuild (use existing .wiki/index/ files)",
-    )
+    s = sub.add_parser("update", help="print the installed version (Stage 1: no fetch)")
+    s.add_argument("--check", action="store_true")
+    s.add_argument("--dry-run", dest="check", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_update)
+    return p
 
-    p_migrate = sub.add_parser(
-        "migrate",
-        help=(
-            "migrate a corpus from the OLD layout (pre-0.5.0) to the NEW layout "
-            "(machine files under .wiki/, _archive/ renamed to _sources/)"
-        ),
-    )
-    p_migrate.add_argument("corpus", help="wiki corpus directory to migrate")
-    p_migrate.add_argument(
-        "--dry-run",
-        action="store_true",
-        dest="dry_run",
-        help="print the migration plan without making any changes",
-    )
-    p_migrate.add_argument(
-        "--force",
-        action="store_true",
-        help="re-run even if the migration sentinel already exists",
-    )
 
-    p_supervise = sub.add_parser(
-        "supervise",
-        help=(
-            "observe-only health monitor for a live ingest run "
-            "(deterministic; reports to <run-dir>/supervisor.jsonl + "
-            "supervisor-status.md)"
-        ),
-    )
-    p_supervise.add_argument("wiki_dir", help="wiki directory to watch")
-    p_supervise.add_argument(
-        "--run-dir",
-        default=None,
-        metavar="PATH",
-        dest="run_dir",
-        help="specific .wiki/runs/ingest-* dir (default: newest)",
-    )
-    p_supervise.add_argument(
-        "--interval",
-        type=float,
-        default=60.0,
-        help="seconds between ticks (default: 60)",
-    )
-    p_supervise.add_argument(
-        "--stall-after",
-        type=float,
-        default=600.0,
-        dest="stall_after",
-        help="seconds without an events.jsonl append before stalled (default: 600)",
-    )
-    p_supervise.add_argument(
-        "--pace-factor",
-        type=float,
-        default=3.0,
-        dest="pace_factor",
-        help="current source elapsed > FACTOR x rolling mean => slow (default: 3)",
-    )
-    p_supervise.add_argument(
-        "--llm-call-ceiling",
-        type=int,
-        default=50,
-        dest="llm_call_ceiling",
-        help="orchestrator per-child-session LLM-call budget (default: 50)",
-    )
-    p_supervise.add_argument(
-        "--context-limit",
-        type=int,
-        default=1_000_000,
-        dest="context_limit",
-        help="provider context-token limit to warn against (default: 1000000)",
-    )
-    p_supervise.add_argument(
-        "--budget",
-        type=float,
-        default=None,
-        help="optional run cost budget in USD (concern when exceeded)",
-    )
-    p_supervise.add_argument(
-        "--once",
-        action="store_true",
-        help="run a single tick and exit (scripting-friendly)",
-    )
-
-    p_sched = sub.add_parser(
-        "schedule", help="manage unattended, cron-scheduled ingestion"
-    )
-    sched_sub = p_sched.add_subparsers(dest="schedule_command")
-
-    s_install = sched_sub.add_parser("install", help="install a cron entry for a wiki")
-    s_install.add_argument("--wiki", required=True, help="wiki directory to schedule")
-    g = s_install.add_mutually_exclusive_group(required=True)
-    g.add_argument(
-        "--every",
-        metavar="INTERVAL",
-        help="friendly interval sugar, e.g. 5m, 30m, 1h, 1d",
-    )
-    g.add_argument(
-        "--cron",
-        metavar="EXPR",
-        help="raw 5-field cron expression (power-user escape hatch)",
-    )
-    s_install.add_argument(
-        "--alert-after",
-        type=int,
-        default=3,
-        dest="alert_after",
-        help="escalate after N consecutive skipped cycles (default: 3)",
-    )
-    s_install.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="per-tick cap on real-ingest sources (default: 10)",
-    )
-
-    s_remove = sched_sub.add_parser("remove", help="remove a wiki's cron entry")
-    s_remove.add_argument(
-        "--wiki", help="wiki directory (canonicalized to find the instance)"
-    )
-    s_remove.add_argument(
-        "--id", dest="instance_id", help="instance id (use after moving a wiki)"
-    )
-    s_remove.add_argument(
-        "--purge",
-        action="store_true",
-        help="also delete the instance's stored config/state/logs",
-    )
-
-    s_status = sched_sub.add_parser(
-        "status", help="show a wiki's schedule + last-run state"
-    )
-    s_status.add_argument("--wiki", help="wiki directory")
-    s_status.add_argument("--id", dest="instance_id", help="instance id")
-
-    sched_sub.add_parser("list", help="list all scheduled wikis and their state")
-
-    s_run = sched_sub.add_parser(
-        "run-now", help="run one ingest tick now (what cron invokes)"
-    )
-    s_run.add_argument("--wiki", required=True, help="wiki directory")
-    s_run.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="override the persisted per-tick cap for THIS tick only",
-    )
-
-    args = parser.parse_args()
-
-    dispatch = {
-        "init": cmd_init,
-        "ingest": cmd_ingest,
-        "lint": cmd_lint,
-        "doctor": cmd_doctor,
-        "update": cmd_update,
-        "ask": cmd_ask,
-        "build-dashboard": cmd_build_dashboard,
-        "migrate": cmd_migrate,
-        "supervise": cmd_supervise,
-        "schedule": cmd_schedule,
-    }
-    if args.command is None:
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    a = parser.parse_args(argv)
+    if not getattr(a, "func", None):
         parser.print_help()
-        raise SystemExit(0)
-    raise SystemExit(dispatch[args.command](args))
+        raise SystemExit(2)
+    raise SystemExit(a.func(a))
 
 
 if __name__ == "__main__":

@@ -1,12 +1,46 @@
-digraph ask_wiki {
-    graph [goal="Answer question from compiled wiki", default_fidelity="compact"]
-    start [shape=Mdiamond, label="Start"]
-    answer [
-        label="Read wiki and answer",
-        llm_provider="anthropic",
-        llm_model="claude-sonnet-4-6",
-        prompt="You are a wiki reader. Answer the question ONLY from the compiled wiki.\n\nWIKI DIRECTORY: $wiki_dir\nQUESTION: $question\n\nPROCEDURE — follow in order:\n1. Read $wiki_dir/index.md to find pages relevant to the question.\n2. Read $wiki_dir/overview.md to understand the wiki scope.\n3. Read the 2-3 most relevant pages from the index.\n4. Follow [[wikilinks]] in those pages (up to 2 hops) for related content.\n5. Read $sources_json to resolve source IDs to author+URL for citations.\n\nANSWER RULES:\n  COVERED: Write a direct cited answer. Name every wiki page used.\n  Cite as [Author, URL] from .sources.json; cite by page name if no\n  author/URL is available.\n  NOT COVERED: Say EXACTLY: \"The wiki does not cover '$question'. Pages consulted: [list pages you read].\"\n  Do NOT use training knowledge. Do NOT refuse silently. FAIL LOUD.\n  PARTIAL: State clearly what IS and what IS NOT covered.\n  Ground EVERY claim in wiki content you actually read. No fabrication.\n\nREQUIRED OUTPUT STEP (mandatory — do this last, after your reasoning):\nWrite a JSON file to exactly this path: $answer_file\nThe file content must be a single JSON object:\n{\"answer\": \"<full answer text>\", \"pages_used\": [\"page.md\"], \"refused\": false}\nFor refused: set refused=true, list examined pages in the answer field.\nThe file MUST be written before you finish — this is how your answer is captured."
+// WikiWeaver V4 - ask: index -> pick pages (MODEL) -> read -> answer (MODEL) -> emit.
+// No search index of any kind: the agent orients from index.md, as READING.md describes.
+
+digraph WikiWeaverAsk {
+    graph [
+        goal="Answer the question from the wiki, citing sources, or refuse when no page covers it.",
+        params="py, ask_dir, fmt",
+        default_max_retries=2,
+        default_fidelity="truncate",
+        model_stylesheet=".strong { llm_provider: anthropic; llm_model: opus; }"
     ]
-    done [shape=Msquare, label="Done"]
-    start -> answer -> done
+
+    start [shape=Mdiamond]
+    done  [shape=Msquare]
+
+    assemble [shape=parallelogram, max_retries=0,
+        tool_command="\"$PY\" -m wiki_weaver.steps ask_assemble", tool_env="py,ask_dir"]
+
+    pick [shape=box, timeout="900s", class="strong", fidelity="truncate",
+        prompt="Read context.md in the directory given here: $ask_dir. It holds how to read this wiki, its index.md, and a question. Choose at most 6 pages from the index that are most likely to answer the question. Write picks.txt in that same directory: one page file name per line (for example some-topic.md). If no page looks relevant, write an empty picks.txt. Do not read or write anything else."]
+
+    read [shape=parallelogram, max_retries=0,
+        tool_command="\"$PY\" -m wiki_weaver.steps ask_read", tool_env="py,ask_dir"]
+
+    answer [shape=box, timeout="900s", class="strong", fidelity="truncate",
+        prompt="Answer a question from the wiki. In the directory $ask_dir read context.md (how to read this wiki, the index, the question) and pages.md (the pages picked for it). Follow the reading guidance: the pages are enough for orientation and synthesis; for a specific date, number, name or commitment, follow the citation into _sources/ and check the passage. Cite as the pages do, [s<id>: \"quoted words\"]. If no page covers the question, refuse rather than guess. Write answer.json in $ask_dir with exactly these keys: answer (string), pages_used (list of page file names you relied on), refused (true when the wiki does not cover the question, else false). Write nothing else."]
+
+    emit [shape=parallelogram, max_retries=0,
+        tool_command="\"$PY\" -m wiki_weaver.steps ask_emit", tool_env="py,ask_dir,fmt"]
+
+    stop [shape=parallelogram, max_retries=0,
+        tool_command="echo 'ask failed; see the run logs' >&2; exit 1"]
+
+    start -> assemble
+    assemble -> pick
+    assemble -> stop [condition="outcome=fail"]
+    pick -> read
+    pick -> stop [condition="outcome=fail"]
+    read -> answer
+    read -> stop [condition="outcome=fail"]
+    answer -> emit
+    answer -> stop [condition="outcome=fail"]
+    emit -> done [condition="outcome=success"]
+    emit -> stop [condition="outcome=fail"]
+    stop -> done [condition="outcome=fail", label="loud exit"]
 }

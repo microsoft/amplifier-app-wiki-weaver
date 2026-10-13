@@ -24,3 +24,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# V4: corpora and run output never live in this repo
+ww-corpora/
+*.wiki-out/
+wiki_weaver/_build_info.txt
