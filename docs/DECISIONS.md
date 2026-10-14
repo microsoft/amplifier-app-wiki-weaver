@@ -279,3 +279,29 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
 - `.wiki/work/` joins the corpus contract's round-trip exclusions (clause 10). The resolver's
   exclude list follows the contract. V4's fallback clears scratch only when init has just
   created .git from nothing.
+
+## 2026-10-14 — Ken's answers, and one proposal
+
+- ACA is the only lane; the VM is retired, barring a staging environment Ken is fixing. Every
+  lane-conditional item in STAGE2 collapses to ACA. On ACA nothing kills a hung job by default,
+  so V4's per-node timeouts (brief 900 s, write 2400 s, index 1800 s) are the only guard.
+- ACA workers reach api.anthropic.com and github.com; the goal and dotgraph resolvers depend on
+  it. V4's engine fetches modules from GitHub on first use and resolves model names live.
+- PR #7 is not a foundation. amplifier-agent became a true library; Ken is re-assessing whether
+  the isolated runtime is still how the core-2.0.1 problem gets fixed. Nothing in Stage 2 bases
+  on PR #7. Our dot-runner check (V4's graphs run on dot-runner 80d5511 + core 2.0.1) is
+  evidence that V4 may not need the quarantine V1 did; told Ken.
+- The resolver should always return the artifact regardless of outcome — Ken's design direction,
+  being built into goal now. A dead mid-write job can therefore ship a half-written page, and
+  with .wiki/work/ excluded from the zip the next job cannot tell. V4 writes pages atomically:
+  Phase 1, brief item 7b. Ken: Team Pulse's jobs have not died so far; their failures are
+  non-convergence.
+- Retention on ACA: pending Ken's answer. Access to submit ACA jobs and the model budget: asked
+  twice, unanswered.
+- PROPOSED by Ken, RECOMMENDED by us, PENDING Gurkaran: V4 as a second CLI in main —
+  wiki_weaver_v4 / wiki-weaver-v4 beside V1 untouched; the resolver picks the binary. Replaces
+  the weaver-v4 catalog entry. About a day: 59 Python references, 18 in the graphs, the
+  contracts, pyproject and the build hook; V4's only dependency is pyyaml, so V1's install gains
+  nothing. Would be the first Phase 2 item, done once, after Phase 1's fixes. Reverses "V4 stays
+  on v4" (2026-10-13) — the reason for that, the VM's image floating on main, no longer exists.
+- Devis is a Team Pulse teammate; on the thread with Samuel and Alex.
