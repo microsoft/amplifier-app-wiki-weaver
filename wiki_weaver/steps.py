@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -506,6 +507,26 @@ def _parse_slugs(text: str) -> list[str]:
     return out
 
 
+_FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|\Z)", re.DOTALL)
+
+
+def strip_current_state(text: str) -> str:
+    """Drop the `## Current state` section, heading and body, from a page's text; every
+    other byte is kept. The writer is asked for a fresh roll-up and never sees the old one:
+    under the never-delete rule it kept old roll-ups (LEARNINGS, 2026-10-13). Section
+    boundaries are the ones the loss guard uses (`checks._without_current_state`)."""
+    m = _FRONTMATTER_RE.match(text)
+    head, body = (text[: m.end()], text[m.end() :]) if m else ("", text)
+    out, inside = [], False
+    for line in body.splitlines(keepends=True):
+        st = line.strip()
+        if st.startswith(("## ", "# ")):
+            inside = bool(ck.CURRENT_STATE_RE.match(st))
+        if not inside:
+            out.append(line)
+    return head + "".join(out)
+
+
 def step_page_select() -> str:
     cur = current()
     work = wiki_work(WIKI)
@@ -546,7 +567,7 @@ def step_page_select() -> str:
             ]
             as_of = _latest_source_date(srcs, this_date)
             head = f"existing, {len(srcs)} sources"
-            body = read_text(p)
+            body = strip_current_state(read_text(p))
         else:
             as_of, head, body = this_date, "new page - does not exist yet", ""
         if not name.startswith("source-") and as_of:

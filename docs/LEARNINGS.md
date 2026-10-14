@@ -465,3 +465,16 @@ through the engine's own parser. The size guard stays at 3.5M (the API window), 
 200K working window the guard is not what bounds the writer — compaction is, silently.
 **Status.** Open — reported at CP1: either the worker advertises 1M, or the guard drops to
 ~700K characters.
+
+### A comment-only changed source does not rewrite the pages that cite it — 2026-10-14
+**Problem.** The Current state cheap-fix test assumed a same-name, changed-hash source makes
+the writer rewrite every page citing it.
+**How it showed.** /tmp/cs-test (copy of full/): s23, s52, s64 re-ingested with one appended
+`<!-- re-ingest test -->` line each. All three converged (7 model calls, 170 s), and page_select
+offered team-pulse.md each time, but the writer touched only the three source summary pages:
+"differs from s64 only by an appended test comment ... other cited pages left untouched".
+team-pulse.md is byte-identical, so the strip was never exercised on a real rewrite. The
+writer ran on `claude-sonnet-5-5` with the repaired `.large-context` rule.
+**Fix.** The strip is in (`steps.strip_current_state`, applied in page_select); the real test
+needs a change the writer must integrate into the busy page.
+**Status.** Open — reported at CP1.
