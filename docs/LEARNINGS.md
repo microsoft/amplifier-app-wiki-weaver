@@ -443,3 +443,25 @@ page per batch, not per source; composes with the splice; can regenerate every r
 existing wiki without re-ingesting.
 **Status.** Recorded at Stage 1 close; fixed in Stage 2 Phase 1 (cheap, tested on E02's busiest
 pages), with the structural step before Phase 3 if the test says so. See docs/STAGE2.md.
+
+### The writer's API window is 1M; its working window was 200K — 2026-10-14
+**Problem.** The `.large_context` class never matched (engine class grammar is
+`[.][a-z0-9-]+`; the regex fell through to a bare-identifier "shape" selector named
+`large_context`, which matches no node), so the write node ran on the worker's default model.
+**How it showed.** Every writer request in Stage 1's three ingest runs (1,399 `provider:response`
+events across 88 writer sessions in `full/.wiki/runs/ingest-*/batch-*/engine/write/sessions/`)
+reports `model: claude-sonnet-5-5`. Anthropic's Models API (`GET /v1/models/claude-sonnet-5-5`,
+2026-10-14) gives `max_input_tokens: 1000000`, `max_tokens: 128000`. But the dot-runner worker
+mounts provider-anthropic with `enable_1m_context` unset (default False), so the provider
+advertises `context_window: 200000` to context-simple, which compacts the writer's history
+against that. The largest prompt any writer request sent was 161,935 tokens (input + cache
+write); 43 of 88 writer sessions show the prompt dropping by over 30% mid-session (12/37 E01a,
+3/8 E01b, 28/43 E02). So no request came near the 1M API limit, and none could: the writer
+never holds more than ~160K tokens at once, while E02's largest writer input was 805K
+characters (~230K tokens). Output per request peaked at 20,938 tokens (cap 128,000); the write
+node sets no `max_tokens`.
+**Fix.** Class renamed to `.large-context`; `tests/test_models.py` resolves every box node
+through the engine's own parser. The size guard stays at 3.5M (the API window), but on a
+200K working window the guard is not what bounds the writer — compaction is, silently.
+**Status.** Open — reported at CP1: either the worker advertises 1M, or the guard drops to
+~700K characters.
