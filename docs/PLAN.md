@@ -439,8 +439,8 @@ items move from Stage 2 to the switch, which is Team Pulse's decision and not pa
 
 **First after Stage 1 — sections as the unit.** One branch, one milestone — triggered, not scheduled: the Stage 2 rebuild stops at its first oversized-context hold, the splice is built on that measurement, and the rebuild resumes from the held source (`docs/STAGE2.md`, Phase 3). The writer receives
 and returns sections, not pages; glue does every write. The brief names the sections. `ask`
-reads Current state first and drills on demand. Tools come off model nodes where the engine
-allows. Then the full 215 under the final design — the scale validation Stage 1 handed off —
+reads Current state first and drills on demand. The writer has no tools: glue assembles everything it needs and it returns text, so
+there is no session to compact and no live page to reopen (DECISIONS, 2026-10-15). Then the full 215 under the final design — the scale validation Stage 1 handed off —
 with anything held for size re-ingested through the retry path. It closes:
 - writer input growing with the wiki — 825K median, 1.51M max, +55% per epoch at 129 sources
   (LEARNINGS, "Writer input grows with the wiki");

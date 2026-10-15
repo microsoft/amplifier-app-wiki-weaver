@@ -305,3 +305,33 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
   nothing. Would be the first Phase 2 item, done once, after Phase 1's fixes. Reverses "V4 stays
   on v4" (2026-10-13) — the reason for that, the VM's image floating on main, no longer exists.
 - Devis is a Team Pulse teammate; on the thread with Samuel and Alex.
+
+## 2026-10-15 — Compaction, the guard, and the splice's shape
+
+- CP1 found the writer's session compacts at ~105K estimated tokens — 0.8 of a ~131K budget
+  (200K advertised window minus half the 128K output cap minus a margin). Protected: system
+  prompt, first and last human messages, last five tool results. Stubbed oldest-first: the
+  writer's own tool results and turns. 43 of 88 Stage 1 writer sessions compacted mid-write,
+  28 in E02. Not recorded in V4's output; the event lands in a hosted-session log.
+- Not a blocker. E02's writes passed every check; the pages sit in the protected opening
+  message. V1 runs in production with worse exposure (pages fetched by tool, cut first) and
+  has never measured it; V2 byte-budgeted to an assumed 150–200K window and records
+  tokens_in: 0. Neither detects compaction.
+- The guard is NOT lowered to the compaction trigger. That would hold about half of E02's
+  sources — the wiki stops growing on exactly the pages people compare. Wrong trade for
+  end-to-end-first. Recorded because the number moved three times in two days (3.5M, 600K,
+  "from the trigger") as each read revealed another layer; it is now set from measurement
+  under whichever worker ships, to what would fail rather than what would compact.
+- First experiment, CP2: worker=llm-direct on the write node. No context module, no
+  compaction, full memory to the 1M API limit, hard failure beyond. Kept if it runs with the
+  writer's tools. Trade: ignores user_instructions; higher cost per large write.
+- Detection, CP2: V4 records when a write compacted, via the context:compaction record in the
+  hosted-session events.jsonl or the input_tokens drop in the node's events.jsonl.
+- The splice gains a clause: the writer has no tools. Glue assembles sections, source, lens
+  rules and index entries; the writer returns text; glue writes. One request, one response —
+  nothing to compact, nothing to reopen. Written into PLAN §6 and STAGE2 Phase 3.
+- The 1M flag is provider config the default worker discards and a .dot graph cannot set;
+  asked Ken. Persisting context:compaction into node output is a dot-runner change; asked Ken.
+- Plausible, unproven: compaction erasing the writer's memory that it already replaced Current
+  state is a mechanism for the stacking seen in E02. The llm-direct run under the Current
+  state variant tests both at once.
