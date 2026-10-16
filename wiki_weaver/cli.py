@@ -34,6 +34,7 @@ from .lib import (
     wiki_ledger,
     wiki_runs,
     wiki_sources,
+    wiki_work,
 )
 from .steps import GIT_ID, jlines
 from .version import resolve_version
@@ -148,6 +149,15 @@ def scaffold(corpus: Path) -> None:
                 f.write("\n")
             f.write("\n".join(missing) + "\n")
     if not (corpus / ".git").exists():
+        # No history: scratch a dead run left behind has nothing to recover against
+        # (Resolve's archive never carries .git). With .git present, recover() decides.
+        work = wiki_work(corpus)
+        if work.is_dir() and any(work.iterdir()):
+            shutil.rmtree(work)
+            print(
+                "wiki-weaver: cleared .wiki/work/ - scratch with no git history to recover against",
+                file=sys.stderr,
+            )
         git(corpus, "init", "-q")
     commit_pending(corpus, "chore: scaffold wiki")
 
