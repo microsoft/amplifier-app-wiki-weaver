@@ -61,6 +61,25 @@ def stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def new_run_dir(parent: Path, kind: str) -> tuple[str, Path]:
+    """Create ``<parent>/<kind>-<UTC time to the microsecond>`` and return (run id, dir).
+
+    Two runs started in the same second used to collide on one directory: the second
+    crashed before writing result.json, and a reader of the newest result.json got the
+    first run's. The microsecond suffix keeps names unique and in start order; a name
+    already taken (a frozen or coarse clock) is retried with a counter."""
+    parent.mkdir(parents=True, exist_ok=True)
+    base = f"{kind}-{stamp()[:-1]}.{datetime.now(UTC).strftime('%f')}Z"
+    for n in range(1000):
+        run_id = base if n == 0 else f"{base}-{n}"
+        try:
+            (parent / run_id).mkdir()
+        except FileExistsError:
+            continue
+        return run_id, parent / run_id
+    raise FileExistsError(f"no free run directory under {parent} for {base}")
+
+
 def die(msg: str, code: int = 1) -> None:
     print(f"wiki-weaver: {msg}", file=sys.stderr)
     raise SystemExit(code)
@@ -253,9 +272,7 @@ def cmd_ingest(a: argparse.Namespace) -> int:
 
 def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
     started, t0 = datetime.now(UTC), time.time()
-    run_id = f"ingest-{stamp()}"
-    run_dir = wiki_runs(corpus) / run_id
-    run_dir.mkdir(parents=True)
+    run_id, run_dir = "", None
     rows: list[dict] = []
     errored: list[dict] = []
     trace: list[dict] = []
@@ -295,10 +312,12 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
                 "wiki_weaver_version": resolve_version(__version__),
             },
         )
-        rs.write(run_dir / "result.json", data)
+        if run_dir is not None:
+            rs.write(run_dir / "result.json", data)
         return data
 
     try:
+        run_id, run_dir = new_run_dir(wiki_runs(corpus), "ingest")
         problems = _preflight(corpus)
         if problems:
             errored += [{"reason": f"preflight: {p}"} for p in problems]
@@ -340,6 +359,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         while True:
             batches += 1
             cap = BATCH if remaining is None else min(BATCH, remaining)
+            assert run_dir is not None
             bdir = run_dir / f"batch-{batches:02d}"
             bdir.mkdir()
             params = {"run_dir": str(bdir), "cap": str(cap), "only": only or "-"}
