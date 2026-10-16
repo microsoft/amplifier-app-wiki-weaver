@@ -7,6 +7,7 @@ corpus as the working directory. A step prints one routing token on its last std
 from __future__ import annotations
 
 import difflib
+import itertools
 import json
 import os
 import re
@@ -507,6 +508,66 @@ def _parse_slugs(text: str) -> list[str]:
     return out
 
 
+# A compaction shows as a request smaller than the one before it in the same session:
+# inside one session a prompt only grows unless history was removed. The margins ignore
+# small accounting noise; on 157 Stage 1 brief/write sessions this count equalled the
+# hosted context:compaction records exactly (LEARNINGS, 2026-10-15).
+COMPACTION_DROP = 0.10
+COMPACTION_MIN_TOKENS = 2000
+MODEL_NODES: tuple[str, ...] = ("brief", "write")
+
+
+def _session_log(path: Path) -> tuple[float | None, list[int]]:
+    """(session start as epoch seconds, prompt size of each request) from one engine
+    session log; prompt size is input_tokens (uncached + cache read) + cache_write_tokens."""
+    start, sizes = None, []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None, []
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("event") == "session:start" and start is None:
+            ts = ev.get("timestamp") or (ev.get("data") or {}).get("timestamp")
+            try:
+                start = datetime.fromisoformat(str(ts)).timestamp()
+            except ValueError:
+                pass
+        elif ev.get("event") == "provider:response":
+            u = (ev.get("data") or {}).get("usage") or {}
+            try:
+                sizes.append(int(u["input_tokens"]) + int(u.get("cache_write_tokens") or 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return start, sizes
+
+
+def count_compactions(path: Path) -> int:
+    _, sizes = _session_log(path)
+    return sum(
+        1
+        for prev, nxt in itertools.pairwise(sizes)
+        if nxt < prev * (1 - COMPACTION_DROP) and prev - nxt >= COMPACTION_MIN_TOKENS
+    )
+
+
+def node_compactions(run_dir: Path, since: float) -> dict[str, int]:
+    """Compactions per model step, over the engine sessions this source started (session
+    start at or after ``since``) under ``<run_dir>/engine/<node>/sessions/``."""
+    out: dict[str, int] = dict.fromkeys(MODEL_NODES, 0)
+    for node in MODEL_NODES:
+        for log in sorted((Path(run_dir) / "engine" / node / "sessions").glob("*/events.jsonl")):
+            start, _ = _session_log(log)
+            if start is not None and start >= since:
+                out[node] += count_compactions(log)
+    return out
+
+
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|\Z)", re.DOTALL)
 
 
@@ -789,6 +850,7 @@ def step_hold(run_dir: str) -> str:
             failed_checks=cur.get("failed_checks", {}),
             writer_input_chars=cur.get("writer_input_chars", 0),
             writer_chars_per_call=cur.get("writer_chars_per_call", []),
+            compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -826,6 +888,7 @@ def step_commit(run_dir: str) -> str:
             failed_checks=cur.get("failed_checks", {}),
             writer_input_chars=cur.get("writer_input_chars", 0),
             writer_chars_per_call=cur.get("writer_chars_per_call", []),
+            compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )

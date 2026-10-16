@@ -87,7 +87,14 @@ def build(
             for r in rows
             if r.get("status") == "failed"
         ],
-        "sources": [{"name": r["source"], "status": r.get("status", "")} for r in rows],
+        "sources": [
+            {
+                "name": r["source"],
+                "status": r.get("status", ""),
+                "compactions": r.get("compactions") or {},
+            }
+            for r in rows
+        ],
     }
     res.update(extra or {})
     return res
