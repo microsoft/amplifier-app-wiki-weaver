@@ -510,3 +510,44 @@ for both. The archive is a tar.gz, not a zip.
 line for `.wiki/work` is still needed.
 **Status.** Verified by reading both revisions (and running pack/unpack on hostile fixtures,
 CPython 3.11-3.14 on macOS, not the worker image).
+
+### The writer fetches its pages by tool; llm-direct cannot run it; compaction is now recorded — 2026-10-16
+**Problem.** Three questions from CP1: how big the writer's requests really were, whether the
+`llm-direct` worker can replace `amplifier-agent` on the write node, and whether V4 can see a
+compaction against the source.
+**How it showed.**
+- Request size (input_tokens + cache_write_tokens; input_tokens already counts cache reads),
+  all 88 Stage 1 writer sessions: first request median 13,130 tokens (max 13,288), the same
+  every time; it is system prompt, tools and the node's prompt. Peak median 120,900, max
+  161,935. E02 alone: peak median 134,551. The assembled pages are not in the first message:
+  the prompt names `.wiki/work/pages.md` and the writer fetches it with `read_file` (median
+  2 reads of pages.md per session, max 7), then re-reads live page files with bash/sed. The
+  hosted logs record 79 `context:compaction` events in 44 of 88 sessions, budget 131,104,
+  target 65,552; at strategy level 5 up to 62 messages were removed and 12 user messages
+  stubbed in one pass.
+- `worker="llm-direct"` on the write node (smoke copy, one source, 3 model calls): the run
+  completes and the node reports success, but nothing is written. llm-direct is the engine's
+  text-only worker: the model's tool calls come back as prose ("Plain text response: ...
+  <invoke name=\"bash\">...") and are never executed, so file tools do not work. Both write
+  attempts failed checks ("source summary ... was not written") and the source was held. Its
+  one request is the node prompt (3,296 characters); the engine logs no usage for it. The
+  write node does not use `user_instructions` (no node attribute, no run context key).
+  Default worker on the same input: 7 and 12 requests, peaks 66,690 and 83,100 tokens.
+  Reverted; the write node stays on the default worker.
+- Compaction detection: on 157 Stage 1 brief and write sessions, the number of requests
+  smaller than the previous one in the same session (>=10% and >=2,000 tokens) equals the
+  hosted `context:compaction` count in every session (113x0, 21x1, 13x2, 8x3, 2x4). V4 now
+  uses that signal: it is the engine's own log inside the run directory, so it needs nothing
+  from `~/.amplifier-agent/`, which clause 11 of the CLI contract puts out of bounds.
+- Forcing one did not happen. Three tries on one-source copies (a 337K-character source; a
+  full/ copy with a 348K-character writer input; smoke with index.md padded to 437K and then
+  957K characters): no compaction, in the hosted logs or by V4's count, which agreed (0 = 0).
+  The prompt jumped by about 65K tokens when the writer read a 451K- and a 932K-character
+  pages.md, where Stage 1's 424K read added about 110K. The mechanism is not identified:
+  no ingress-truncation or tool-truncation marker appears in the hosted logs. If something
+  between the tool and the model caps large reads, the writer sees only part of pages.md on
+  big pages. Open.
+**Fix.** `compactions: {"brief": n, "write": n}` on every ledger row and in result.json
+`sources[]` (bda2b17).
+**Status.** Detection proven on recorded sessions; not yet seen firing live. The read cap is
+open.
