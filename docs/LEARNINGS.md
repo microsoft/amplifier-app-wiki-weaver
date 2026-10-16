@@ -478,3 +478,35 @@ writer ran on `claude-sonnet-5-5` with the repaired `.large-context` rule.
 **Fix.** The strip is in (`steps.strip_current_state`, applied in page_select); the real test
 needs a change the writer must integrate into the busy page.
 **Status.** Open — reported at CP1.
+
+### The resolver's archive: symlinks skipped on pack (true); 3.12 + data_filter on unpack (false) — 2026-10-16
+**Problem.** The platform investigation claimed (a) the resolver skips symbolic links when
+packing the output archive, and (b) the platform pinned Python 3.12 so unpacking uses
+`tarfile.data_filter`, which rejects links escaping the directory. Neither had been read.
+**How it showed.** amplifier-resolver-weaver at `main` 0f87a02 and PR #7 8a02493 (draft, Ken).
+`src/amplifier_resolver_weaver/corpus.py` is the same blob in both, so every line below holds
+for both. The archive is a tar.gz, not a zip.
+- (a) TRUE. `corpus.py:135` `with tarfile.open(dest, "w:gz") as tar:`; `:136`
+  `for dirpath, dirnames, filenames in os.walk(src):`; `:156`
+  `if abs_f.is_symlink() or not abs_f.is_file():` / `:157` `continue`. Directory symlinks are
+  skipped only because `os.walk` defaults to `followlinks=False`; hard links are packed as
+  link members (and then refused by this module's own unpack). No test covers pack-side
+  symlinks.
+- (b) FALSE as stated. No `filter=`, `data_filter` or `extraction_filter` anywhere in either
+  tree. Unpack (`corpus.py:209-218`) is a hand-written pre-scan: `if member.issym() or
+  member.islnk(): raise UnsafeArchiveMember(...)`, non-regular members refused,
+  `_safe_member_path(member.name, dest)`, then a plain `tar.extractall(dest)`. That rejects
+  every link, stricter than `data_filter`, but leaves setuid bits that `data_filter` would
+  clear. A 3.12 pin would not give `data_filter` by default anyway (the default became
+  `'data'` in 3.14). main pins nothing (`pyproject.toml:6` `requires-python = ">=3.11"`;
+  `docs/WORKER_IMAGE.md:281` lists Python 3.11.2). PR #7 adds
+  `manifest.json:28` `uv venv --clear --python 3.12 /opt/resolve-weaver`, but that venv hosts
+  only the wiki-weaver/repo-weaver CLIs; pack and unpack run in the resolver's own
+  `/opt/uv-tools/amplifier` interpreter. Unpack runs only on the input corpus
+  (`resolver.py:858`); the output is only packed (`resolver.py:1073`).
+- Excludes, both revisions: `corpus.py:58-62` `DEFAULT_EXCLUDES = (".wiki/runs",
+  ".wiki/snapshots", ".runs")`; `:65` `.git` at any depth. `.wiki/work` is not excluded.
+**Fix.** None in V4. Links escaping the corpus cannot travel either way. Marc's exclude-list
+line for `.wiki/work` is still needed.
+**Status.** Verified by reading both revisions (and running pack/unpack on hostile fixtures,
+CPython 3.11-3.14 on macOS, not the worker image).
