@@ -292,6 +292,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
                 "max_cycles": a.max_cycles,
                 "limit": a.limit,
                 "source": a.source,
+                "wiki_weaver_version": resolve_version(__version__),
             },
         )
         rs.write(run_dir / "result.json", data)
