@@ -119,6 +119,25 @@ def atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def atomic_copy(src: Path, dest: Path) -> None:
+    """Copy ``src`` to ``dest`` via a temp file beside ``dest`` and os.replace: ``dest`` is
+    always the complete old file or the complete new one, never a partial copy."""
+    import os
+    import shutil
+    import tempfile
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def atomic_append_line(path: Path, line: str) -> None:
     """Append one line by rewriting the file atomically (ledger and batch JSONL are small)."""
     path = Path(path)

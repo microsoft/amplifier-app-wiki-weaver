@@ -551,3 +551,30 @@ compaction against the source.
 `sources[]` (bda2b17).
 **Status.** Detection proven on recorded sessions; not yet seen firing live. The read cap is
 open.
+
+### Atomic page writes: the glue's are; the model steps' are not, and cannot be without staging — 2026-10-16
+**Problem.** The resolver returns the corpus whatever the outcome, so a job that dies
+mid-write would ship a half-written page, and the next job's init would commit it as the
+baseline.
+**How it showed.** Glue writes to round-trip files were plain writes: `READING.md`
+(cli.py scaffold), `lens.md` (steps default_lens), `log.md` (steps finalize),
+`.wiki/source-versions/` (steps commit), and migrate's page rewrites. The model steps write
+pages themselves, through whatever tool they choose: tool-filesystem `write_file`/`edit_file`
+(`write_text_preserving` -> `path.write_bytes`, truncate-then-write, not atomic), bash
+heredocs, or, in the SIGTERM test below, a Python script the writer wrote and ran that edited
+five pages in one go. A kill test on a smoke copy (one source, 2 model calls) sent SIGTERM to
+the whole ingest process group the moment a page changed (149.8 s): 28 of 33 pages
+byte-identical, 5 changed, each with whole frontmatter and a final newline, no temp files;
+result.json final, `errored: [{"kind": "interrupted", ...}]`. That passed, but only because the
+writer's script finished before the poll saw it. It proves nothing about the writer path.
+**Fix.** Glue writes now go through `lib.atomic_write_text` / `lib.atomic_copy` (temp file in
+the same directory, `os.replace`). The writer and index steps were not changed (the brief's
+scope guard). Making them atomic needs staging: page_select copies the selected pages to
+`.wiki/work/stage/`; the write prompt names those paths instead of the live ones; checks
+read the staged files and compare them with `before/`; commit `os.replace`s each staged page
+into place; hold just discards the stage, with no revert; any change to a live page during
+the write becomes a scope violation. The index node is the same, for index.md and log.md.
+That changes where both model steps write, so it is a change to their contract. It is not the
+splice, which is about reading and returning sections. It also needs one real ingest to check
+that the writer keeps to the staged paths.
+**Status.** Glue done. Writer/index staging is open, for a decision.

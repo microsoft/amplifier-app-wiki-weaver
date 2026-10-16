@@ -25,6 +25,7 @@ from .dashboard import build_dashboard
 from .ledger import eligible, source_versions
 from .lens import describe, parse_page_types
 from .lib import (
+    atomic_copy,
     contained_file,
     feedback_log,
     lens_path,
@@ -139,7 +140,7 @@ def scaffold(corpus: Path) -> None:
     feedback_log(corpus).touch()
     reading = corpus / "READING.md"
     if not reading.exists():
-        shutil.copy2(PKG / "data" / "READING.md", reading)
+        atomic_copy(PKG / "data" / "READING.md", reading)
     gi = corpus / ".gitignore"
     have = gi.read_text().splitlines() if gi.exists() else []
     missing = [line for line in CORPUS_IGNORES if line not in have]

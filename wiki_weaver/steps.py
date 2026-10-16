@@ -25,6 +25,7 @@ from .lib import (
     MAX_SOURCE_CHARS,
     NON_PAGE_FILES,
     atomic_append_line,
+    atomic_copy,
     atomic_write_text,
     contained_file,
     corrections_dir,
@@ -909,7 +910,7 @@ def step_commit(run_dir: str) -> str:
         keep = lg.versions_dir(WIKI) / f"s{cur['prev_source_id']}.md"
         keep.parent.mkdir(parents=True, exist_ok=True)
         if not keep.exists():
-            shutil.copyfile(dest, keep)
+            atomic_copy(dest, keep)
     _place(src, srcs)
     record(
         Path(run_dir),
@@ -974,7 +975,7 @@ def step_index_prep(run_dir: str) -> str:
     out += ["\n# Current index.md\n\n", read_text(idx) if idx.exists() else "(none)\n"]
     (work / "index_input.md").write_text("".join(out))
     if log.exists():
-        shutil.copy2(log, work / "log_before.md")
+        atomic_copy(log, work / "log_before.md")
     return "index"
 
 
@@ -984,7 +985,7 @@ def step_finalize() -> str:
     if before.exists() and log.exists() and not read_text(log).startswith(read_text(before)):
         # log.md is append-only: restore the prior history and keep the new tail.
         new = read_text(log)
-        log.write_text(read_text(before).rstrip("\n") + "\n\n" + new)
+        atomic_write_text(log, read_text(before).rstrip("\n") + "\n\n" + new)
         print("log.md was rewritten, not appended; restored prior history", file=sys.stderr)
     extras = [p for p in changed_paths() if p not in ("index.md", "log.md")]
     if extras:
@@ -1019,7 +1020,7 @@ def step_init_mode(mode: str) -> str:
 def step_default_lens() -> str:
     if not lens_path(WIKI).exists():
         data = Path(__file__).parent / "data" / "default_lens.md"
-        shutil.copy2(data, lens_path(WIKI))
+        atomic_copy(data, lens_path(WIKI))
     return "ok"
 
 
