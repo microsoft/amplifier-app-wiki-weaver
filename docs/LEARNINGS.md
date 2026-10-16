@@ -444,27 +444,42 @@ existing wiki without re-ingesting.
 **Status.** Recorded at Stage 1 close; fixed in Stage 2 Phase 1 (cheap, tested on E02's busiest
 pages), with the structural step before Phase 3 if the test says so. See docs/STAGE2.md.
 
-### The writer's API window is 1M; its working window was 200K — 2026-10-14
+### The writer's API window is 1M; it compacts at ~105K tokens, and its pages are cut before that — 2026-10-14, corrected 2026-10-16
 **Problem.** The `.large_context` class never matched (engine class grammar is
 `[.][a-z0-9-]+`; the regex fell through to a bare-identifier "shape" selector named
 `large_context`, which matches no node), so the write node ran on the worker's default model.
 **How it showed.** Every writer request in Stage 1's three ingest runs (1,399 `provider:response`
 events across 88 writer sessions in `full/.wiki/runs/ingest-*/batch-*/engine/write/sessions/`)
 reports `model: claude-sonnet-5-5`. Anthropic's Models API (`GET /v1/models/claude-sonnet-5-5`,
-2026-10-14) gives `max_input_tokens: 1000000`, `max_tokens: 128000`. But the dot-runner worker
-mounts provider-anthropic with `enable_1m_context` unset (default False), so the provider
-advertises `context_window: 200000` to context-simple, which compacts the writer's history
-against that. The largest prompt any writer request sent was 161,935 tokens (input + cache
-write); 43 of 88 writer sessions show the prompt dropping by over 30% mid-session (12/37 E01a,
-3/8 E01b, 28/43 E02). So no request came near the 1M API limit, and none could: the writer
-never holds more than ~160K tokens at once, while E02's largest writer input was 805K
-characters (~230K tokens). Output per request peaked at 20,938 tokens (cap 128,000); the write
-node sets no `max_tokens`.
+2026-10-14) gives `max_input_tokens: 1000000`, `max_tokens: 128000`. That is the API window,
+not what the writer works with. The dot-runner worker mounts provider-anthropic with
+`enable_1m_context` unset (default False), so the provider advertises 200,000 to
+context-simple. context-simple's effective budget, as its own `context:compaction` records
+show, is 131,104 tokens, and it compacts at 0.8 of that: a trigger of about 105K tokens
+(first Stage 1 compaction: estimate 112,497 against budget 131,104, cut to a 65,552 target).
+The trigger runs on context-simple's own estimate, so provider-counted prompts can run
+higher; the largest Stage 1 writer request was 161,935 tokens (input + cache write). 44 of 88
+writer sessions compacted (79 compactions). Output per request peaked at 20,938 tokens (cap
+128,000); the write node sets no `max_tokens`.
+**Pages are fetched by tool and cut first.** The assembled pages are not in the writer's
+prompt. It fetches `.wiki/work/pages.md` with `read_file`, and two cuts apply before
+compaction ever does. (1) context-simple admits at most 128 KiB of any one tool result
+(`DEFAULT_MAX_TOOL_RESULT_BYTES = 128 * 1024`). Past that it keeps the first 128 KiB and
+appends "[tool-result truncated at ingress: original_text_utf8_bytes=...; retrieve missing
+content using narrower read/query parameters ...]". 60 of the 93 Stage 1 `read_file` reads of
+pages.md were over 128 KiB, so the writer saw only the head: the first pages in selection
+order, and never index.md, which is appended last. (2) When compaction fires, its first level
+truncates older tool results; the most recent five are protected. So the pages.md read is the
+first thing cut. The writer makes up for some of this by re-reading live page files with
+bash/sed; nothing tells V4 or the reader when it doesn't. `read_file`'s 2,000-line default
+also applies (the 957K-character test pages.md returned 2,000 of 2,184 lines), but the
+128 KiB ingress cap bites long before it.
 **Fix.** Class renamed to `.large-context`; `tests/test_models.py` resolves every box node
-through the engine's own parser. The size guard stays at 3.5M (the API window), but on a
-200K working window the guard is not what bounds the writer — compaction is, silently.
-**Status.** Open — reported at CP1: either the worker advertises 1M, or the guard drops to
-~700K characters.
+through the engine's own parser. Size guard left at 3.5M by decision (2026-10-16): lowering it
+to the compaction trigger would hold about half the sources. What bounds the writer is the
+128 KiB read and the ~105K trigger, not the guard. The splice, where the writer reads and
+returns sections, is the structural answer.
+**Status.** Guard decided. The read cap is recorded here; V4 does not yet detect it.
 
 ### A comment-only changed source does not rewrite the pages that cite it — 2026-10-14
 **Problem.** The Current state cheap-fix test assumed a same-name, changed-hash source makes
@@ -477,7 +492,7 @@ team-pulse.md is byte-identical, so the strip was never exercised on a real rewr
 writer ran on `claude-sonnet-5-5` with the repaired `.large-context` rule.
 **Fix.** The strip is in (`steps.strip_current_state`, applied in page_select); the real test
 needs a change the writer must integrate into the busy page.
-**Status.** Open — reported at CP1.
+**Status.** Superseded by "The Current state strip holds on a real rewrite — 2026-10-16".
 
 ### The resolver's archive: symlinks skipped on pack (true); 3.12 + data_filter on unpack (false) — 2026-10-16
 **Problem.** The platform investigation claimed (a) the resolver skips symbolic links when
@@ -543,14 +558,16 @@ compaction against the source.
   full/ copy with a 348K-character writer input; smoke with index.md padded to 437K and then
   957K characters): no compaction, in the hosted logs or by V4's count, which agreed (0 = 0).
   The prompt jumped by about 65K tokens when the writer read a 451K- and a 932K-character
-  pages.md, where Stage 1's 424K read added about 110K. The mechanism is not identified:
-  no ingress-truncation or tool-truncation marker appears in the hosted logs. If something
-  between the tool and the model caps large reads, the writer sees only part of pages.md on
-  big pages. Open.
+  pages.md. Cause, found 2026-10-16: context-simple's 128 KiB cap on any one tool result. The
+  read returned 936K characters (2,000 of 2,184 lines; no truncation field in the read_file
+  result, and no offset/limit in the writer's call: in that run it never paged), and context-simple
+  admitted the first 128 KiB plus a marker (its own estimate went 2,637 -> 39,467 across that
+  turn's reads, pages.md among them). See the
+  2026-10-14 entry, corrected.
 **Fix.** `compactions: {"brief": n, "write": n}` on every ledger row and in result.json
 `sources[]` (bda2b17).
-**Status.** Detection proven on recorded sessions; not yet seen firing live. The read cap is
-open.
+**Status.** Detection proven on recorded sessions; not yet seen firing live. Read cap
+explained (128 KiB ingress).
 
 ### Atomic page writes: the glue's are; the model steps' are not, and cannot be without staging — 2026-10-16
 **Problem.** The resolver returns the corpus whatever the outcome, so a job that dies
@@ -577,4 +594,62 @@ the write becomes a scope violation. The index node is the same, for index.md an
 That changes where both model steps write, so it is a change to their contract. It is not the
 splice, which is about reading and returning sections. It also needs one real ingest to check
 that the writer keeps to the staged paths.
-**Status.** Glue done. Writer/index staging is open, for a decision.
+**Status.** Glue done. Plan of record (decided 2026-10-16): staging for the writer and index
+steps is built once, with the splice, not before. The design: a stage dir
+`.wiki/work/stage/`; page_select copies the selected pages in; the prompts name the staged
+paths, never the live ones; checks read the stage and compare it with `before/`; commit
+`os.replace`s each staged page into place after the checks pass; hold discards the stage, with
+nothing to revert; any write to a live page during a model step is a scope violation. Index
+and log.md get the same treatment. Validation needs one real ingest showing the writer keeps
+to staged paths.
+
+### The ".wiki/work blocks every Resolve job" premise was wrong — 2026-10-16
+**Problem.** STAGE2 Phase 1 (and the 65554af commit message) said scratch left by a dead job
+would stop every later Resolve job, because the archive carries no `.git`.
+**How it showed.** The pre-65554af code, run on a corpus with leftover `.wiki/work/` scratch:
+with no `.git` (the Resolve case), two jobs in a row ran normally (`recover` is skipped
+without `.git`, and `select` wipes `.wiki/work/` at the start of every source). With `.git`
+present: "recover: .wiki/work/ holds scratch from a run that died ... touching nothing", exit 1,
+as designed.
+**Fix.** None needed. 65554af only moves the clearing earlier and logs one line saying a
+previous job died. The real Resolve risk from a dead job is half-written pages committed as
+the next baseline, which is the atomic-writes plan of record above.
+**Status.** Corrected here; the commit message stands as history.
+
+### The Current state strip holds on a real rewrite; a large real input did not compact — 2026-10-16
+**Problem.** Two open questions: does the writer still stack roll-ups when it never sees the
+old one, and does a large real writer input make compaction fire live?
+**How it showed.** /tmp/cs-real, a copy of full/. s64 (Team Pulse Weekly Planning chat) went
+back through `_inbox/` with one substantive, dated message appended: "## 2026-06-03 / [10:12]
+Brian Krabach: Change of plan for Team Pulse: Samuel Lee now owns the starting eval rubric
+instead of Chris, and the first draft is due 2026-06-12. Chris moves to the outside-team
+interviews full time." Converged on the second write (the first failed 6 citation checks and
+1 loss check); 4 model calls, 280 s. Six pages touched.
+- Current state, team-pulse.md: 10,657 -> 1,747 characters. "Earlier roll-up" block gone;
+  three "As of ..." paragraphs -> none. Before, it opened "Team Pulse is the team's
+  status-memory product, built by Chris Park and Samuel Lee under Brian Krabach's direction.
+  As of 2026-05-29 the plan for the week of 2026-06-01 is set: ..." After, it opens with a
+  state: "Team Pulse is the team's status-memory app: a pulse page, member, project and
+  outcome pages, and an agent endpoint and bundle that expose team data. Brian drives it ...;
+  Samuel Lee ... owns the data layer ...; Chris Park owns the member, project and outcome
+  pages ...". It then has "Where it stands", "Open or blocked" and "Latest decisions"
+  paragraphs. The change appears once, as state: "On 2026-06-03 Brian changed it: the starting
+  eval rubric moved from Chris to Samuel Lee, first draft due 2026-06-12 [s66: ...]". The same
+  held on every other touched page with a roll-up: brian 9,193 -> 1,163, chris 7,284 -> 1,061,
+  evals 4,972 -> 1,367, weekly-commitments-and-blockers 8,254 -> 1,203; every "Earlier roll-up"
+  block gone, no "As of" paragraphs. The roll-ups are now shorter than E01's ~2,500 median:
+  worth a read for what they leave out.
+- Did the writer reopen the live page? It never read team-pulse.md before writing. It read
+  pages.md (527K characters, cut at ingress to 128 KiB) and then paged into it with targeted
+  `read_file` offset/limit calls after a `grep -n '^## ' pages.md`. It edited the live pages
+  through a Python script it wrote (load, replace, save), which read the old roll-up only
+  inside the script. The old roll-up reached the model only after the edit, as removed
+  lines in its own `git diff` checks.
+- Compaction probe, same run (real Stage 1 pages, writer input 517K characters): no
+  compaction. Writer request sizes rose to 131,343 provider tokens (attempt 1) and 93,753
+  (attempt 2); the hosted logs show no `context:compaction`, and V4 recorded
+  `{"brief": 0, "write": 0}`. The trigger runs on context-simple's own estimate, which runs
+  below provider counts.
+**Fix.** None further: the strip is the Phase 1 fix.
+**Status.** Stacking gone on a real rewrite. Compaction still not seen live after four large
+inputs.
