@@ -355,7 +355,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             snapshot("final")
             return rs.EXIT_EMPTY
         snapshot("in_progress")
-        remaining = a.limit if a.limit and a.limit > 0 else None
+        remaining = a.limit
         while True:
             batches += 1
             cap = BATCH if remaining is None else min(BATCH, remaining)
@@ -522,6 +522,17 @@ class _VersionAction(argparse.Action):
         parser.exit()
 
 
+def _positive_int(text: str) -> int:
+    """--limit: a positive count (contract clause 10: an invalid --limit is exit 2)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wiki-weaver", description="WikiWeaver V4")
     p.add_argument("--version", action=_VersionAction)
@@ -557,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="accepted for V1 compatibility; V4 rewrites at most once",
     )
     s.add_argument("--keep-going", action="store_true", help=argparse.SUPPRESS)
-    s.add_argument("--limit", type=int, default=None, help=argparse.SUPPRESS)
+    s.add_argument("--limit", type=_positive_int, default=None, help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_ingest)
 
     s = sub.add_parser("ask", help="answer a question from the wiki")

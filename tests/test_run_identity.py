@@ -74,3 +74,20 @@ def test_run_ids_sort_in_start_order(tmp_path: Path) -> None:
     dirs = [p.parent for p in _results(w)]
     started = [json.loads((d / "result.json").read_text())["started"] for d in dirs]
     assert started == sorted(started) and len({d.name for d in dirs}) == 3
+
+
+# item 6 ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_limit_not_positive_is_usage_error(tmp_path: Path, limit: str) -> None:
+    w = _wiki(tmp_path)
+    r = ww("ingest", "--wiki", str(w), "--limit", limit, env=ENV)
+    assert r.returncode == 2
+    assert "--limit" in r.stderr and "usage:" in r.stderr
+    assert not (w / ".wiki/runs").exists() or not list((w / ".wiki/runs").iterdir())
+
+
+def test_limit_positive_is_accepted(tmp_path: Path) -> None:
+    w = _wiki(tmp_path)
+    assert ww("ingest", "--wiki", str(w), "--limit", "1", env=ENV).returncode == 3
