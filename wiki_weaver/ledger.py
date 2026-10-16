@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 
 from .lib import MAX_SOURCE_CHARS, atomic_append_line, wiki_inbox, wiki_ledger
@@ -32,14 +33,34 @@ STATUS_CONVERGED = "converged"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 
-# failure_kind vocabulary (V4). V1's kinds described its convergence loop; these
-# describe where V4's per-source path stopped.
-KIND_OVERSIZED = "oversized"
-KIND_CHECKS = "checks_failed"
-KIND_MODEL_STEP = "model_step_failed"
-KIND_EMPTY = "empty_source"
-KIND_UNKNOWN = "unknown"
-KIND_OVERSIZED_CONTEXT = "oversized_context"
+
+class FailureKind(StrEnum):
+    """failure_kind vocabulary (V4): where a source's path stopped and, for a model step,
+    why. One closed set; make_row refuses anything else (contracts/cli-surface.v1.md, 12)."""
+
+    OVERSIZED = "oversized"
+    OVERSIZED_CONTEXT = "oversized_context"
+    EMPTY = "empty_source"
+    CHECKS = "checks_failed"
+    MODEL_TIMEOUT = "model_timeout"
+    MODEL_AUTH = "model_auth_error"
+    MODEL_PROVIDER = "model_provider_error"  # 429, 529, other 5xx
+    MODEL_CONNECTION = "model_connection_error"
+    MODEL_STEP = "model_step_failed"  # the engine recorded no usable cause
+    UNKNOWN = "unknown"
+
+
+FAILURE_KINDS = frozenset(k.value for k in FailureKind)
+KIND_OVERSIZED = FailureKind.OVERSIZED.value
+KIND_OVERSIZED_CONTEXT = FailureKind.OVERSIZED_CONTEXT.value
+KIND_EMPTY = FailureKind.EMPTY.value
+KIND_CHECKS = FailureKind.CHECKS.value
+KIND_MODEL_TIMEOUT = FailureKind.MODEL_TIMEOUT.value
+KIND_MODEL_AUTH = FailureKind.MODEL_AUTH.value
+KIND_MODEL_PROVIDER = FailureKind.MODEL_PROVIDER.value
+KIND_MODEL_CONNECTION = FailureKind.MODEL_CONNECTION.value
+KIND_MODEL_STEP = FailureKind.MODEL_STEP.value
+KIND_UNKNOWN = FailureKind.UNKNOWN.value
 
 
 def read_rows(wiki: Path) -> list[dict]:
@@ -100,6 +121,8 @@ def make_row(
     failed_to: str = "",
     **extra,
 ) -> dict:
+    if failure_kind and failure_kind not in FAILURE_KINDS:
+        raise ValueError(f"failure_kind {failure_kind!r} is not in FailureKind")
     row = {
         "source": source,
         "source_id": source_id_for(read_rows(wiki), file_hash),

@@ -1,0 +1,20 @@
+{
+  "node_id": "brief",
+  "iteration": 0,
+  "outcome": "fail",
+  "status": "fail",
+  "preferred_next_label": null,
+  "preferred_label": null,
+  "suggested_next_ids": null,
+  "context_updates": null,
+  "duration_ms": 375.3970410034526,
+  "notes": null,
+  "failure_reason": "Error code: 529 - {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}, 'request_id': 'req_synthetic'}",
+  "session_id": null,
+  "is_explicit": false,
+  "failed_step": {
+    "prompt": "You write the brief for one source entering a wiki. Read .wiki/work/context.md: ",
+    "response_tail": "",
+    "error": "Error code: 529 - {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}, 'request_id': 'req_synthetic'}"
+  }
+}

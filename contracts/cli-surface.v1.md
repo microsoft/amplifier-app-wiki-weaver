@@ -67,6 +67,17 @@ contract fixes what callers touch so the engine can change freely underneath.
     `wiki_weaver/cli.py:133` with `wiki_weaver/schedule.py:38` (lock held → 75).*
 11. **The command reads and writes only the corpus directory it is pointed at,** so a
     resolver can ship the wiki in and out as a tarball.
+12. **`result.json` says what ran and why anything did not.** It carries
+    `wiki_weaver_version` (the `--version` string), `status`, `verdict`, `counts`;
+    `failed[]` entries with `source`, `reason` and a `failure_kind` from one closed set
+    (`oversized`, `oversized_context`, `empty_source`, `checks_failed`, `model_timeout`,
+    `model_auth_error`, `model_provider_error`, `model_connection_error`,
+    `model_step_failed`, `unknown`); and `errored[]` entries, which are run-level, not
+    sources, with `kind` (`preflight`, `recovery`, `usage`, `engine`, `interrupted`) and
+    `reason`. A model step's `reason` carries the provider's cause, e.g.
+    `write: model step failed — HTTP 401 authentication`; `model_step_failed` means the
+    engine recorded no usable cause. This record reaches Resolve's completion payload
+    verbatim, and the engine's logs do not leave the container.
 
 ## What v1 deliberately does NOT freeze
 

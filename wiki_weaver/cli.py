@@ -330,7 +330,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         run_id, run_dir = new_run_dir(wiki_runs(corpus), "ingest")
         problems = _preflight(corpus)
         if problems:
-            errored += [{"reason": f"preflight: {p}"} for p in problems]
+            errored += [{"kind": "preflight", "reason": f"preflight: {p}"} for p in problems]
             for p in problems:
                 print(f"wiki-weaver: {p}", file=sys.stderr)
             return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
@@ -338,7 +338,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         # before the snapshot below would commit them as if they were the owner's.
         ok, msg = recover(corpus)
         if not ok:
-            errored.append({"reason": msg})
+            errored.append({"kind": "recovery", "reason": msg})
             print(f"wiki-weaver: {msg}; not starting", file=sys.stderr)
             return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
         if msg:
@@ -356,7 +356,9 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         only = Path(a.source).name if a.source else None
         if only:
             if not ((wiki_inbox(corpus) / only).exists() or (wiki_failed(corpus) / only).exists()):
-                errored.append({"reason": f"--source {only}: not in _inbox/ or .wiki/failed/"})
+                errored.append(
+                    {"kind": "usage", "reason": f"--source {only}: not in _inbox/ or .wiki/failed/"}
+                )
                 print(f"wiki-weaver: --source {only} not found", file=sys.stderr)
                 return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
         elif not eligible(corpus):
@@ -381,13 +383,15 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             if rc != 0:
                 errored.append(
                     {
-                        "reason": f"engine run failed in batch {batches} (exit {rc}); see {bdir}/engine.log"
+                        "kind": "engine",
+                        "reason": f"engine run failed in batch {batches} (exit {rc}); see {bdir}/engine.log",
                     }
                 )
             if any(t.get("node_id") == "index" and t.get("status") != "success" for t in btrace):
                 errored.append(
                     {
-                        "reason": f"index step failed in batch {batches}; pages were committed, index.md/log.md may be stale"
+                        "kind": "engine",
+                        "reason": f"index step failed in batch {batches}; pages were committed, index.md/log.md may be stale",
                     }
                 )
             attempted = sum(1 for r in brows if r.get("status") != "skipped")
@@ -404,7 +408,9 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         )
         return rs.EXIT_FOR_VERDICT[data["verdict"]]
     except BaseException as exc:
-        errored.append({"reason": f"ingest interrupted: {type(exc).__name__}: {exc}"})
+        errored.append(
+            {"kind": "interrupted", "reason": f"ingest interrupted: {type(exc).__name__}: {exc}"}
+        )
         snapshot("final")
         if isinstance(exc, Exception):
             print(f"wiki-weaver: {exc}", file=sys.stderr)

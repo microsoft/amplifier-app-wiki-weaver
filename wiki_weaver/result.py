@@ -57,6 +57,10 @@ EXIT_FOR_VERDICT = {
 }
 
 
+# errored[] entries are run-level problems, not sources: each carries one of these kinds.
+ERRORED_KINDS = frozenset({"preflight", "recovery", "usage", "engine", "interrupted"})
+
+
 def build(
     *,
     run_id: str,

@@ -568,6 +568,45 @@ def node_compactions(run_dir: Path, since: float) -> dict[str, int]:
     return out
 
 
+# The engine's per-node status.json carries the provider's cause in failure_reason (and,
+# for a node timeout, notes); it never leaves the container, so the hold reason carries it.
+_TIMEOUT_AFTER_RE = re.compile(r"timed out after (\d+(?:\.\d+)?)s")
+_HTTP_RE = re.compile(r"\b(?:Error code|status(?: code)?|HTTP)[: ]+([45]\d\d)\b", re.IGNORECASE)
+
+
+def model_failure(run_dir: Path, node: str) -> tuple[str, str]:
+    """(failure_kind, reason) for a failed model step, from
+    ``<run_dir>/engine/<node>/status.json``: ``<node>: model step failed — <cause>``."""
+    base = f"{node}: model step failed"
+    st = jread(Path(run_dir) / "engine" / node / "status.json", {}) or {}
+    if not isinstance(st, dict):
+        return lg.KIND_MODEL_STEP, base
+    fr = str(st.get("failure_reason") or "").strip()
+    notes = str(st.get("notes") or "").strip()
+    text = f"{fr} {notes}".strip()
+    if not fr:
+        return lg.KIND_MODEL_STEP, base
+    low = text.lower()
+    if fr.lower() == "timeout" or "timed out" in low:
+        m = _TIMEOUT_AFTER_RE.search(text)
+        cause = f"timeout after {round(float(m.group(1)))}s" if m else "timeout"
+        return lg.KIND_MODEL_TIMEOUT, f"{base} \u2014 {cause}"
+    m = _HTTP_RE.search(text)
+    code = int(m.group(1)) if m else None
+    if code in (401, 403) or "authentication_error" in low or "permission_error" in low:
+        word = "authentication" if code != 403 else "permission denied"
+        return lg.KIND_MODEL_AUTH, f"{base} \u2014 HTTP {code or 401} {word}"
+    if code == 429 or "rate_limit_error" in low:
+        return lg.KIND_MODEL_PROVIDER, f"{base} \u2014 HTTP 429 rate limited"
+    if code == 529 or "overloaded" in low:
+        return lg.KIND_MODEL_PROVIDER, f"{base} \u2014 HTTP 529 overloaded"
+    if code is not None and code >= 500:
+        return lg.KIND_MODEL_PROVIDER, f"{base} \u2014 HTTP {code} server error"
+    if "connection error" in low or "connecterror" in low or "connection refused" in low:
+        return lg.KIND_MODEL_CONNECTION, f"{base} \u2014 connection error"
+    return lg.KIND_MODEL_STEP, f"{base} \u2014 {fr[:200]}"
+
+
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|\Z)", re.DOTALL)
 
 
@@ -806,24 +845,21 @@ def step_hold(run_dir: str) -> str:
     stage = cur.get("stage", "?")
     if stage == "checks" and cur.get("findings"):
         f = cur["findings"]
+        kind = lg.KIND_CHECKS
         reason = f"checks failed twice: {'; '.join(f[:3])}" + (
             f" (+{len(f) - 3} more)" if len(f) > 3 else ""
         )
-    elif stage == "write":
+    elif stage == "checks":
+        kind, reason = lg.KIND_CHECKS, "failed at checks"
+    elif stage in MODEL_NODES:
         # a missing slugs file fails page_select before stage flips to write
-        reason = "write: model step failed"
-    elif stage == "brief":
-        reason = "brief: model step failed or wrote no slugs"
+        kind, reason = model_failure(Path(run_dir), stage)
+        if stage == "brief" and kind == lg.KIND_MODEL_STEP:
+            reason = "brief: model step failed or wrote no slugs"
     elif stage == "oversized-context":
-        reason = cur.get("hold_reason", "oversized-context")
+        kind, reason = lg.KIND_OVERSIZED_CONTEXT, cur.get("hold_reason", "oversized-context")
     else:
-        reason = f"failed at {stage}"
-    kind = {
-        "checks": lg.KIND_CHECKS,
-        "brief": lg.KIND_MODEL_STEP,
-        "write": lg.KIND_MODEL_STEP,
-        "oversized-context": lg.KIND_OVERSIZED_CONTEXT,
-    }.get(stage, lg.KIND_UNKNOWN)
+        kind, reason = lg.KIND_UNKNOWN, f"failed at {stage}"
     # Revert exactly two known lists: the journal's owned paths (the pages this source's
     # writer was given) and the paths the scope check named. If no writer ran, there are
     # no page entries and nothing is reverted. Everything else is left as it is.

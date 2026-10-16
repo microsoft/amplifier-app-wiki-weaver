@@ -1,0 +1,16 @@
+{
+  "node_id": "brief",
+  "iteration": 0,
+  "outcome": "fail",
+  "status": "fail",
+  "preferred_next_label": null,
+  "preferred_label": null,
+  "suggested_next_ids": null,
+  "context_updates": null,
+  "duration_ms": 900006.9722080079,
+  "notes": "Node 'brief' timed out after 900.0s",
+  "failure_reason": "timeout",
+  "session_id": null,
+  "is_explicit": false,
+  "failed_step": null
+}
