@@ -71,7 +71,8 @@ def new_run_dir(parent: Path, kind: str) -> tuple[str, Path]:
     first run's. The microsecond suffix keeps names unique and in start order; a name
     already taken (a frozen or coarse clock) is retried with a counter."""
     parent.mkdir(parents=True, exist_ok=True)
-    base = f"{kind}-{stamp()[:-1]}.{datetime.now(UTC).strftime('%f')}Z"
+    now = datetime.now(UTC)
+    base = f"{kind}-{now:%Y%m%dT%H%M%S}.{now:%f}Z"
     for n in range(1000):
         run_id = base if n == 0 else f"{base}-{n}"
         try:
