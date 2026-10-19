@@ -280,3 +280,28 @@ def test_init_never_overwrites_an_existing_corpus(tmp_path: Path) -> None:
             assert got.startswith(text)
         else:
             assert got == text, rel
+
+
+def test_init_leaves_no_gitkeep_anywhere(tmp_path: Path) -> None:
+    """RepoWeaver enumerates .wiki/failed/ as held sources with no dotfile filter."""
+    w = tmp_path / "w"
+    w.mkdir()
+    (w / "lens.md").write_text("## Purpose\nx\n")
+    r = subprocess.run(
+        [sys.executable, "-m", "wiki_weaver.cli", "init", str(w), "--plain"],
+        capture_output=True, text=True, check=False,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    assert not [str(p.relative_to(w)) for p in w.rglob(".gitkeep") if ".git/" not in str(p)]
+    assert (w / ".wiki/failed").is_dir() and (w / "_sources").is_dir()
+
+
+def test_scaffold_removes_gitkeep_an_older_init_left(tmp_path: Path) -> None:
+    w = tmp_path / "w"
+    for d in ("_sources", ".wiki/failed", "lens/corrections"):
+        (w / d).mkdir(parents=True)
+        (w / d / ".gitkeep").touch()
+    (w / ".wiki/failed/held.md").write_text("a held source\n")
+    cli.scaffold(w)
+    assert not list(w.rglob(".gitkeep"))
+    assert (w / ".wiki/failed/held.md").read_text() == "a held source\n"

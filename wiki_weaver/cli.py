@@ -136,8 +136,10 @@ def scaffold(corpus: Path) -> None:
         corpus / "feedback",
     ):
         d.mkdir(parents=True, exist_ok=True)
-    for keep in (wiki_sources(corpus), wiki_failed(corpus), corpus / "lens" / "corrections"):
-        (keep / ".gitkeep").touch()
+    # No .gitkeep placeholders: RepoWeaver lists .wiki/failed/ as held sources with no
+    # dotfile filter. Remove any an older init left; the folders are recreated every run.
+    for d in (wiki_sources(corpus), wiki_failed(corpus), corpus / "lens" / "corrections"):
+        (d / ".gitkeep").unlink(missing_ok=True)
     feedback_log(corpus).touch()
     reading = corpus / "READING.md"
     if not reading.exists():
