@@ -10,11 +10,11 @@ makes) so a rule that does not match fails here, not in production.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+from engine import ENGINE
 
 PIPELINE = Path(__file__).parent.parent / "pipeline"
 GRAPHS = ["init.dot", "ingest.dot", "ask.dot"]
@@ -38,7 +38,7 @@ print(json.dumps(out))
 
 
 def _engine_python() -> str | None:
-    exe = shutil.which("dot-runner")
+    exe = ENGINE
     if not exe:
         return None
     first = Path(exe).read_text(errors="replace").splitlines()[0]

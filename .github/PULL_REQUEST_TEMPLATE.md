@@ -10,7 +10,7 @@
 
 <!-- How did you test this? Include specific commands run and their output. -->
 
-- [ ] `pytest eval/ -q` passes (deterministic tests — no LLM required)
+- [ ] `uv run pytest tests/ -q` passes (model-free; no API key required)
 - [ ] Tested manual `wiki-weaver ingest` with a real wiki (if touching the pipeline)
 - [ ] Added/updated tests for new behavior
 

@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
+from engine import needs_engine
 from test_steps import ORCHARD, cite, fake_brief, page, step
 
 from wiki_weaver import checks as ck
@@ -226,7 +227,7 @@ def _select_only_graph() -> str:
     )
 
 
-@pytest.mark.skipif(not shutil.which("dot-runner"), reason="dot-runner not installed")
+@needs_engine
 def test_parameter_with_shell_metacharacters_is_not_executed(corpus: Path, tmp_path: Path):
     evil = "Bob's chat $(touch PWNED) `touch PWNED2` (draft).md"
     shutil.copy2(corpus / "_inbox" / ORCHARD, corpus / "_inbox" / evil)

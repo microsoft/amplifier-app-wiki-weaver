@@ -16,13 +16,13 @@ import sys
 from pathlib import Path
 
 import pytest
+from engine import ENGINE, needs_engine
 
 from wiki_weaver import cli, ledger
 from wiki_weaver import result as rs
 
 FIX = Path(__file__).parent / "fixtures"
 VERBS = ("doctor", "init", "ingest", "ask", "build-dashboard", "update")
-needs_engine = pytest.mark.skipif(not shutil.which("dot-runner"), reason="dot-runner not installed")
 
 
 def ww(*args: str, env: dict | None = None, cwd: Path | None = None, **kw):
@@ -213,7 +213,7 @@ def test_c8_one_ingest_one_run_directory_one_result(tmp_path: Path) -> None:
 def limited_run(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> tuple[Path, subprocess.CompletedProcess]:
-    if not shutil.which("dot-runner"):
+    if ENGINE is None:
         pytest.skip("dot-runner not installed")
     w = _wiki(tmp_path_factory.mktemp("c9"), sources=2)
     r = ww(

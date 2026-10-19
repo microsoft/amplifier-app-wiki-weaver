@@ -120,12 +120,12 @@ def test_c_no_shell_node_invokes_a_model():
 
 
 def test_dot_runner_lint_passes_on_all_graphs():
-    import shutil
     import subprocess
 
     import pytest
+    from engine import ENGINE
 
-    exe = shutil.which("dot-runner")
+    exe = ENGINE
     if not exe:
         pytest.skip("dot-runner not installed")
     for g in GRAPHS:

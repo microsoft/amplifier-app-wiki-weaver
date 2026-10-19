@@ -17,39 +17,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        # Lightweight, hermetic CI. wiki-weaver declares amplifier-foundation +
-        # amplifier-unified-llm-client as @main git deps; we install with --no-deps so CI
-        # does NOT git-clone those two repos on every run (slow + network-flaky). The real
-        # `uv tool install` + @main resolution is validated by the DTU install proof, not CI.
-        # Deterministic tests run here; tests needing the Amplifier runtime self-skip when
-        # amplifier_foundation is absent.
+      - name: Install uv
         run: |
-          python -m pip install --upgrade pip
-          # Test runner + the lightweight PyPI runtime deps the deterministic
-          # suite needs. tinycss2 + markdown are REAL runtime deps (dashboard
-          # CSS sanitizer + markdown rendering); they must be present because
-          # dashboard.py imports them at top level (no silent-degrade). hatchling
-          # is a test-only dep: eval/test_hatch_build.py imports BuildHookInterface
-          # to unit-test hatch_build.py's git-derived-version build hook (it is
-          # already a [build-system] requirement, but that's only installed into
-          # the isolated build env, not this test env). They are all installed
-          # explicitly here because the package install below uses
-          # --no-deps to avoid git-cloning the two @main Amplifier deps.
-          pip install pytest pytest-asyncio pyyaml tinycss2 markdown hatchling
-          pip install --no-deps -e .
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Run eval tests
-        # The deterministic tests (policy, provenance, ingest-drain, any-text ingest)
-        # run without LLM calls or API keys and should always pass. Tests that invoke
-        # the LLM pipeline (via amplifier_foundation) are automatically skipped when
-        # that package is not installed — CI runs the deterministic majority.
-        run: python -m pytest eval/ -q
+      - name: Run tests
+        # V4's suite. Model-free: no API key is set, and tests that drive the dot-runner
+        # engine skip when it is not installed (it is a separate `uv tool`).
+        run: uv run pytest tests/ -q
 
       - name: Resolution smoke -- uv tool install (fresh-install regression guard)
-        # The job above installs with `pip install --no-deps`, which cannot see
-        # dependency-resolution regressions (e.g. the "conflicting URLs for
-        # package amplifier-foundation" class of bug). This exercises the SAME
+        # `uv run` above resolves the dev environment, not an end-user install,
+        # so it cannot see install-time resolution regressions. This exercises the SAME
         # resolution path a real `uv tool install git+https://...` does, against
         # the checked-out commit via git+file://.
         #
@@ -61,5 +41,4 @@ jobs:
         # commit under test sidesteps that entirely (and is more precise: it
         # tests the actual PR commit, not whatever HEAD happens to resolve to).
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          "$HOME/.local/bin/uv" tool install "git+file://$GITHUB_WORKSPACE@$GITHUB_SHA"
+          uv tool install "git+file://$GITHUB_WORKSPACE@$GITHUB_SHA"
