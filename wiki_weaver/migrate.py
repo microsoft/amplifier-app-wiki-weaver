@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from .ledger import read_rows
-from .lib import page_files
+from .lib import atomic_write_text, page_files
 from .sources import read_text
 
 OLD_CITE_RE = re.compile(r'\[([^\[\]\n]+?\.md): "([^"\n]+)"\]')
@@ -49,7 +49,7 @@ def transform_citations(wiki: Path, apply: bool = True) -> dict:
         report["applied"] = False
         return report
     for p, text in plan.items():
-        p.write_text(text, encoding="utf-8")
+        atomic_write_text(p, text)
     report["applied"] = True
     return report
 

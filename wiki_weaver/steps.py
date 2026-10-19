@@ -7,8 +7,10 @@ corpus as the working directory. A step prints one routing token on its last std
 from __future__ import annotations
 
 import difflib
+import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +25,7 @@ from .lib import (
     MAX_SOURCE_CHARS,
     NON_PAGE_FILES,
     atomic_append_line,
+    atomic_copy,
     atomic_write_text,
     contained_file,
     corrections_dir,
@@ -506,6 +509,163 @@ def _parse_slugs(text: str) -> list[str]:
     return out
 
 
+# A compaction shows as a request smaller than the one before it in the same session:
+# inside one session a prompt only grows unless history was removed. The margins ignore
+# small accounting noise; on 157 Stage 1 brief/write sessions this count equalled the
+# hosted context:compaction records exactly (LEARNINGS, 2026-10-15).
+COMPACTION_DROP = 0.10
+COMPACTION_MIN_TOKENS = 2000
+MODEL_NODES: tuple[str, ...] = ("brief", "write")
+
+
+# context-simple admits at most this much (UTF-8) of any one tool result; the rest is dropped
+# behind a "[tool-result truncated at ingress ...]" marker the logs never record. The engine
+# does log each tool result whole, so the cut is recomputed from it (LEARNINGS, 2026-10-19).
+INGRESS_CAP_BYTES = 128 * 1024
+
+
+def _events(path: Path):
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ev, dict):
+            yield ev
+
+
+def _session_start(path: Path) -> float | None:
+    for ev in _events(path):
+        if ev.get("event") == "session:start":
+            ts = ev.get("timestamp") or (ev.get("data") or {}).get("timestamp")
+            try:
+                return datetime.fromisoformat(str(ts)).timestamp()
+            except ValueError:
+                return None
+    return None
+
+
+def _prompt_sizes(path: Path) -> list[int]:
+    """Prompt size of each request: input_tokens (uncached + cache read) + cache writes."""
+    sizes = []
+    for ev in _events(path):
+        if ev.get("event") == "provider:response":
+            u = (ev.get("data") or {}).get("usage") or {}
+            try:
+                sizes.append(int(u["input_tokens"]) + int(u.get("cache_write_tokens") or 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return sizes
+
+
+def count_compactions(path: Path) -> int:
+    sizes = _prompt_sizes(path)
+    return sum(
+        1
+        for prev, nxt in itertools.pairwise(sizes)
+        if nxt < prev * (1 - COMPACTION_DROP) and prev - nxt >= COMPACTION_MIN_TOKENS
+    )
+
+
+def count_ingress_truncations(path: Path) -> int:
+    """Tool results the model received cut at the 128 KiB ingress cap: the result as it is
+    serialized for the model (JSON for dict/list output, as amplifier-core does) is larger."""
+    n = 0
+    for ev in _events(path):
+        if ev.get("event") != "tool:post":
+            continue
+        res = (ev.get("data") or {}).get("result")
+        out = res.get("output") if isinstance(res, dict) else res
+        text = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+        if len(text.encode("utf-8", errors="replace")) > INGRESS_CAP_BYTES:
+            n += 1
+    return n
+
+
+def _per_node(run_dir: Path, since: float, count) -> dict[str, int]:
+    out: dict[str, int] = dict.fromkeys(MODEL_NODES, 0)
+    for node in MODEL_NODES:
+        for log in sorted((Path(run_dir) / "engine" / node / "sessions").glob("*/events.jsonl")):
+            start = _session_start(log)
+            if start is not None and start >= since:
+                out[node] += count(log)
+    return out
+
+
+def node_compactions(run_dir: Path, since: float) -> dict[str, int]:
+    """Compactions per model step, over the engine sessions this source started (session
+    start at or after ``since``) under ``<run_dir>/engine/<node>/sessions/``."""
+    return _per_node(run_dir, since, count_compactions)
+
+
+def node_ingress_truncations(run_dir: Path, since: float) -> dict[str, int]:
+    """Tool results cut at the ingress cap, per model step, over this source's sessions."""
+    return _per_node(run_dir, since, count_ingress_truncations)
+
+
+# The engine's per-node status.json carries the provider's cause in failure_reason (and,
+# for a node timeout, notes); it never leaves the container, so the hold reason carries it.
+_TIMEOUT_AFTER_RE = re.compile(r"timed out after (\d+(?:\.\d+)?)s")
+_HTTP_RE = re.compile(r"\b(?:Error code|status(?: code)?|HTTP)[: ]+([45]\d\d)\b", re.IGNORECASE)
+
+
+def model_failure(run_dir: Path, node: str) -> tuple[str, str]:
+    """(failure_kind, reason) for a failed model step, from
+    ``<run_dir>/engine/<node>/status.json``: ``<node>: model step failed — <cause>``."""
+    base = f"{node}: model step failed"
+    st = jread(Path(run_dir) / "engine" / node / "status.json", {}) or {}
+    if not isinstance(st, dict):
+        return lg.KIND_MODEL_STEP, base
+    fr = str(st.get("failure_reason") or "").strip()
+    notes = str(st.get("notes") or "").strip()
+    text = f"{fr} {notes}".strip()
+    if not fr:
+        return lg.KIND_MODEL_STEP, base
+    low = text.lower()
+    if fr.lower() == "timeout" or "timed out" in low:
+        m = _TIMEOUT_AFTER_RE.search(text)
+        cause = f"timeout after {round(float(m.group(1)))}s" if m else "timeout"
+        return lg.KIND_MODEL_TIMEOUT, f"{base} \u2014 {cause}"
+    m = _HTTP_RE.search(text)
+    code = int(m.group(1)) if m else None
+    if code in (401, 403) or "authentication_error" in low or "permission_error" in low:
+        word = "authentication" if code != 403 else "permission denied"
+        return lg.KIND_MODEL_AUTH, f"{base} \u2014 HTTP {code or 401} {word}"
+    if code == 429 or "rate_limit_error" in low:
+        return lg.KIND_MODEL_PROVIDER, f"{base} \u2014 HTTP 429 rate limited"
+    if code == 529 or "overloaded" in low:
+        return lg.KIND_MODEL_PROVIDER, f"{base} \u2014 HTTP 529 overloaded"
+    if code is not None and code >= 500:
+        return lg.KIND_MODEL_PROVIDER, f"{base} \u2014 HTTP {code} server error"
+    if "connection error" in low or "connecterror" in low or "connection refused" in low:
+        return lg.KIND_MODEL_CONNECTION, f"{base} \u2014 connection error"
+    return lg.KIND_MODEL_STEP, f"{base} \u2014 {fr[:200]}"
+
+
+_FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|\Z)", re.DOTALL)
+
+
+def strip_current_state(text: str) -> str:
+    """Drop the `## Current state` section, heading and body, from a page's text; every
+    other byte is kept. The writer is asked for a fresh roll-up and never sees the old one:
+    under the never-delete rule it kept old roll-ups (LEARNINGS, 2026-10-13). Section
+    boundaries are the ones the loss guard uses (`checks._without_current_state`)."""
+    m = _FRONTMATTER_RE.match(text)
+    head, body = (text[: m.end()], text[m.end() :]) if m else ("", text)
+    out, inside = [], False
+    for line in body.splitlines(keepends=True):
+        st = line.strip()
+        if st.startswith(("## ", "# ")):
+            inside = bool(ck.CURRENT_STATE_RE.match(st))
+        if not inside:
+            out.append(line)
+    return head + "".join(out)
+
+
 def step_page_select() -> str:
     cur = current()
     work = wiki_work(WIKI)
@@ -546,7 +706,7 @@ def step_page_select() -> str:
             ]
             as_of = _latest_source_date(srcs, this_date)
             head = f"existing, {len(srcs)} sources"
-            body = read_text(p)
+            body = strip_current_state(read_text(p))
         else:
             as_of, head, body = this_date, "new page - does not exist yet", ""
         if not name.startswith("source-") and as_of:
@@ -724,24 +884,21 @@ def step_hold(run_dir: str) -> str:
     stage = cur.get("stage", "?")
     if stage == "checks" and cur.get("findings"):
         f = cur["findings"]
+        kind = lg.KIND_CHECKS
         reason = f"checks failed twice: {'; '.join(f[:3])}" + (
             f" (+{len(f) - 3} more)" if len(f) > 3 else ""
         )
-    elif stage == "write":
+    elif stage == "checks":
+        kind, reason = lg.KIND_CHECKS, "failed at checks"
+    elif stage in MODEL_NODES:
         # a missing slugs file fails page_select before stage flips to write
-        reason = "write: model step failed"
-    elif stage == "brief":
-        reason = "brief: model step failed or wrote no slugs"
+        kind, reason = model_failure(Path(run_dir), stage)
+        if stage == "brief" and kind == lg.KIND_MODEL_STEP:
+            reason = "brief: model step failed or wrote no slugs"
     elif stage == "oversized-context":
-        reason = cur.get("hold_reason", "oversized-context")
+        kind, reason = lg.KIND_OVERSIZED_CONTEXT, cur.get("hold_reason", "oversized-context")
     else:
-        reason = f"failed at {stage}"
-    kind = {
-        "checks": lg.KIND_CHECKS,
-        "brief": lg.KIND_MODEL_STEP,
-        "write": lg.KIND_MODEL_STEP,
-        "oversized-context": lg.KIND_OVERSIZED_CONTEXT,
-    }.get(stage, lg.KIND_UNKNOWN)
+        kind, reason = lg.KIND_UNKNOWN, f"failed at {stage}"
     # Revert exactly two known lists: the journal's owned paths (the pages this source's
     # writer was given) and the paths the scope check named. If no writer ran, there are
     # no page entries and nothing is reverted. Everything else is left as it is.
@@ -768,6 +925,8 @@ def step_hold(run_dir: str) -> str:
             failed_checks=cur.get("failed_checks", {}),
             writer_input_chars=cur.get("writer_input_chars", 0),
             writer_chars_per_call=cur.get("writer_chars_per_call", []),
+            compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
+            ingress_truncations=node_ingress_truncations(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -790,7 +949,7 @@ def step_commit(run_dir: str) -> str:
         keep = lg.versions_dir(WIKI) / f"s{cur['prev_source_id']}.md"
         keep.parent.mkdir(parents=True, exist_ok=True)
         if not keep.exists():
-            shutil.copyfile(dest, keep)
+            atomic_copy(dest, keep)
     _place(src, srcs)
     record(
         Path(run_dir),
@@ -805,6 +964,8 @@ def step_commit(run_dir: str) -> str:
             failed_checks=cur.get("failed_checks", {}),
             writer_input_chars=cur.get("writer_input_chars", 0),
             writer_chars_per_call=cur.get("writer_chars_per_call", []),
+            compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
+            ingress_truncations=node_ingress_truncations(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -854,7 +1015,7 @@ def step_index_prep(run_dir: str) -> str:
     out += ["\n# Current index.md\n\n", read_text(idx) if idx.exists() else "(none)\n"]
     (work / "index_input.md").write_text("".join(out))
     if log.exists():
-        shutil.copy2(log, work / "log_before.md")
+        atomic_copy(log, work / "log_before.md")
     return "index"
 
 
@@ -864,7 +1025,7 @@ def step_finalize() -> str:
     if before.exists() and log.exists() and not read_text(log).startswith(read_text(before)):
         # log.md is append-only: restore the prior history and keep the new tail.
         new = read_text(log)
-        log.write_text(read_text(before).rstrip("\n") + "\n\n" + new)
+        atomic_write_text(log, read_text(before).rstrip("\n") + "\n\n" + new)
         print("log.md was rewritten, not appended; restored prior history", file=sys.stderr)
     extras = [p for p in changed_paths() if p not in ("index.md", "log.md")]
     if extras:
@@ -899,7 +1060,7 @@ def step_init_mode(mode: str) -> str:
 def step_default_lens() -> str:
     if not lens_path(WIKI).exists():
         data = Path(__file__).parent / "data" / "default_lens.md"
-        shutil.copy2(data, lens_path(WIKI))
+        atomic_copy(data, lens_path(WIKI))
     return "ok"
 
 

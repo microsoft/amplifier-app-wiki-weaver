@@ -25,6 +25,7 @@ from .dashboard import build_dashboard
 from .ledger import eligible, source_versions
 from .lens import describe, parse_page_types
 from .lib import (
+    atomic_copy,
     contained_file,
     feedback_log,
     lens_path,
@@ -34,6 +35,7 @@ from .lib import (
     wiki_ledger,
     wiki_runs,
     wiki_sources,
+    wiki_work,
 )
 from .steps import GIT_ID, jlines
 from .version import resolve_version
@@ -59,6 +61,26 @@ def pipeline_dir() -> Path:
 
 def stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def new_run_dir(parent: Path, kind: str) -> tuple[str, Path]:
+    """Create ``<parent>/<kind>-<UTC time to the microsecond>`` and return (run id, dir).
+
+    Two runs started in the same second used to collide on one directory: the second
+    crashed before writing result.json, and a reader of the newest result.json got the
+    first run's. The microsecond suffix keeps names unique and in start order; a name
+    already taken (a frozen or coarse clock) is retried with a counter."""
+    parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC)
+    base = f"{kind}-{now:%Y%m%dT%H%M%S}.{now:%f}Z"
+    for n in range(1000):
+        run_id = base if n == 0 else f"{base}-{n}"
+        try:
+            (parent / run_id).mkdir()
+        except FileExistsError:
+            continue
+        return run_id, parent / run_id
+    raise FileExistsError(f"no free run directory under {parent} for {base}")
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -114,12 +136,14 @@ def scaffold(corpus: Path) -> None:
         corpus / "feedback",
     ):
         d.mkdir(parents=True, exist_ok=True)
-    for keep in (wiki_sources(corpus), wiki_failed(corpus), corpus / "lens" / "corrections"):
-        (keep / ".gitkeep").touch()
+    # No .gitkeep placeholders: RepoWeaver lists .wiki/failed/ as held sources with no
+    # dotfile filter. Remove any an older init left; the folders are recreated every run.
+    for d in (wiki_sources(corpus), wiki_failed(corpus), corpus / "lens" / "corrections"):
+        (d / ".gitkeep").unlink(missing_ok=True)
     feedback_log(corpus).touch()
     reading = corpus / "READING.md"
     if not reading.exists():
-        shutil.copy2(PKG / "data" / "READING.md", reading)
+        atomic_copy(PKG / "data" / "READING.md", reading)
     gi = corpus / ".gitignore"
     have = gi.read_text().splitlines() if gi.exists() else []
     missing = [line for line in CORPUS_IGNORES if line not in have]
@@ -129,6 +153,15 @@ def scaffold(corpus: Path) -> None:
                 f.write("\n")
             f.write("\n".join(missing) + "\n")
     if not (corpus / ".git").exists():
+        # No history: scratch a dead run left behind has nothing to recover against
+        # (Resolve's archive never carries .git). With .git present, recover() decides.
+        work = wiki_work(corpus)
+        if work.is_dir() and any(work.iterdir()):
+            shutil.rmtree(work)
+            print(
+                "wiki-weaver: cleared .wiki/work/ - scratch with no git history to recover against",
+                file=sys.stderr,
+            )
         git(corpus, "init", "-q")
     commit_pending(corpus, "chore: scaffold wiki")
 
@@ -253,9 +286,7 @@ def cmd_ingest(a: argparse.Namespace) -> int:
 
 def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
     started, t0 = datetime.now(UTC), time.time()
-    run_id = f"ingest-{stamp()}"
-    run_dir = wiki_runs(corpus) / run_id
-    run_dir.mkdir(parents=True)
+    run_id, run_dir = "", None
     rows: list[dict] = []
     errored: list[dict] = []
     trace: list[dict] = []
@@ -292,15 +323,18 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
                 "max_cycles": a.max_cycles,
                 "limit": a.limit,
                 "source": a.source,
+                "wiki_weaver_version": resolve_version(__version__),
             },
         )
-        rs.write(run_dir / "result.json", data)
+        if run_dir is not None:
+            rs.write(run_dir / "result.json", data)
         return data
 
     try:
+        run_id, run_dir = new_run_dir(wiki_runs(corpus), "ingest")
         problems = _preflight(corpus)
         if problems:
-            errored += [{"reason": f"preflight: {p}"} for p in problems]
+            errored += [{"kind": "preflight", "reason": f"preflight: {p}"} for p in problems]
             for p in problems:
                 print(f"wiki-weaver: {p}", file=sys.stderr)
             return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
@@ -308,7 +342,7 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         # before the snapshot below would commit them as if they were the owner's.
         ok, msg = recover(corpus)
         if not ok:
-            errored.append({"reason": msg})
+            errored.append({"kind": "recovery", "reason": msg})
             print(f"wiki-weaver: {msg}; not starting", file=sys.stderr)
             return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
         if msg:
@@ -326,7 +360,9 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         only = Path(a.source).name if a.source else None
         if only:
             if not ((wiki_inbox(corpus) / only).exists() or (wiki_failed(corpus) / only).exists()):
-                errored.append({"reason": f"--source {only}: not in _inbox/ or .wiki/failed/"})
+                errored.append(
+                    {"kind": "usage", "reason": f"--source {only}: not in _inbox/ or .wiki/failed/"}
+                )
                 print(f"wiki-weaver: --source {only} not found", file=sys.stderr)
                 return rs.EXIT_FOR_VERDICT[snapshot("final")["verdict"]]
         elif not eligible(corpus):
@@ -335,10 +371,11 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             snapshot("final")
             return rs.EXIT_EMPTY
         snapshot("in_progress")
-        remaining = a.limit if a.limit and a.limit > 0 else None
+        remaining = a.limit
         while True:
             batches += 1
             cap = BATCH if remaining is None else min(BATCH, remaining)
+            assert run_dir is not None
             bdir = run_dir / f"batch-{batches:02d}"
             bdir.mkdir()
             params = {"run_dir": str(bdir), "cap": str(cap), "only": only or "-"}
@@ -350,13 +387,15 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             if rc != 0:
                 errored.append(
                     {
-                        "reason": f"engine run failed in batch {batches} (exit {rc}); see {bdir}/engine.log"
+                        "kind": "engine",
+                        "reason": f"engine run failed in batch {batches} (exit {rc}); see {bdir}/engine.log",
                     }
                 )
             if any(t.get("node_id") == "index" and t.get("status") != "success" for t in btrace):
                 errored.append(
                     {
-                        "reason": f"index step failed in batch {batches}; pages were committed, index.md/log.md may be stale"
+                        "kind": "engine",
+                        "reason": f"index step failed in batch {batches}; pages were committed, index.md/log.md may be stale",
                     }
                 )
             attempted = sum(1 for r in brows if r.get("status") != "skipped")
@@ -373,7 +412,9 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         )
         return rs.EXIT_FOR_VERDICT[data["verdict"]]
     except BaseException as exc:
-        errored.append({"reason": f"ingest interrupted: {type(exc).__name__}: {exc}"})
+        errored.append(
+            {"kind": "interrupted", "reason": f"ingest interrupted: {type(exc).__name__}: {exc}"}
+        )
         snapshot("final")
         if isinstance(exc, Exception):
             print(f"wiki-weaver: {exc}", file=sys.stderr)
@@ -501,6 +542,17 @@ class _VersionAction(argparse.Action):
         parser.exit()
 
 
+def _positive_int(text: str) -> int:
+    """--limit: a positive count (contract clause 10: an invalid --limit is exit 2)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wiki-weaver", description="WikiWeaver V4")
     p.add_argument("--version", action=_VersionAction)
@@ -536,7 +588,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="accepted for V1 compatibility; V4 rewrites at most once",
     )
     s.add_argument("--keep-going", action="store_true", help=argparse.SUPPRESS)
-    s.add_argument("--limit", type=int, default=None, help=argparse.SUPPRESS)
+    s.add_argument("--limit", type=_positive_int, default=None, help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_ingest)
 
     s = sub.add_parser("ask", help="answer a question from the wiki")
