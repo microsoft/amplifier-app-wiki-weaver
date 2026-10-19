@@ -335,3 +335,38 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
 - Plausible, unproven: compaction erasing the writer's memory that it already replaced Current
   state is a mechanism for the stacking seen in E02. The llm-direct run under the Current
   state variant tests both at once.
+
+## 2026-10-19 — Phase 1 closed
+
+- Closed at cc7e06b: v4-stage2 merged into v4 at 4fb85a5, then the credential-skip fix on top.
+  Seventeen commits; 177 tests with engine and key, 174 + 3 skipped without the key, 169 + 8
+  skipped without the engine; 38 of 50 model calls. Eight exit criteria met in full; atomic
+  writes met for glue-written files; two external items open — Marc's exclude line and Samuel's
+  packaging code — both Phase 2 gates, not blockers to this close.
+- Budget raised 40 → 50 on 2026-10-16, earmarked for the Current state real test and one
+  compaction probe. 38 used in total.
+- Staging for model-step page writes: with the splice, not now. Design recorded in LEARNINGS.
+  Ken: jobs have not been dying; Phase 2 and early Phase 3 are our jobs on our corpus; change
+  where the writer writes once, not twice.
+- worker=llm-direct on the write node: tried, reverted. Text-only — tool calls come back as
+  prose, nothing is written. Cannot run a tool-using writer; is the target worker for the
+  tool-less splice.
+- Two corrections to the 2026-10-15 entry: the pages are NOT in the writer's protected first
+  message — the prompt names .wiki/work/pages.md and the writer fetches it by tool, so the pages
+  are cut first; and the Stage 1 compaction count is 44 of 88 writer sessions. A second cut:
+  the context layer admits 128 KiB per tool result at ingress, head kept; 61 of 89 Stage 1
+  pages.md reads exceeded it and the writer never saw index.md. Both recorded per source as
+  compactions and ingress_truncations.
+- The ".wiki/work blocks every Resolve job" premise was wrong (LEARNINGS, 2026-10-16): without
+  .git, recovery is skipped and select wipes scratch per source anyway. The init fallback is
+  harmless. The real dead-job risk is a half-written page.
+- Current state cheap fix proven on a real rewrite: team-pulse.md roll-up 10,657 → 1,747 chars,
+  stacking gone, opens with state, change appears once with citation; the writer did not reopen
+  the live page. The structural roll-up step is NOT needed before Phase 3.
+- Archive claims verified at main and PR #7: pack skips symlinks; unpack refuses every link
+  member (stricter than data_filter, which is not used); archive is tar.gz; .wiki/work is not in
+  the exclude list.
+- CI runs V4's suite but cannot install the engine: dot-runner at the pinned rev depends on
+  amplifier-agent@main, which no longer builds. Engine-driven tests skip in CI. Whether the ACA
+  worker's pins install cleanly is an open question to Ken and the first Phase 2 risk.
+- Second CLI in main: still pending Gurkaran.
