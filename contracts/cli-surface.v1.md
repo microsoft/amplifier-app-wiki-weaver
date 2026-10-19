@@ -43,7 +43,9 @@ contract fixes what callers touch so the engine can change freely underneath.
 5. **`init` on an existing wiki leaves it intact.** The resolver runs `init` on every
    job; a wiki that `init` rewrites is a wiki lost every run.
 6. **`init` with neither `--purpose` nor `--plain`, run non-interactively, behaves as
-   `--plain`.** The resolver runs `init` in a container with nobody to interview.
+   `--plain`.** The resolver runs `init` in a container with nobody to interview. A plain
+   init still runs the engine for scaffolding, and needs provider credentials when the
+   engine is present.
 7. **`wiki_weaver.lib` exports five path helpers:** `wiki_inbox`, `wiki_sources`,
    `wiki_failed`, `wiki_ledger`, `wiki_dashboard`, returning `_inbox`, `_sources`,
    `.wiki/failed`, `.wiki/.processed.jsonl` and `.wiki/dashboard` under the corpus.

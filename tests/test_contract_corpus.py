@@ -16,7 +16,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
-from engine import needs_engine
+from engine import needs_engine_and_key
 from test_steps import ORCHARD, cite, fake_brief, page, step
 
 from wiki_weaver import cli
@@ -240,7 +240,7 @@ def test_c9_upstream_policy_reaches_the_writer(one: Path, tmp_path: Path, where:
 
 
 # layout: what init creates, and what it never overwrites ---------------------------------
-@needs_engine
+@needs_engine_and_key
 def test_layout_after_init(tmp_path: Path) -> None:
     w = tmp_path / "fresh"
     r = subprocess.run(
