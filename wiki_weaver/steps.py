@@ -518,38 +518,52 @@ COMPACTION_MIN_TOKENS = 2000
 MODEL_NODES: tuple[str, ...] = ("brief", "write")
 
 
-def _session_log(path: Path) -> tuple[float | None, list[int]]:
-    """(session start as epoch seconds, prompt size of each request) from one engine
-    session log; prompt size is input_tokens (uncached + cache read) + cache_write_tokens."""
-    start, sizes = None, []
+# context-simple admits at most this much (UTF-8) of any one tool result; the rest is dropped
+# behind a "[tool-result truncated at ingress ...]" marker the logs never record. The engine
+# does log each tool result whole, so the cut is recomputed from it (LEARNINGS, 2026-10-19).
+INGRESS_CAP_BYTES = 128 * 1024
+
+
+def _events(path: Path):
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return None, []
+        return
     for line in lines:
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("event") == "session:start" and start is None:
+        if isinstance(ev, dict):
+            yield ev
+
+
+def _session_start(path: Path) -> float | None:
+    for ev in _events(path):
+        if ev.get("event") == "session:start":
             ts = ev.get("timestamp") or (ev.get("data") or {}).get("timestamp")
             try:
-                start = datetime.fromisoformat(str(ts)).timestamp()
+                return datetime.fromisoformat(str(ts)).timestamp()
             except ValueError:
-                pass
-        elif ev.get("event") == "provider:response":
+                return None
+    return None
+
+
+def _prompt_sizes(path: Path) -> list[int]:
+    """Prompt size of each request: input_tokens (uncached + cache read) + cache writes."""
+    sizes = []
+    for ev in _events(path):
+        if ev.get("event") == "provider:response":
             u = (ev.get("data") or {}).get("usage") or {}
             try:
                 sizes.append(int(u["input_tokens"]) + int(u.get("cache_write_tokens") or 0))
             except (KeyError, TypeError, ValueError):
                 continue
-    return start, sizes
+    return sizes
 
 
 def count_compactions(path: Path) -> int:
-    _, sizes = _session_log(path)
+    sizes = _prompt_sizes(path)
     return sum(
         1
         for prev, nxt in itertools.pairwise(sizes)
@@ -557,16 +571,40 @@ def count_compactions(path: Path) -> int:
     )
 
 
-def node_compactions(run_dir: Path, since: float) -> dict[str, int]:
-    """Compactions per model step, over the engine sessions this source started (session
-    start at or after ``since``) under ``<run_dir>/engine/<node>/sessions/``."""
+def count_ingress_truncations(path: Path) -> int:
+    """Tool results the model received cut at the 128 KiB ingress cap: the result as it is
+    serialized for the model (JSON for dict/list output, as amplifier-core does) is larger."""
+    n = 0
+    for ev in _events(path):
+        if ev.get("event") != "tool:post":
+            continue
+        res = (ev.get("data") or {}).get("result")
+        out = res.get("output") if isinstance(res, dict) else res
+        text = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+        if len(text.encode("utf-8", errors="replace")) > INGRESS_CAP_BYTES:
+            n += 1
+    return n
+
+
+def _per_node(run_dir: Path, since: float, count) -> dict[str, int]:
     out: dict[str, int] = dict.fromkeys(MODEL_NODES, 0)
     for node in MODEL_NODES:
         for log in sorted((Path(run_dir) / "engine" / node / "sessions").glob("*/events.jsonl")):
-            start, _ = _session_log(log)
+            start = _session_start(log)
             if start is not None and start >= since:
-                out[node] += count_compactions(log)
+                out[node] += count(log)
     return out
+
+
+def node_compactions(run_dir: Path, since: float) -> dict[str, int]:
+    """Compactions per model step, over the engine sessions this source started (session
+    start at or after ``since``) under ``<run_dir>/engine/<node>/sessions/``."""
+    return _per_node(run_dir, since, count_compactions)
+
+
+def node_ingress_truncations(run_dir: Path, since: float) -> dict[str, int]:
+    """Tool results cut at the ingress cap, per model step, over this source's sessions."""
+    return _per_node(run_dir, since, count_ingress_truncations)
 
 
 # The engine's per-node status.json carries the provider's cause in failure_reason (and,
@@ -888,6 +926,7 @@ def step_hold(run_dir: str) -> str:
             writer_input_chars=cur.get("writer_input_chars", 0),
             writer_chars_per_call=cur.get("writer_chars_per_call", []),
             compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
+            ingress_truncations=node_ingress_truncations(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )
@@ -926,6 +965,7 @@ def step_commit(run_dir: str) -> str:
             writer_input_chars=cur.get("writer_input_chars", 0),
             writer_chars_per_call=cur.get("writer_chars_per_call", []),
             compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
+            ingress_truncations=node_ingress_truncations(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
         ),
     )

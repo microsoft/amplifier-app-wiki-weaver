@@ -653,3 +653,23 @@ interviews full time." Converged on the second write (the first failed 6 citatio
 **Fix.** None further: the strip is the Phase 1 fix.
 **Status.** Stacking gone on a real rewrite. Compaction still not seen live after four large
 inputs.
+
+### The 128 KiB ingress cut is recorded per source, from the tool result, not the marker — 2026-10-19
+**Problem.** The Phase 4 comparison needs to know which pages were written by a writer that
+did not see all its input. context-simple cuts any tool result over 128 KiB at ingress.
+**How it showed.** The `[tool-result truncated at ingress ...]` marker is never written to a
+log. It is absent from every run-directory `events.jsonl` (0 of 159 Stage 1 brief/write
+sessions); context-simple's own `context:tool_result_ingress_truncated` hook event is absent
+from every hosted context-intelligence log (0 across all workspaces); the only hits for the
+phrase are 2 sessions where the model's own reasoning mentions it. What the engine does log
+is each `tool:post` result in full. context-simple measures the tool message content, which
+amplifier-core builds with `get_serialized_output()` (JSON for dict/list output). Applied to
+Stage 1's run-directory logs, that rule finds 61 of 89 `read_file` reads of pages.md over
+128 KiB (the 2026-10-16 count from a different log source was 60 of 93), 71 over-cap tool
+results in all, in 61 of 159 sessions.
+**Fix.** Ledger rows and result.json `sources[]` carry
+`ingress_truncations: {"brief": n, "write": n}` beside `compactions`, counted from the run
+directory's session logs with the same session-start attribution. A result within a few bytes
+of the cap can be miscounted (the exact serializer is amplifier-core's); pages.md reads are
+hundreds of KiB either side.
+**Status.** Recorded, model-free. Detection only: nothing holds a source for it.

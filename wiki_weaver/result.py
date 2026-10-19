@@ -96,6 +96,7 @@ def build(
                 "name": r["source"],
                 "status": r.get("status", ""),
                 "compactions": r.get("compactions") or {},
+                "ingress_truncations": r.get("ingress_truncations") or {},
             }
             for r in rows
         ],

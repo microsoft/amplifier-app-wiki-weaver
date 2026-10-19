@@ -108,6 +108,76 @@ def test_result_json_carries_compactions_per_source() -> None:
         }
     ]
     data = rs.build(run_id="r", status="final", rows=rows, errored=[])
-    assert data["sources"] == [
-        {"name": "a.md", "status": "converged", "compactions": {"brief": 0, "write": 2}}
+    assert [
+        {k: v for k, v in x.items() if k != "ingress_truncations"} for x in data["sources"]
+    ] == [{"name": "a.md", "status": "converged", "compactions": {"brief": 0, "write": 2}}]
+
+
+# The 128 KiB ingress cap -------------------------------------------------------------
+# context-simple admits at most 128 KiB (UTF-8) of any one tool result and drops the rest
+# behind a "[tool-result truncated at ingress ...]" marker. The marker is never logged (not in
+# the run directory, and context-simple's own context:tool_result_ingress_truncated event is
+# not in the hosted logs either), so V4 applies the cap's rule to the tool:post result the
+# engine does log: the result as the model receives it (JSON for dict/list output) over
+# 128 KiB means the model saw only its head.
+
+
+def _read_session(tmp_path: Path, content_bytes: int, name: str = "s.jsonl") -> Path:
+    lines = (FIX / "read-pages.jsonl").read_text().splitlines()
+    post = json.loads(lines[1])
+    post["data"]["result"]["output"]["content"] = "x" * content_bytes
+    p = tmp_path / name
+    p.write_text("\n".join([lines[0], json.dumps(post)]) + "\n")
+    return p
+
+
+def test_tool_result_over_128_kib_counts_as_cut(tmp_path: Path) -> None:
+    from wiki_weaver.steps import count_ingress_truncations
+
+    assert count_ingress_truncations(_read_session(tmp_path, 140_000)) == 1
+
+
+def test_tool_result_under_128_kib_is_whole(tmp_path: Path) -> None:
+    from wiki_weaver.steps import count_ingress_truncations
+
+    assert count_ingress_truncations(_read_session(tmp_path, 120_000)) == 0
+    assert count_ingress_truncations(FIX / "compacted-4.jsonl") == 0  # no tool:post kept
+    assert count_ingress_truncations(tmp_path / "missing.jsonl") == 0
+
+
+def test_commit_records_ingress_cuts_against_the_source(corpus: Path, tmp_path: Path) -> None:
+    from test_steps import ORCHARD, cite, fake_brief, page, step
+
+    run = tmp_path / "run"
+    step(corpus, "select", str(run), "0", "-")
+    step(corpus, "assemble")
+    fake_brief(corpus, ["orchard-rollout"])
+    assert step(corpus, "page_select") == (0, "ok")
+    big = _read_session(tmp_path, 200_000, "big.jsonl")
+    _now_session(big, run / "engine/write/sessions/engine-w/events.jsonl")
+    _now_session(FIX / "clean.jsonl", run / "engine/brief/sessions/engine-b/events.jsonl")
+    sel = (corpus / ".wiki/work/selected.txt").read_text().split()
+    q = cite(corpus, "The orchard sensor rollout ships on Friday")
+    (corpus / sel[0]).write_text(page("Orchard Sync", [ORCHARD], f"- Rollout Friday {q}\n"))
+    (corpus / sel[1]).write_text(page("Orchard rollout", [ORCHARD], f"## Plan\n- Friday {q}\n"))
+    assert step(corpus, "checks") == (0, "pass")
+    assert step(corpus, "commit", str(run)) == (0, "next")
+    row = json.loads((corpus / ".wiki/.processed.jsonl").read_text().splitlines()[-1])
+    assert row["ingress_truncations"] == {"brief": 0, "write": 1}
+    assert row["compactions"] == {"brief": 0, "write": 0}
+
+
+def test_result_json_carries_ingress_cuts_per_source() -> None:
+    from wiki_weaver import result as rs
+
+    rows = [
+        {
+            "source": "a.md",
+            "status": "converged",
+            "converged": True,
+            "compactions": {"brief": 0, "write": 0},
+            "ingress_truncations": {"brief": 0, "write": 2},
+        }
     ]
+    src = rs.build(run_id="r", status="final", rows=rows, errored=[])["sources"][0]
+    assert src["ingress_truncations"] == {"brief": 0, "write": 2}
