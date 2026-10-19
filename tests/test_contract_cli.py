@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from engine import ENGINE, needs_engine
+from engine import ENGINE, needs_engine_and_key
 
 from wiki_weaver import cli, ledger
 from wiki_weaver import result as rs
@@ -164,7 +164,7 @@ def test_c5_init_on_an_existing_wiki_leaves_it_intact(tmp_path: Path) -> None:
 
 
 # 6 ------------------------------------------------------------------------------------
-@needs_engine
+@needs_engine_and_key
 def test_c6_init_without_flags_non_interactive_is_plain(tmp_path: Path) -> None:
     w = tmp_path / "fresh"
     r = ww("init", str(w), stdin=subprocess.DEVNULL, timeout=300)
