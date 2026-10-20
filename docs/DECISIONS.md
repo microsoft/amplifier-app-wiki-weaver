@@ -370,3 +370,35 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
   amplifier-agent@main, which no longer builds. Engine-driven tests skip in CI. Whether the ACA
   worker's pins install cleanly is an open question to Ken and the first Phase 2 risk.
 - Second CLI in main: still pending Gurkaran.
+
+## 2026-10-20 — Phase 2's mechanism is Ken's; #10 merged
+
+- Ken decided and built how V4 runs beside V1, superseding our two drafts (a resolver
+  branch; a weaver-v4 catalog entry) and his own counter-proposal as we had read it (a
+  package rename). amplifier-resolve#458, merged 8c3a948: V4 in its own Python 3.12
+  environment at /opt/resolve-weaver-v4, a seven-line wiki-weaver-v4 wrapper, V1 untouched.
+  Resolver PR #10: wiki_weaver_version main|v4; .wiki/work excluded on pack. No rename; V4
+  stays on v4. The second-CLI-in-main question is closed.
+- Why his is better, and why we missed it: it changes nothing in V4; two environments
+  cannot collide by construction; it uses the resolver's existing wiki_weaver_bin and the
+  exact pattern V1 is already installed with. We read "available in main" as the branch,
+  reasoned inside one Python environment instead of asking for two, and had wiki_weaver_bin
+  in our notes without using it. The answer lived in the deployment layer, not the code.
+- We reviewed #10 against real V4 at tip and pushed 06904df: "" and None now default to
+  main (the stock form sends "" for an untouched picker; every form-launched V1 job would
+  otherwise have failed before any CLI call); recovery failure preserves the original
+  reason; the recovery call is wrapped like doctor and build-dashboard; the recovery test's
+  fake writes V4's real journal shape; README notes that wiki_weaver_bin selection gets no
+  recovery. Merged by rebase at b453be3 — main requires linear history, so our earlier
+  "merge commit" advice was wrong; the catalog re-pin points at b453be3.
+- Not yet true: the image's V4 pin is c527cd9 (Phase 1 tip is 274d310); no image built or
+  deployed from the merged state; no staging workflow in either repo. The re-pin PR is ours
+  to send; build and deploy are Ken's.
+- Phase 2's path is local first — Ken: "get a local resolver regardless of the shape …
+  make that your goal today" — then ACA when an image is deployed. The local run is his
+  "verify it works in a DTU."
+- The image's dot-runner is fa01aa0, not the 80d5511 we verified on; 80d5511 no longer
+  installs fresh (amplifier-agent@main changed). Verifying V4 on fa01aa0 before the re-pin.
+- Open from the review, for Ken: withhold vs ship on recovery failure; unpack does not
+  strip .wiki/work; sources[] in the completion payload is uncapped and crosses the 8 KiB
+  line limit at ~65–70 sources once V4's per-source fields are present — before Phase 3.

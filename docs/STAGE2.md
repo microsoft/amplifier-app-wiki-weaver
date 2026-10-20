@@ -8,7 +8,7 @@
 
 **What this is.** WikiWeaver V4 replaces V1 as the engine that turns Team Pulse's sources into a wiki. It runs behind the same Resolve interface — same four commands, same zip in, same zip out — so nothing in Resolve or Team Pulse changes to run it. Stage 2 ends with V4 running in Resolve consistently: a V4 wiki of Team Pulse's full history, built inside Resolve, and V4 running alongside V1 on live jobs so the two can be compared. **Switching Team Pulse to V4 is a later, separate decision, and it is theirs.**
 
-**Resolve team (Ken, Marc).** Nothing changes in the platform. Team Pulse runs on ACA — confirmed by Ken; the VM lane is retired — and ACA workers reach `api.anthropic.com` and `github.com`. We need: a way for V4 jobs to run beside `weaver` without touching it — either a `weaver-v4` catalog entry, or Ken's proposal of V4 as a second CLI in `main` (pending, see DECISIONS); one line added to the resolver's zip-exclude list (`.wiki/work/`); how long ACA retains job inputs; access for us to submit jobs; and the model budget for a rebuild that is several hundred model calls over days of jobs. Budget two or three pin updates as V4 changes during Stage 2.
+**Resolve team (Ken, Marc).** Nothing changes in the platform. Team Pulse runs on ACA — confirmed by Ken; the VM lane is retired — and ACA workers reach `api.anthropic.com` and `github.com`. Ken has built the mechanism: V1 and V4 coexist in the worker image, V4 in its own environment behind a `wiki-weaver-v4` wrapper (`amplifier-resolve#458`, merged), and a job picks V4 with one parameter, `wiki_weaver_version: "v4"` (resolver PR #10 — reviewed by us, merged at `b453be3`; it also excludes `.wiki/work/` from the archive). Still needed: a re-pin so the image carries the Phase 1 tip rather than `c527cd9`; the image built and deployed somewhere we can submit to; how long ACA retains job inputs; access for us to submit jobs; and the model budget for a rebuild that is several hundred model calls over days of jobs.
 
 **Team Pulse team (Samuel, Alex, Devis).** Nothing changes in your code or your schedule. We need: read access to `data/corpus` on your server, to take the sources for the rebuild; your packaging code, to understand exactly what each job sends — V4 assumes the whole wiki is present, and you send a subset; your job parameters; and to know what on your side reads the wiki after Resolve returns it. The shadow runs are on our trigger, not yours.
 
@@ -36,7 +36,7 @@ Every item below is tagged with whose system it concerns:
 
 ## What changes for each team
 
-**Resolve team:** nothing in the platform. The existing weaver resolver — the wrapper that unpacks the zip, runs four `wiki-weaver` commands, and repacks — stays as it is; V4 answers those four commands and writes the same result file V1 does, verified by running the code. On ACA, the resolver's CLI environment is built at job start from pinned requirements, so "which wiki-weaver" is a catalog entry, not an image. Three things on your side: a `weaver-v4` catalog entry pinned to a V4 commit (Phase 2); one line added to the resolver's list of folders left out of the zip (Phase 1); and two or three pin updates over Stage 2 as V4 changes — Phase 1 changes it, the splice may change it again. The contract is the boundary, so Resolve never notices; the pins just have to follow. Separately, we have shared a set of platform observations with Ken — watchdog behavior by lane, failure reporting, retention, the image fallback — tracked there, not here.
+**Resolve team:** nothing in the platform's execution flow. The weaver resolver — the wrapper that unpacks the archive, runs four `wiki-weaver` commands, and repacks — now also reads `wiki_weaver_version` (PR #10, merged `b453be3`) and uses `wiki-weaver` or `wiki-weaver-v4` for every command in the job; V4 answers those commands and writes the same result file V1 does, verified by running the code. The worker image carries both: V1 at `/opt/resolve-weaver` as before; V4 at `/opt/resolve-weaver-v4` in its own Python 3.12 environment with its own `dot-runner`, behind a seven-line wrapper (#458, merged). Three things remain on your side: a re-pin of the image's V4 from `c527cd9` to the Phase 1 tip and of the resolver to `b453be3` (one PR, ours to send); building and deploying that image somewhere we can submit to; and two or three further pin updates as V4 changes during Stage 2 — the splice may change it again. The contract is the boundary, so Resolve never notices; the pins just have to follow. Separately, we have shared a set of platform observations with Ken — watchdog behavior by lane, failure reporting, retention, the image fallback — tracked there, not here.
 
 **Team Pulse team:** nothing in your code and nothing in your schedule. You keep packaging and sending jobs exactly as now, and reading V1's output. We need read access to `data/corpus` once, to take the sources for the rebuild, and to read your packaging code — the one real compatibility question is that V4 expects the whole wiki in the zip and you send a subset. The shadow runs are ours to trigger — we take each new source you've processed and run it through V4 — so your scheduler sends nothing twice. Before anyone talks about switching, we need to know what on your side reads the wiki after Resolve returns it.
 
@@ -114,7 +114,7 @@ The cheap fix: strip Current state from the page before the writer sees it and a
 
 ### What this is
 
-V4 runs **inside a Resolve worker container on ACA**, submitted the way Team Pulse submits, through the existing weaver resolver — a zip in, a wiki out. End to end first, small, before anything at scale. It is the first time V4 runs anywhere we do not control, and the first time it calls a model from inside Resolve.
+V4 runs **inside a Resolve worker container**, submitted the way Team Pulse submits, through the existing weaver resolver — an archive in, a wiki out. **Local first:** Ken's instruction is to stand Resolve up locally (via `amplifier-bundle-resolve`, the way he verifies his own changes), build the worker image there with the real V4, and run the job; then the same job on ACA once an image is deployed. The local run is what he means by "verify it works in a DTU"; the ACA run is Phase 2's second clause. End to end first, small, before anything at scale. It is the first time V4 runs anywhere we do not control, and the first time it calls a model from inside Resolve.
 
 ### Before starting — answers from the Resolve team
 
@@ -122,7 +122,7 @@ V4 runs **inside a Resolve worker container on ACA**, submitted the way Team Pul
 2. **[V4 ↔ Resolve] Egress — confirmed.** Ken: ACA workers reach `api.anthropic.com` and `github.com`; the goal and dotgraph resolvers already depend on it. V4's engine fetches its modules from GitHub on first use and resolves model names live, so this mattered.
 3. **[V4 ↔ Resolve] Retention — pending.** How long does ACA keep a job's input after completion? Ken is working on this and will answer. Phase 4's primary mechanism depends on it; the fallback does not.
 4. **[V4 ↔ Resolve] A dead job's zip — answered.** Ken's design direction: the resolver should always return the artifact, regardless of outcome; he is building that into the goal resolver now. So a half-written page *can* travel, and with scratch excluded from the zip the next job cannot tell. V4 writes pages atomically — Phase 1. Ken also notes Team Pulse's jobs have not died so far; their failures are non-convergence, not infrastructure.
-5. **[V4 ↔ Resolve] Does the engine install in the ACA worker today?** At Phase 1's close, a fresh install of dot-runner at our pinned rev failed: its `amplifier-agent@main` dependency no longer builds — Ken's library change, landing. CI runs V4's suite without the engine for now. Which dot-runner and amplifier-agent versions does the ACA worker install, and do they build cleanly? If the pinned closure is broken, this is the first thing Phase 2 hits.
+5. **[V4 ↔ Resolve] Does the engine install in the ACA worker today?** **Partly answered by #458:** the image installs dot-runner `fa01aa0` — its `main` tip — from a fully pinned closure; Ken's local DTU ran one source on it. That is not the `80d5511` we verified on, and `80d5511` no longer installs fresh. We verify V4 on `fa01aa0` before the re-pin. At Phase 1's close, a fresh install of dot-runner at our pinned rev failed: its `amplifier-agent@main` dependency no longer builds — Ken's library change, landing. CI runs V4's suite without the engine for now. Which dot-runner and amplifier-agent versions does the ACA worker install, and do they build cleanly? If the pinned closure is broken, this is the first thing Phase 2 hits.
 
 ### One check on our side first
 
@@ -130,7 +130,8 @@ V4 runs **inside a Resolve worker container on ACA**, submitted the way Team Pul
 
 ### What is in it
 
-- **[V4 ↔ Resolve] The catalog entry.** On ACA, which wiki-weaver runs is decided by pinned requirements the resolver's setup installs at job start — the mechanism from Ken's PR #7, whose head commit the hosted catalog already pins even though the PR is still a draft. The switch point is therefore not a branch we own but a catalog change Resolve owns: a second entry, `weaver-v4`, with its pins pointing at a commit on wiki-weaver's `v4` branch, plus the API image rebuild that makes the catalog live. Team Pulse keeps calling `weaver`; we call `weaver-v4`. We supply the commit SHA. V4 stays on `v4`; nothing merges to `main` in Stage 2. **Ken's answer and counter-proposal:** `amplifier-agent` became a true library, so whether the isolated runtime is still how the core-2.0.1 problem gets fixed is being re-assessed — nothing here should base on PR #7. Instead he asks: what would it take for V4 to be a **second CLI available in `main`**, so the resolver picks which binary to call? Answer: a rename (`wiki_weaver_v4` / `wiki-weaver-v4`), about a day, V1 untouched byte-for-byte, no new dependencies for V1's install. Recommended; recorded in DECISIONS as pending. If adopted, it replaces the catalog entry and becomes the first Phase 2 item.
+- **[V4 ↔ Resolve] How V4 gets into the worker and how a job picks it — decided and built by Ken.** Not a catalog entry, not a package rename. `amplifier-resolve#458` (merged `8c3a948`) bakes V4 into the worker image in its own Python 3.12 environment at `/opt/resolve-weaver-v4`, from a fully pinned 116-line closure, behind a seven-line `wiki-weaver-v4` wrapper that puts V4's own `dot-runner` first on PATH; V1 at `/opt/resolve-weaver` is byte-for-byte unchanged. Resolver PR #10 (merged `b453be3`) adds `wiki_weaver_version: "main" | "v4"` — omitted, empty or null means `main`; invalid values fail before any CLI call; a missing binary fails loud with no fallback; one binary serves every command in the job; the selection and the CLI's actual `--version` are recorded in every completion payload — and adds `.wiki/work` to the archive's pack exclusions. We reviewed #10 against real V4 at tip and fixed four things before merge, one of which would have failed every form-launched V1 job (the stock form sends `""` for an untouched picker). V4 stays on `v4`; nothing merges to `main`. **Two things are not yet true:** the image's V4 pin is `c527cd9`, twenty commits behind the Phase 1 tip `274d310` — a re-pin PR moves it, and the resolver's pin to `b453be3`; and no image has been built or deployed from the merged state — neither repo has a build workflow, and staging was "still being solidified" on the 19th.
+
 - **[V4 ↔ Team Pulse] The lens.** V4 is steered by a file called `lens.md` — what the wiki is for, who reads it, what each page type tracks. V1 has no equivalent. We have Team Pulse's lens, built from their purpose during Stage 1; the page-type section in it was written by hand and pasted in, not generated, as DECISIONS records. **For Samuel:** who owns this file after any switch.
 - **[V4 ↔ Team Pulse] A job shaped like theirs.** First, a fresh corpus: the lens and one of their sources. Then a job shaped exactly like Team Pulse's — the pages their packaging code would select, the ledger, one new source in `_inbox/` — against the small wiki the first job produced. That second job is where the partial-corpus question gets its answer in practice. We check Resolve's completion payload, fetch the returned zip through Resolve's artifact endpoint, read V4's result file from the event stream, and read the pages.
 - **[V4 ↔ Resolve] One long job.** Thirty-plus sources in one job. Team Pulse's own jobs are one source each, so this is not their shape; it is ours for Phase 3, and it measures what ACA actually does to a job that runs for hours. In the meeting we quoted a three-hour limit; the platform code says nothing on ACA kills a job on time. This job replaces the argument with a measurement, and the measured per-source time seeds the batch budget for Phase 3.
@@ -145,7 +146,7 @@ V4 runs **inside a Resolve worker container on ACA**, submitted the way Team Pul
 
 ### What we need
 
-**From the Resolve team:** ACA confirmed; egress; retention; the dead-job answer; PR #7's steady state; the `weaver-v4` catalog entry; the exclude-list line; access for us to submit jobs.
+**From the Resolve team:** the re-pin reviewed, and the image built and deployed somewhere we can submit to; retention; access for us to submit jobs; the model budget; `fa01aa0` confirmed or explained.
 **From the Team Pulse team:** a handful of representative sources; the packaging code; which parameters you pass today (`limit`, `max_cycles`, `keep_going`, a purpose text or `--plain`).
 
 ---
@@ -169,7 +170,7 @@ V4 runs **inside a Resolve worker container on ACA**, submitted the way Team Pul
 ### What is in it
 
 - **[V4 ↔ Team Pulse]** With read access to `data/corpus`, we take every source, confirm the archive is complete rather than pruned, and sort by source date. The moment we take them is the **snapshot**; Phase 4 picks up from it.
-- **[V4 ↔ Resolve]** A fresh V4 corpus with Team Pulse's lens, then `weaver-v4` jobs on ACA. **Each batch is sized by time, not by count:** per-source time grows as the wiki grows (218 to 321 seconds between E01 and E02), so a count that fit early would run over late. Each batch gets as many sources as the most recent per-source time says fit in the budget.
+- **[V4 ↔ Resolve]** A fresh V4 corpus with Team Pulse's lens, then jobs submitted with `wiki_weaver_version: "v4"`. **Each batch is sized by time, not by count:** per-source time grows as the wiki grows (218 to 321 seconds between E01 and E02), so a count that fit early would run over late. Each batch gets as many sources as the most recent per-source time says fit in the budget.
 - **[V4]** We watch writer input per call, wall time per source, and holds for size, batch by batch. Whatever happens is recorded.
 - **[V4]** At the first size hold: stop; the splice; resume from the held source.
 - **[V4]** We read pages and run the three questions we asked after every Stage 1 epoch. This is measurement, not a scored gate.
@@ -246,7 +247,7 @@ Brian's guidance: get the end-to-end working first; fix what the run shows needs
 
 **The scored evaluation.** Phase 4 produces a like-for-like side-by-side of V1 and V4 on the same sources. Judging which is better, formally, is the evaluation Brian deferred on 9/30. The comparison is there for whoever wants to look; it does not gate Stage 2.
 
-**Merging to `main`.** V4 stays on the `v4` branch. Resolve's catalog pins a `v4` commit. The merge happens when we decide, later.
+**Merging to `main`.** V4 stays on the `v4` branch; the worker image installs it from a pinned `v4` commit. Ken's coexistence design removed the only reason to merge early. The merge happens when we decide, later.
 
 ---
 
@@ -258,7 +259,7 @@ Written down so it can be tracked; not scheduled.
 
 **Before it:** the four data-safety items closed, by the splice or by direct fixes; whatever reads the wiki on Team Pulse's side confirmed against V4's shape; who owns the lens after the switch agreed.
 
-**The switch itself is two things.** On Resolve's side, `weaver`'s catalog pins move to the V4 commit — or Team Pulse's calls move to `weaver-v4` — one change, reviewed, enforced by the runtime check. On Team Pulse's side, the wiki pages in `data/corpus` are replaced by the V4-built wiki from Phases 3–4, which by then is level with V1's. Their next job packages from the V4 wiki and sends it to the V4 pin. Their code does not change.
+**The switch itself is two things.** On Resolve's side, Team Pulse's jobs start passing `wiki_weaver_version: "v4"` — or the resolver's default flips from `main` to `v4` — one reviewed change, enforced by the `--version` preflight. On Team Pulse's side, the wiki pages in `data/corpus` are replaced by the V4-built wiki from Phases 3–4, which by then is level with V1's. Their next job packages from the V4 wiki and sends it to the V4 pin. Their code does not change.
 
 **Reverting** is the same two steps in reverse: the pin back, the V1 pages restored. Checked, not assumed, before the switch.
 
@@ -291,21 +292,22 @@ Four recorded changes — the splice's trigger, the merge sequence, the §10 swa
 | | |
 |---|---|
 | **WikiWeaver (us)** | Phase 1; the lens; Phase 2's jobs; the Phase 3 rebuild, its measurements, and the splice if triggered; the Phase 4 backlog and shadow runs; the comparison |
-| **Resolve — Ken** | Retention (pending); access and budget (unanswered); the second-CLI decision with us; the watchdog and the other items in the platform notes already sent. ACA, egress, PR #7's status and the dead-job question: answered |
+| **Resolve — Ken** | Retention (pending); access and budget (unanswered); where the image is built and deployed; the `fa01aa0` question; the re-pin review; the two compaction asks; the watchdog and the other items in the platform notes already sent. ACA, egress, PR #7, the dead-job question, and the V4 mechanism: answered — the last by building it |
 | **Resolve — Marc** | The exclude-list line; the `update` verb decision; emitting `summary` so Resolve's `result.summary` is not null for weaver jobs; the pin change if and when the switch happens |
 | **Team Pulse — Samuel, Alex, Devis** | Sources and parameters for Phase 2; the packaging code; read access to `data/corpus`; what reads the wiki; and, later, the decision to switch |
 | **Brian** | The Stage 1 report; the splice when Phase 3 triggers it; whether the deferred evaluation comes back |
 
 ## Open questions
 
-Answered by Ken (recorded in DECISIONS, 2026-10-14): ACA is the only lane; ACA reaches Anthropic and GitHub; the resolver should always return the artifact; PR #7 is not a foundation.
+Answered by Ken (DECISIONS 2026-10-14 and 2026-10-20): ACA is the only lane; ACA reaches Anthropic and GitHub; the resolver should always return the artifact; PR #7 is not a foundation; how V4 gets into the worker and how a job picks it (#458, #10); the `.wiki/work/` exclusion (#10). The second-CLI-in-`main` question is closed — no rename was needed.
 
 1. **[Resolve]** How long does ACA retain a job's input after completion? (Ken: answer to follow.)
-2. **[Resolve]** Access for us to submit ACA jobs, and the model budget for the rebuild. (Asked twice; unanswered.)
-3. **[Resolve, us]** V4 as a second CLI in `main` — adopt? (Ken proposes; we recommend; pending.)
-4. **[Team Pulse]** What on your side reads the wiki after Resolve returns it, and what does it expect to find?
-5. **[Team Pulse]** How does the packaging code choose "relevant pages," and would sending all pages be a problem?
-6. **[Team Pulse]** Is the source archive in `data/corpus` complete, or pruned? What parameters does each job pass? How do returned pages get merged back?
-7. **[Team Pulse]** How do you want a rebuilt V4 wiki surfaced to you — Ken's suggestion is via your API, your design.
-8. **[Resolve]** Does the ACA worker's engine install cleanly today? A fresh install of dot-runner at our pinned rev fails — `amplifier-agent@main` no longer builds.
-9. **[Resolve, Marc]** The `.wiki/work/` exclude line — verified still missing at CP2.
+2. **[Resolve]** Access for us to submit jobs, and the model budget for the rebuild. (Asked three times; unanswered.)
+3. **[Resolve]** Where is the worker image built and deployed from, and is staging real? Neither repo has a build workflow; the meeting said staging was "still being solidified."
+4. **[Resolve]** Why dot-runner `fa01aa0` rather than `80d5511`? `80d5511` no longer installs fresh; we are re-verifying V4 on `fa01aa0`.
+5. **[Resolve]** Can the worker pass `enable_1m_context` through, and can dot-runner persist the `context:compaction` event into node output?
+6. **[Resolve, policy]** Should V4 recovery failure withhold the archive, or ship it flagged? Ken's "artifact regardless of outcome" says ship; #10 withholds. Marked PROPOSED in the review.
+7. **[Team Pulse]** What on your side reads the wiki after Resolve returns it, and what does it expect to find?
+8. **[Team Pulse]** How does the packaging code choose "relevant pages," and would sending all pages be a problem?
+9. **[Team Pulse]** Is the source archive in `data/corpus` complete, or pruned? What parameters does each job pass? How do returned pages get merged back?
+10. **[Team Pulse]** How do you want a rebuilt V4 wiki surfaced to you — Ken's suggestion is via your API, your design.
