@@ -402,3 +402,50 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
 - Open from the review, for Ken: withhold vs ship on recovery failure; unpack does not
   strip .wiki/work; sources[] in the completion payload is uncapped and crosses the 8 KiB
   line limit at ~65–70 sources once V4's per-source fields are present — before Phase 3.
+
+## 2026-10-20 — Phase 2's first clause met; the corpus is local; Phase 3 scoped
+
+- The first V4 job ran inside a Resolve worker. Local DTU via bundle-resolve; instance
+  de0203be8122; 3/3 converged; wiki_weaver_version "v4", wiki_weaver_bin "wiki-weaver-v4",
+  cli_version 2026.10.20-1292d87; 14 pages with Current state; 63 [sN] citations; no .git,
+  no .wiki/work in the archive. Verified from the backend's own database, the platform's
+  event stream and the archive — not the builder's report. Failure path: bad key →
+  model_auth_error on every source, recover rc=0, archive returned. Phase 2 criteria 1–3
+  met locally; the same job on staging is the second clause.
+- #462 merged at 1a57574: the image pins V4 1292d87 and the resolver b453be3. Ken approved;
+  he also shipped #463 (local registration, cold schema init) from our findings the same
+  evening. V4 verified on the image's engine fa01aa0: lint identical, 2/2 converged, correct
+  routing. Finding: the engine fetches nine modules from GitHub at @main on first run and
+  imports the fetched copies, so the pinned closure is partial. Platform's to fix; told Ken.
+- docs/CONTRACT.md drafted for the resolver (cad1bc7, local). It found: the catalog had
+  pinned #10's pre-rebase head; the 8 KiB line rule is the resolver's own (the platform
+  reads 64 MiB) and V4's per-source fields cross it at ~50 sources; V4 jobs get no
+  `activity` in heartbeats and progress moves per batch of 40.
+- Defects found by the run, fixes decided (Brief F): the resolver's unpack keeps the
+  archive's uid, so a non-root caller's tarball breaks git in the worker ("dubious
+  ownership") and defeats recovery — V1 is immune, V4 is not; fix in the resolver
+  (normalize uid/gid) AND in V4 (safe.directory at init), so neither depends on the other's
+  version. Also: V4 reports kind "engine" with the git cause dropped; .wiki/ingest.lock
+  travels; result.json never leaves the worker (→ .wiki/last-run.json round-trips); macOS
+  ._* files reach _inbox/.
+- Local-mode frictions reported to Ken: the 120 s schema-worker INITIALIZATION_TIMEOUT vs
+  116–181 s of V1 setup_commands on a cold VM; stack profile missing WORKER_CALLBACK_URL and
+  gh; registration by git URL impossible; Colima path and boot-race issues; a V1 defect —
+  two module caches collide on the second source of a multi-source job (Team Pulse's
+  one-source jobs never hit it).
+- Team Pulse's job shape, observed from a real job's archive and confirmed by Samuel: the
+  pages relevant to the source (seven, in the job we read), the ledgers, and one new source
+  in _inbox/ — not the wiki. That source was a repo summary; RepoWeaver on their server
+  feeds repo changes through the same weaver resolver. Their pages run to 137 KB.
+- The corpus is on this machine: a Sept 9 snapshot of amplifier-app-team-pulse-made/
+  data/corpus, 81 MB — Team Pulse's V1 wiki OUTPUT with the raw sources nested in _sources/
+  directories. conversations/_sources/ holds ~410 transcripts, chats and channel exports;
+  repos/, repos-private/, repos-public/ are ~690 per-repository mini-wikis with thousands of
+  per-commit change summaries. Phase 3 therefore does not wait on read access; the snapshot
+  is Phase 3's input and Phase 4 catches up from it.
+- Phase 3 scoped to the conversations wiki — the team's status memory, which is what the
+  exit criteria and the three questions are about. ~410 sources, double Stage 1's largest
+  run: two to three days of batches, not one. The repo trees are a separate decision, made
+  with their counts in hand. Brief: phase3-brief.md (source prep, bootstrap, batch driver).
+- Phase 2's path is staging (hosted), not local: V4 is in staging's image via #458/#462. The
+  local stack was torn down for disk (6.5 GiB free) once its evidence was on the host.
