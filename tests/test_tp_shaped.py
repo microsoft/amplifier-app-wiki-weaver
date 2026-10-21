@@ -102,7 +102,10 @@ def test_known_sources_lists_every_ledger_id(corpus: Path):
     assert lg.source_versions(corpus) == {}  # neither file is on disk
 
 
-def _tp_shaped(corpus: Path) -> None:
+BASE = "## Plan\n" + KEPT  # the committed page's body
+
+
+def _tp_shaped(corpus: Path, body: str = BASE) -> None:
     """Make the fixture corpus Team Pulse-shaped: one source in _inbox/, a ledger naming a
     source whose file is not here, and a committed page quoting that source."""
     for f in (corpus / "_inbox").glob("*.md"):
@@ -114,7 +117,7 @@ def _tp_shaped(corpus: Path) -> None:
             corpus, source=OLD, file_hash="a" * 64, status=lg.STATUS_CONVERGED, source_id=7
         ),
     )
-    (corpus / "orchard-rollout.md").write_text(page("Orchard Rollout", [OLD], "## Plan\n" + KEPT))
+    (corpus / "orchard-rollout.md").write_text(page("Orchard Rollout", [OLD], body))
     subprocess.run(["git", "add", "-A"], cwd=corpus, check=True)
     subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "tp-shaped"],
@@ -123,14 +126,14 @@ def _tp_shaped(corpus: Path) -> None:
     )
 
 
-def _write_pages(corpus: Path, added: str) -> None:
-    """The writer's output: the summary page, and the existing page with its old quote kept
-    and ``added`` woven in."""
+def _write_pages(corpus: Path, body: str) -> None:
+    """The writer's output: the summary page, and the existing page rewritten with
+    ``body`` (the old content kept, the new material woven in)."""
     cur = json.loads((corpus / ".wiki/work/current.json").read_text())
     summary = (corpus / ".wiki/work/selected.txt").read_text().split()[0]
     (corpus / summary).write_text(page(summary, [cur["filename"]], cite(corpus, QUOTE) + "\n"))
     (corpus / "orchard-rollout.md").write_text(
-        page("Orchard Rollout", [OLD, cur["filename"]], "## Plan\n" + KEPT + added)
+        page("Orchard Rollout", [OLD, cur["filename"]], body)
     )
 
 
@@ -141,7 +144,7 @@ def test_steps_accept_the_prior_quote_and_verify_the_new_one(corpus: Path, tmp_p
     step(corpus, "assemble")
     fake_brief(corpus, ["orchard-rollout"])
     assert step(corpus, "page_select") == (0, "ok")
-    _write_pages(corpus, f"- Ships {cite(corpus, QUOTE)}\n")
+    _write_pages(corpus, BASE + f"- Ships {cite(corpus, QUOTE)}\n")
     assert step(corpus, "checks") == (0, "pass")
     assert step(corpus, "commit", str(run)) == (0, "next")
     row = json.loads((corpus / ".wiki/.processed.jsonl").read_text().splitlines()[-1])
@@ -158,7 +161,7 @@ def test_steps_hold_keeps_every_finding_in_the_row(corpus: Path, tmp_path: Path)
     fake_brief(corpus, ["orchard-rollout"])
     step(corpus, "page_select")
     bad = "".join(f'- Claim {i} [s7: "newly added words number {i} here"]\n' for i in range(6))
-    _write_pages(corpus, bad)
+    _write_pages(corpus, BASE + bad)
     assert step(corpus, "checks") == (0, "rewrite")
     assert (corpus / ".wiki/work/findings.md").read_text().count("not verifiable") == 6
     assert step(corpus, "write_guard") == (0, "ok")
@@ -172,6 +175,65 @@ def test_steps_hold_keeps_every_finding_in_the_row(corpus: Path, tmp_path: Path)
     # rollback: the page is byte-identical to its committed version
     committed = page("Orchard Rollout", [OLD], "## Plan\n" + KEPT)
     assert (corpus / "orchard-rollout.md").read_text() == committed
+
+
+# Fix 4 - links already on the committed page stand ---------------------------------------
+
+LINKED = FM + "- See [Amplifier](amplifier.md) and [[salil-das]]\n"  # neither page is in the job
+
+
+def test_f_prior_dangling_link_passes(tmp_path: Path):
+    assert ck.check_links("p.md", LINKED, tmp_path, prior=LINKED) == []
+    assert len(ck.check_links("p.md", LINKED, tmp_path)) == 2  # a new page, or lint: checked
+
+
+def test_g_new_link_to_an_absent_page_fails(tmp_path: Path):
+    text = LINKED + "- And [Salil](salil-das.md)\n"
+    errs = ck.check_links("p.md", text, tmp_path, prior=LINKED)
+    assert errs == ["p.md: broken link -> salil-das.md"]
+    (tmp_path / "salil-das.md").write_text("x")  # in the job, or created by this write
+    assert ck.check_links("p.md", text, tmp_path, prior=LINKED) == []
+
+
+def test_h_prior_link_whose_text_changed_is_new(tmp_path: Path):
+    text = FM + "- See [the Amplifier initiative](amplifier.md) and [[salil-das|Salil]]\n"
+    errs = ck.check_links("p.md", text, tmp_path, prior=LINKED)
+    assert errs == ["p.md: broken link -> amplifier.md", "p.md: broken wikilink [[salil-das]]"]
+
+
+def test_steps_keep_prior_dangling_links_and_check_new_ones(corpus: Path, tmp_path: Path):
+    dangling = "- See [Amp](amplifier.md)\n"  # amplifier.md is not in this job
+    _tp_shaped(corpus, body=BASE + dangling)
+    run = tmp_path / "run"
+    step(corpus, "select", str(run), "0", "-")
+    step(corpus, "assemble")
+    fake_brief(corpus, ["orchard-rollout", "new-note"])
+    assert step(corpus, "page_select") == (0, "ok")
+    cur = json.loads((corpus / ".wiki/work/current.json").read_text())
+    (corpus / "new-note.md").write_text(page("Note", [cur["filename"]], "## Plan\n- new\n"))
+    # keeps the dangling link, adds a quote and a link to the page this write created
+    _write_pages(
+        corpus, BASE + dangling + f"- Ships {cite(corpus, QUOTE)}, see [note](new-note.md)\n"
+    )
+    assert step(corpus, "checks") == (0, "pass")
+    assert step(corpus, "commit", str(run)) == (0, "next")
+    assert dangling in (corpus / "orchard-rollout.md").read_text()
+
+
+def test_steps_rewrite_on_a_new_link_to_an_absent_page(corpus: Path, tmp_path: Path):
+    dangling = "- See [Amp](amplifier.md)\n"
+    _tp_shaped(corpus, body=BASE + dangling)
+    run = tmp_path / "run"
+    step(corpus, "select", str(run), "0", "-")
+    step(corpus, "assemble")
+    fake_brief(corpus, ["orchard-rollout"])
+    step(corpus, "page_select")
+    _write_pages(
+        corpus, BASE + dangling + f"- Ships {cite(corpus, QUOTE)}, see [Ghost](ghost.md)\n"
+    )
+    assert step(corpus, "checks") == (0, "rewrite")
+    findings = (corpus / ".wiki/work/findings.md").read_text()
+    assert "broken link -> ghost.md" in findings and "amplifier.md" not in findings
 
 
 # Fix 2 - the run record keeps the full error list -------------------------------------

@@ -467,8 +467,11 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
   the three-finding summary (cli-surface clause 12). The in-progress record is refreshed per
   source by the step that writes the ledger row (`steps.record` → `result.refresh`), not per
   batch by the CLI, so a progress panel sees each source land.
-- OPEN: links already on a page to pages a Team Pulse-shaped job was not sent would fail
-  `check_links` on any write to that page (`sam.md` → `amplifier.md`, `brian-krabach.md` →
-  `amplifier.md`, `salil-das.md` in the staging corpus). Not hit on staging or locally; not
-  fixed here. The same "already on the committed page" rule would apply — for the platform
-  owner, with the other TP-shaped question: whether the job should carry the linked pages.
+- Links follow the same rule as citations (closed the same day, same branch): a link already
+  on the committed page before the write — same label, same target — stands even when its
+  target page is not in the job; a link the write adds, or whose label or target it changed,
+  must resolve to a page the job carries or this write created. Found as a latent second
+  hold for Team Pulse-shaped jobs (`brian-krabach.md` → `amplifier.md`, `salil-das.md`;
+  `sam.md` → `amplifier.md` in the staging corpus; never selected by the brief, so never
+  hit). Whether such a job should carry the linked pages stays with the platform owner; V4
+  no longer depends on it.

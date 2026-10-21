@@ -182,10 +182,27 @@ def check_superseded_blocks(name: str, text: str, current_id: int | None) -> lis
     return []
 
 
-def check_links(name: str, text: str, wiki: Path) -> list[str]:
+def links_in(text: str) -> set[str]:
+    """Every link in ``text``'s body as written (label and target), whitespace-normalized:
+    markdown links and wikilinks alike."""
+    _, body = split_frontmatter(text)
+    out = {normalize_ws(m.group(0)) for m in MD_LINK_RE.finditer(body)}
+    return out | {normalize_ws(m.group(0)) for m in WIKILINK_RE.finditer(body)}
+
+
+def check_links(name: str, text: str, wiki: Path, prior: str | None = None) -> list[str]:
+    """Every link this write added or changed resolves to a file in the corpus - one the
+    job carries or one this write created. A link already on the committed page
+    (``prior``; same label, same target) stands even when its target is not in the job: it
+    resolved when it was written, and a job that carries only the pages it needs cannot
+    resolve every link they already hold. ``prior`` is None for a new page, or for `lint`,
+    which checks every link. A changed label or target is a new link."""
     errs = []
     _, body = split_frontmatter(text)
+    kept = links_in(prior) if prior is not None else set()
     for m in MD_LINK_RE.finditer(body):
+        if normalize_ws(m.group(0)) in kept:
+            continue
         target = m.group(1).strip("<>")
         if re.match(r"^[a-z][a-z0-9+.-]*:", target, re.IGNORECASE) or target.startswith("#"):
             continue
@@ -193,6 +210,8 @@ def check_links(name: str, text: str, wiki: Path) -> list[str]:
         if path and not (wiki / path).exists():
             errs.append(f"{name}: broken link -> {target}")
     for m in WIKILINK_RE.finditer(body):
+        if normalize_ws(m.group(0)) in kept:
+            continue
         slug = m.group(1).strip()
         cand = slug if slug.endswith(".md") else f"{slug}.md"
         if not (wiki / cand).exists():
@@ -351,12 +370,11 @@ def run_page_checks(
                 errs.append(f"{name}: page deleted")
             continue
         text = read_text(p)
+        before = read_text(prior) if prior.exists() else None
         errs += check_frontmatter(name, text)
         errs += check_duplicate_headings(name, text)
-        errs += check_citations(
-            name, text, sources, read_text(prior) if prior.exists() else None, known
-        )
-        errs += check_links(name, text, wiki)
+        errs += check_citations(name, text, sources, before, known)
+        errs += check_links(name, text, wiki, before)
         errs += check_current_state(name, text)
         errs += check_superseded_blocks(name, text, current_id)
         if types:

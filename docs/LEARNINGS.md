@@ -738,7 +738,10 @@ a prior quote was verified when it was first written and the writer may not alte
 altered one no longer matches the committed page and is verified as new); the ledger, not the
 page, says which ids are real; a prior quote is not re-read even when its source is present,
 so the rule is the same for every job shape, and `wiki-weaver lint` remains the full audit of
-every quote against every source. With it: `failed[].errors` keeps the full finding list
+every quote against every source. Links follow the same rule: a link already on the committed
+page (same label, same target) stands even when its target is not in the job; a link the write
+adds or changes must resolve to a page the job carries or this write created — the latent
+second hold found below. With it: `failed[].errors` keeps the full finding list
 (≤50) in `result.json` and `last-run.json` while `reason` stays the summary (cli-surface
 clause 12), and the in-progress `result.json` is rewritten after every source by the step that
 writes the ledger row (`steps.record` → `result.refresh`), so counts move 1 → 2 → 3 inside a
@@ -747,8 +750,11 @@ batch.
 `tests/test_tp_shaped.py`. Real runs: the staging job's corpus converges 1/1 (4 model calls;
 `resolve.md` keeps its 6 s3 quotes and gains 13 verified s4 quotes; untouched pages
 byte-identical), and cp3's three sources still converge 3/3 (9 calls; lint 65 citations, 0
-errors). Open, not fixed: two of the same job's input pages link to pages the job was not sent
-(`brian-krabach.md` → `amplifier.md`, `salil-das.md`; `sam.md` → `amplifier.md`), so
-`check_links` would hold any write that touches them. Not hit on staging or locally because
-the brief never selected those pages. Same shape of rule (accept links already on the
-committed page), different check — reported for a decision rather than folded in.
+errors). The link case was found afterwards by `lint` on the converged output: two of the
+same job's input pages link to pages the job was not sent (`brian-krabach.md` →
+`amplifier.md`, `salil-das.md`; `sam.md` → `amplifier.md`), never selected by the brief on
+staging or locally, so never hit. Closed the same day with the link rule above, and proved on
+a steered run of the same corpus (the graph's `brief` box replaced by a tool node naming
+`resolve`, `sam`, `brian-krabach`; the real `write` and `index`, 3 calls): converged,
+`brian-krabach.md` keeps its three dangling links, which under the old rule would have been
+three `broken link` findings and a hold.
