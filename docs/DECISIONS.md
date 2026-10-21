@@ -458,3 +458,17 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
 - Ownership is fixed on both sides by design — the resolver unpacks as the running user, V4
   trusts its corpus via a process-scoped `safe.directory` (git's environment config, never
   `~/.gitconfig`) — so neither depends on the other's version.
+- Ingest checks verify only the quotes a write adds or changes. A quote already on the
+  committed page stands on a ledger-known id (`ledger.known_sources`) and is not re-read even
+  when its source is present — one rule for every job shape (Team Pulse sends pages, ledger
+  and the new source, not `_sources/`); `wiki-weaver lint` remains the full audit. An id in
+  neither ledger nor `_sources/` is still an error. Branch `fix/tp-shaped-jobs`, local.
+- `result.json` `failed[].errors` carries the full finding list, capped at 50; `reason` stays
+  the three-finding summary (cli-surface clause 12). The in-progress record is refreshed per
+  source by the step that writes the ledger row (`steps.record` → `result.refresh`), not per
+  batch by the CLI, so a progress panel sees each source land.
+- OPEN: links already on a page to pages a Team Pulse-shaped job was not sent would fail
+  `check_links` on any write to that page (`sam.md` → `amplifier.md`, `brian-krabach.md` →
+  `amplifier.md`, `salil-das.md` in the staging corpus). Not hit on staging or locally; not
+  fixed here. The same "already on the committed page" rule would apply — for the platform
+  owner, with the other TP-shaped question: whether the job should carry the linked pages.

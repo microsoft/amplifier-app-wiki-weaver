@@ -68,7 +68,7 @@ def test_verdicts_and_exit_codes():
     assert ex([row("a", "skipped")]) == ("empty", 3, False)
     assert ex([row("a", "converged")], [{"reason": "index failed"}]) == ("errored", 1, False)
     d = rs.build(run_id="r", status="final", rows=[row("a", "failed")], errored=[])
-    assert d["failed"] == [{"source": "a", "reason": "r", "failure_kind": ""}]
+    assert d["failed"] == [{"source": "a", "reason": "r", "failure_kind": "", "errors": ["r"]}]
 
 
 def ww(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:

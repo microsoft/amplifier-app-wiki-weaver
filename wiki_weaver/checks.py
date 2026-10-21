@@ -78,26 +78,57 @@ def check_duplicate_headings(name: str, text: str) -> list[str]:
     return [f"{name}: duplicate ## heading '{h}'" for h in dups]
 
 
-def check_citations(name: str, text: str, sources: dict[int, tuple[str, str]]) -> list[str]:
-    """Every quote is >=5 words and an exact (whitespace-normalized) substring of the source
-    version its id names; every cited source is known and listed in the page's `sources:`.
-    ``sources`` maps source_id -> (filename, text of that version)."""
+def citations_in(text: str) -> set[tuple[int, str]]:
+    """(source_id, whitespace-normalized quote) for every quoted citation in ``text``."""
+    _, body = split_frontmatter(text)
+    return {(int(m.group(1)), normalize_ws(m.group(2))) for m in CITE_RE.finditer(body)}
+
+
+def check_citations(
+    name: str,
+    text: str,
+    sources: dict[int, tuple[str, str]],
+    prior: str | None = None,
+    known: dict[int, str] | None = None,
+) -> list[str]:
+    """Every quote this write added or changed is >=5 words and an exact (whitespace-
+    normalized) substring of the source version its id names; every cited source is known
+    and listed in the page's `sources:`.
+
+    ``sources`` maps source_id -> (filename, text of that version). ``prior`` is the page as
+    committed before this write (None for a new page, or for `lint`): a quote already on it
+    - same id, same words - was verified when it was first written, so it needs only a
+    known id, one in ``sources`` or in ``known`` (source_id -> filename, from the ledger).
+    A job that carries the pages it needs but not every source they quote (Team Pulse's
+    shape) can then write to them; a quote from a source whose text is not here is an
+    error only when this write added or changed it.
+    """
     errs: list[str] = []
     fm, body = split_frontmatter(text)
     listed = {str(s) for s in ((fm or {}).get("sources") or []) if isinstance(s, str)}
+    known = known or {}
+    kept = citations_in(prior) if prior is not None else set()
     norm_cache: dict[int, str] = {}
     for m in CITE_RE.finditer(body):
         sid, quote = int(m.group(1)), m.group(2)
-        if sid not in sources:
+        if sid in sources:
+            fname, stext = sources[sid]
+        elif sid in known:
+            fname, stext = known[sid], None
+        else:
             errs.append(f"{name}: cites unknown source [s{sid}]")
             continue
-        fname, stext = sources[sid]
-        if len(quote.split()) < 5:
-            errs.append(f'{name}: quote under 5 words: [s{sid}: "{quote}"]')
-            continue
-        hay = norm_cache.setdefault(sid, normalize_ws(stext))
-        if normalize_ws(quote) not in hay:
-            errs.append(f'{name}: quote not found verbatim in s{sid} ({fname}): "{quote[:80]}"')
+        if (sid, normalize_ws(quote)) not in kept:  # added or changed by this write
+            if len(quote.split()) < 5:
+                errs.append(f'{name}: quote under 5 words: [s{sid}: "{quote}"]')
+                continue
+            if stext is None:
+                errs.append(
+                    f"{name}: quote from s{sid} ({fname}) not verifiable - that source's text "
+                    f'is not in this job; cite only the current source for new claims: "{quote[:80]}"'
+                )
+            elif normalize_ws(quote) not in norm_cache.setdefault(sid, normalize_ws(stext)):
+                errs.append(f'{name}: quote not found verbatim in s{sid} ({fname}): "{quote[:80]}"')
         if listed and fname not in listed:
             errs.append(f"{name}: cites s{sid} ({fname}) but it is not in frontmatter sources")
     for m in MD_LINK_RE.finditer(body):
@@ -105,7 +136,7 @@ def check_citations(name: str, text: str, sources: dict[int, tuple[str, str]]) -
         if re.fullmatch(r"(\./)?source-[^/]*\.md", target):
             errs.append(f'{name}: links to a source page ({target}); cite as [s<id>: "quote"] only')
     for m in BARE_CITE_RE.finditer(body):
-        if int(m.group(1)) in sources:
+        if int(m.group(1)) in sources or int(m.group(1)) in known:
             errs.append(f"{name}: citation without a quote: [s{m.group(1)}]")
         else:
             errs.append(f"{name}: cites unknown source [s{m.group(1)}]")
@@ -271,6 +302,7 @@ CHECK_KINDS = (
     ("cites unknown source", "citations"),
     ("quote under 5 words", "short_quote"),
     ("not found verbatim", "citations"),
+    ("not verifiable", "citations"),
     ("not in frontmatter sources", "citations"),
     ("links to a source page", "source_link"),
     ("citation without a quote", "citations"),
@@ -305,7 +337,11 @@ def run_page_checks(
     sources: dict[int, tuple[str, str]],
     current_id: int | None = None,
     types: dict | None = None,
+    known: dict[int, str] | None = None,
 ) -> list[str]:
+    """``before_dir`` holds each existing selected page as committed before this write
+    (page_select copies it there; V4 commits per source, so that copy is HEAD's version).
+    ``known`` is the ledger's source_id -> filename map; see check_citations."""
     errs: list[str] = []
     for name in pages:
         p = wiki / name
@@ -317,7 +353,9 @@ def run_page_checks(
         text = read_text(p)
         errs += check_frontmatter(name, text)
         errs += check_duplicate_headings(name, text)
-        errs += check_citations(name, text, sources)
+        errs += check_citations(
+            name, text, sources, read_text(prior) if prior.exists() else None, known
+        )
         errs += check_links(name, text, wiki)
         errs += check_current_state(name, text)
         errs += check_superseded_blocks(name, text, current_id)

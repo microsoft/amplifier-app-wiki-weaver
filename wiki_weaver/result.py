@@ -8,8 +8,9 @@ counts.{total, converged, failed, blocked, errored, skipped}; ``total`` excludes
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
+
+from .lib import atomic_write_text
 
 EXIT_OK = 0
 EXIT_ERRORED = 1
@@ -60,6 +61,16 @@ EXIT_FOR_VERDICT = {
 # errored[] entries are run-level problems, not sources: each carries one of these kinds.
 ERRORED_KINDS = frozenset({"preflight", "recovery", "usage", "engine", "interrupted"})
 
+# failed[].errors keeps at most this many entries; `reason` stays the short summary.
+ERRORS_CAP = 50
+
+
+def _errors(row: dict) -> list[str]:
+    """The full list behind a failed row's `reason`: every check finding for a
+    `checks_failed` hold, otherwise the single cause. Never longer than ERRORS_CAP."""
+    errs = row.get("errors") or ([row["reason"]] if row.get("reason") else [])
+    return [str(e) for e in errs][:ERRORS_CAP]
+
 
 def build(
     *,
@@ -87,6 +98,7 @@ def build(
                 "source": r["source"],
                 "reason": r.get("reason", ""),
                 "failure_kind": r.get("failure_kind", ""),
+                "errors": _errors(r),
             }
             for r in rows
             if r.get("status") == "failed"
@@ -107,7 +119,48 @@ def build(
 
 def write(path: Path, data: dict) -> None:
     """Atomic replace: readers polling mid-run never see a torn file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+# The keys build() derives from its rows and lists; everything else in a record is `extra`.
+BUILD_KEYS = frozenset(
+    {
+        "run_id",
+        "status",
+        "verdict",
+        "counts",
+        "total",
+        "converged",
+        "advisories",
+        "blocked",
+        "errored",
+        "failed",
+        "sources",
+    }
+)
+
+
+def refresh(path: Path, rows: list[dict]) -> dict | None:
+    """Re-derive the row-driven fields of the in-progress record at ``path`` - counts,
+    verdict, failed[], sources[] - from ``rows`` and rewrite it atomically, keeping the
+    rest of the record (started, model_calls, lens_page_types, ...) as the CLI last wrote
+    it. Called after every source, so a progress panel polling the file sees each source
+    land, not only each batch. None, and nothing written, when there is no in-progress
+    record there: a final record is never touched.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("status") != "in_progress":
+        return None
+    out = build(
+        run_id=str(data.get("run_id", "")),
+        status="in_progress",
+        rows=rows,
+        errored=list(data.get("errored") or []),
+        blocked=list(data.get("blocked") or []),
+        extra={k: v for k, v in data.items() if k not in BUILD_KEYS},
+    )
+    write(path, out)
+    return out

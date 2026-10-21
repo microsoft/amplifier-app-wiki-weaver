@@ -71,15 +71,20 @@ contract fixes what callers touch so the engine can change freely underneath.
     resolver can ship the wiki in and out as a tarball.
 12. **`result.json` says what ran and why anything did not.** It carries
     `wiki_weaver_version` (the `--version` string), `status`, `verdict`, `counts`;
-    `failed[]` entries with `source`, `reason` and a `failure_kind` from one closed set
+    `failed[]` entries with `source`, `reason`, a `failure_kind` from one closed set
     (`oversized`, `oversized_context`, `empty_source`, `checks_failed`, `model_timeout`,
     `model_auth_error`, `model_provider_error`, `model_connection_error`,
-    `model_step_failed`, `unknown`); and `errored[]` entries, which are run-level, not
-    sources, with `kind` (`preflight`, `recovery`, `usage`, `engine`, `interrupted`) and
-    `reason`. A model step's `reason` carries the provider's cause, e.g.
+    `model_step_failed`, `unknown`) and `errors[]`, the full list behind `reason` — every
+    check finding for a `checks_failed` hold, the single cause otherwise — capped at 50
+    entries, while `reason` stays a short summary (`checks failed twice: a; b; c (+3
+    more)`); and `errored[]` entries, which are run-level, not sources, with `kind`
+    (`preflight`, `recovery`, `usage`, `engine`, `interrupted`) and `reason`. A model
+    step's `reason` carries the provider's cause, e.g.
     `write: model step failed — HTTP 401 authentication`; `model_step_failed` means the
-    engine recorded no usable cause. This record reaches Resolve's completion payload
-    verbatim, and the engine's logs do not leave the container.
+    engine recorded no usable cause. While a run is in progress the same file (status
+    `in_progress`) is rewritten after every source — counts, `failed[]`, `sources[]` — not
+    only when a batch ends. This record reaches Resolve's completion payload verbatim, and
+    the engine's logs do not leave the container.
 
 ## What v1 deliberately does NOT freeze
 
@@ -105,6 +110,8 @@ contract fixes what callers touch so the engine can change freely underneath.
   and the newest `result.json` records the value 4.
 - An unknown flag exits 2; `ingest` on an empty inbox exits 3; on a missing directory, 1.
 - `ingest` exits 75 while another ingest holds the same wiki.
+- A held source's `failed[]` entry carries `errors[]` (at most 50) and `reason` summarizes
+  it; the in-progress `result.json` counts move after each source, not each batch.
 
 ## Reserved / open questions (NOT frozen)
 

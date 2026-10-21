@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import checks as ck
 from . import ledger as lg
+from . import result as rs
 from .lens import parse_page_types
 from .lib import (
     MAX_SOURCE_CHARS,
@@ -127,10 +128,23 @@ def save_current(cur: dict) -> None:
 
 
 def record(run_dir: Path, row: dict) -> None:
-    """One V1-shaped ledger row, mirrored into this batch's changes.jsonl."""
+    """One V1-shaped ledger row, mirrored into this batch's changes.jsonl. The run's
+    in-progress result.json (one level up, written by the CLI) then reflects this source
+    at once - counts, failed[], sources[] - rather than when the batch ends."""
     row.setdefault("run_id", run_dir.parent.name)
     lg.append_row(WIKI, row)
     jappend(run_dir / "changes.jsonl", row)
+    run = run_dir.parent
+    if (run / "result.json").is_file():
+        rs.refresh(run / "result.json", run_rows(run))
+
+
+def run_rows(run: Path) -> list[dict]:
+    """Every row this run has written so far, across its batches, in order."""
+    rows: list[dict] = []
+    for b in sorted(run.glob("batch-*")):
+        rows += jlines(b / "changes.jsonl")
+    return rows
 
 
 LEDGER_REL = ".wiki/.processed.jsonl"
@@ -379,6 +393,7 @@ def step_select(run_dir: str, cap_s: str, only: str) -> str:
                     reason=f"oversized: more than {MAX_SOURCE_CHARS} characters",
                     failure_kind=lg.KIND_OVERSIZED,
                     failed_to=str(dest.resolve()),
+                    errors=[f"oversized: more than {MAX_SOURCE_CHARS} characters"],
                     pages_touched=[],
                     model_calls=0,
                 ),
@@ -781,7 +796,13 @@ def step_checks() -> str:
     lens = contained_file(WIKI, "lens.md")
     types = parse_page_types(read_text(lens)) if lens else {}
     errs += ck.run_page_checks(
-        WIKI, pages, work / "before", check_sources(cur), cur.get("source_id"), types
+        WIKI,
+        pages,
+        work / "before",
+        check_sources(cur),
+        cur.get("source_id"),
+        types,
+        known=lg.known_sources(WIKI),
     )
     if not errs:
         save_current(cur)
@@ -892,12 +913,14 @@ def step_recover() -> str:
 def step_hold(run_dir: str) -> str:
     cur = current()
     stage = cur.get("stage", "?")
+    errors: list[str] = []  # the full list behind `reason`; the ledger row carries it
     if stage == "checks" and cur.get("findings"):
         f = cur["findings"]
         kind = lg.KIND_CHECKS
         reason = f"checks failed twice: {'; '.join(f[:3])}" + (
             f" (+{len(f) - 3} more)" if len(f) > 3 else ""
         )
+        errors = list(f[: rs.ERRORS_CAP])
     elif stage == "checks":
         kind, reason = lg.KIND_CHECKS, "failed at checks"
     elif stage in MODEL_NODES:
@@ -930,6 +953,7 @@ def step_hold(run_dir: str) -> str:
             reason=reason,
             failure_kind=kind,
             failed_to=str(dest.resolve()),
+            errors=errors or [reason],
             pages_touched=[],
             model_calls=cur.get("model_calls", 0),
             failed_checks=cur.get("failed_checks", {}),

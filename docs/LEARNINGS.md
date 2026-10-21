@@ -711,3 +711,44 @@ inode it locked, retrying otherwise, so deleting it cannot let two runs hold the
 ingest's final `result.json` is also written to `.wiki/last-run.json` (overwritten each run,
 git-ignored in the corpus); corpus-package clause 10 now lists it as round-tripping.
 **Status.** Fixed, model-free tests in `tests/test_phase2_resolve.py`.
+
+### Team Pulse-shaped jobs held on quotes from sources they were never sent — 2026-10-21
+**Problem.** Team Pulse sends a job only the pages relevant to the new source, the ledger
+(`.wiki/.processed.jsonl`) and the one new source in `_inbox/` — not `_sources/`. Those pages
+already carry quotes such as `[s3: "…"]` from earlier sources, and V4's checks re-verified
+every quote on every page the writer touched against that source's text, which for s3 was not
+in the job. Such a job could never converge, however good the write.
+**How it showed.** Staging job 2 held its one source: `checks failed twice: resolve.md: cites
+unknown source [s3]; … (+3 more)`. Reproduced locally with the full list: attempt 1 was six
+`resolve.md: cites unknown source [s3]` plus `resolve.md: lost 2/13 lines (15%); superseded
+text must stay`, which the writer fixed; attempt 2 was the same six. The six were the page's
+six pre-existing s3 quotes, not anything the writer wrote; the writer's own s4 quotes were
+fine. Rollback was correct. Two things made it hard to read from Resolve: the run record kept
+only the first three findings (the rest survived only in the writer's session log), and the
+progress panel showed `0 converged` for the whole run because the in-progress `result.json`
+moved only when a batch of up to 40 sources ended.
+**Fix.** Verify only the quotes this write wrote. A quote the write added or changed must be
+≥5 words, its id known, and its text verbatim in that source version — as before. A quote
+already on the page before the write (same id, same words, in the copy `page_select` takes of
+the committed page) needs only a known id: one whose text is here, or one the ledger has
+assigned (`ledger.known_sources`). An id in neither is still `cites unknown source`; a new
+quote from a ledger-known source whose text is absent is `not verifiable`, a citations
+finding that tells the writer to cite only the current source for new claims. Why it is safe:
+a prior quote was verified when it was first written and the writer may not alter it (an
+altered one no longer matches the committed page and is verified as new); the ledger, not the
+page, says which ids are real; a prior quote is not re-read even when its source is present,
+so the rule is the same for every job shape, and `wiki-weaver lint` remains the full audit of
+every quote against every source. With it: `failed[].errors` keeps the full finding list
+(≤50) in `result.json` and `last-run.json` while `reason` stays the summary (cli-surface
+clause 12), and the in-progress `result.json` is rewritten after every source by the step that
+writes the ledger row (`steps.record` → `result.refresh`), so counts move 1 → 2 → 3 inside a
+batch.
+**Status.** Fixed on `fix/tp-shaped-jobs` (local, not pushed); tests in
+`tests/test_tp_shaped.py`. Real runs: the staging job's corpus converges 1/1 (4 model calls;
+`resolve.md` keeps its 6 s3 quotes and gains 13 verified s4 quotes; untouched pages
+byte-identical), and cp3's three sources still converge 3/3 (9 calls; lint 65 citations, 0
+errors). Open, not fixed: two of the same job's input pages link to pages the job was not sent
+(`brian-krabach.md` → `amplifier.md`, `salil-das.md`; `sam.md` → `amplifier.md`), so
+`check_links` would hold any write that touches them. Not hit on staging or locally because
+the brief never selected those pages. Same shape of rule (accept links already on the
+committed page), different check — reported for a decision rather than folded in.

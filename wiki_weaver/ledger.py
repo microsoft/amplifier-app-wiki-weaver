@@ -203,6 +203,18 @@ def source_versions(wiki: Path) -> dict[int, tuple[str, str]]:
     return out
 
 
+def known_sources(wiki: Path) -> dict[int, str]:
+    """source_id -> filename for every id the ledger has assigned, whether or not that
+    version's text is on disk (``source_versions`` lists the ones that are). A job that
+    carries the ledger but not `_sources/` still knows which ids are real."""
+    out: dict[int, str] = {}
+    for r in read_rows(wiki):
+        sid = r.get("source_id")
+        if isinstance(sid, int) and sid not in out:
+            out[sid] = _name(r)
+    return out
+
+
 def ids_for_source(wiki: Path, name: str) -> set[int]:
     return {
         r["source_id"]

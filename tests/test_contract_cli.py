@@ -239,9 +239,10 @@ def test_c12_result_json_says_what_ran_and_why_not(limited_run) -> None:
     for key in ("status", "verdict", "counts", "failed", "errored"):
         assert key in data
     (f,) = data["failed"]
-    assert set(f) >= {"source", "reason", "failure_kind"}
+    assert set(f) >= {"source", "reason", "failure_kind", "errors"}
     assert f["failure_kind"] == "model_connection_error"
     assert f["reason"] == "brief: model step failed \u2014 connection error"
+    assert f["errors"] == [f["reason"]]  # the full list behind `reason`; here, one cause
     assert f["failure_kind"] in ledger.FAILURE_KINDS
     assert r.returncode == 5
 
