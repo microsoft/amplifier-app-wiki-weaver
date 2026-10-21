@@ -5,6 +5,11 @@ of the run. The kernel decides who holds it, so there is no window between creat
 file and writing a PID in which a second run can mistake a live lock for a stale one, and
 a crashed holder's lock is released by the OS (no stale-PID heuristics). The holder's PID
 is written into the file for diagnostics only; nothing reads it to decide anything.
+
+The file is removed on release so it never travels in a returned corpus archive. Removal
+happens while the lock is still held, and an acquirer that locked a file which was unlinked
+between its open and its flock sees the path no longer names its inode and retries on the
+new file -- so two runs can never both hold "the" lock.
 """
 
 from __future__ import annotations
@@ -34,24 +39,39 @@ def acquire(path: Path) -> bool:
     if str(path) in _held:
         return True
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return False
+    while True:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        if _same_file(fd, path):
+            break
+        os.close(fd)  # the previous holder unlinked it on release; lock the new one
     os.ftruncate(fd, 0)
     os.pwrite(fd, str(os.getpid()).encode(), 0)
     _held[str(path)] = fd
     return True
 
 
+def _same_file(fd: int, path: Path) -> bool:
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return False
+    fst = os.fstat(fd)
+    return (st.st_dev, st.st_ino) == (fst.st_dev, fst.st_ino)
+
+
 def release(path: Path) -> None:
-    fd = _held.pop(str(Path(path)), None)
+    path = Path(path)
+    fd = _held.pop(str(path), None)
     if fd is None:
         return
     try:
-        os.ftruncate(fd, 0)
+        if _same_file(fd, path):
+            path.unlink(missing_ok=True)  # still held: no one can lock it in between
         fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)

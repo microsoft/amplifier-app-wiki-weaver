@@ -112,8 +112,19 @@ def test_c1_c10_state_travels_and_the_rest_does_not(
     _pack(one, there)
     for x in NOT_ROUND_TRIP:
         assert not (there / x).exists(), x
-    for x in ("_sources", ".wiki/.processed.jsonl", ".wiki/failed", "lens.md", "feedback"):
+    for x in (
+        "_sources",
+        ".wiki/.processed.jsonl",
+        ".wiki/failed",
+        "lens.md",
+        "feedback",
+        ".wiki/last-run.json",
+    ):
         assert (there / x).exists(), x
+    assert not (one / ".wiki/ingest.lock").exists()  # nothing left to travel
+    assert (there / ".wiki/last-run.json").read_bytes() == (
+        one / ".wiki/last-run.json"
+    ).read_bytes()
     r = subprocess.run(
         [sys.executable, "-m", "wiki_weaver.cli", "init", str(there), "--plain"],
         capture_output=True, text=True, check=False,

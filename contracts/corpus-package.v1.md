@@ -64,7 +64,11 @@ each part means, so any caller can swap the engine underneath without noticing.
 9. **Upstream-app policy at `.wiki/policy/schema.md` or `policy/schema.md` is read if
    present** and folded into the lens, so an upstream app's page types reach the writer.
 10. **Pages, `_sources/`, the ledger, `.wiki/failed/`, `.wiki/source-versions/`, the lens,
-    corrections and feedback round-trip; `.wiki/runs`, `.wiki/snapshots`, `.wiki/work` and every `.git` do not.**
+    corrections, feedback and `.wiki/last-run.json` round-trip; `.wiki/runs`, `.wiki/snapshots`,
+    `.wiki/work`, `.wiki/ingest.lock` and every `.git` do not.**
+    `.wiki/last-run.json` is the latest ingest's final `result.json`, copied out of
+    `.wiki/runs/` so the run record survives the trip; `ingest` removes its lock file on
+    every exit.
     The corpus may carry its own git for page history, but that history does not
     survive Resolve; `init` re-initializes git when `.git` is absent. `.wiki/work/` is a run's
     scratch: on a laptop, scratch left behind means a run died and the next run stops; inside

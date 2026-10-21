@@ -160,7 +160,7 @@ def test_c5_init_on_an_existing_wiki_leaves_it_intact(tmp_path: Path) -> None:
     assert ww("init", str(w), "--plain").returncode == 0
     after = snap()
     assert {k: after.get(k) for k in before} == before  # every existing file byte-identical
-    assert set(after) - set(before) <= {".wiki/ingest.lock"}  # the run lock, empty
+    assert set(after) - set(before) == set()  # not even the run lock: it is removed on exit
 
 
 # 6 ------------------------------------------------------------------------------------

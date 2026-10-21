@@ -87,6 +87,16 @@ def git(*args: str, check: bool = True) -> str:
     return r.stdout
 
 
+def git_fatal(text: str) -> str | None:
+    """The first ``fatal:`` line git printed, from ``fatal:`` on, or None. Git follows it
+    with hint lines (e.g. how to add a safe.directory), so the last line is not the cause."""
+    for line in (text or "").splitlines():
+        i = line.find("fatal:")
+        if i >= 0:
+            return line[i:].strip()[:300]
+    return None
+
+
 def changed_paths() -> list[str]:
     """Paths changed since the last commit (tracked or untracked, not ignored)."""
     out = git("status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")

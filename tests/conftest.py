@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,6 +27,20 @@ if ENGINE is None:
     os.environ["PATH"] = f"{_stub.parent}{os.pathsep}{os.environ.get('PATH', '')}"
 os_environ_key = "WW_TEST_ENGINE"
 __import__("os").environ[os_environ_key] = ENGINE or ""
+
+
+@pytest.fixture(autouse=True)
+def _isolated_git_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch):
+    """In-process init/ingest add `safe.directory` to os.environ (GIT_CONFIG_COUNT/KEY/VALUE);
+    restore the environment after each test so trust never leaks between tests. A scratch
+    GIT_CONFIG_GLOBAL proves nothing is written to the global config."""
+    cfg = tmp_path_factory.mktemp("gitglobal") / "gitconfig"
+    cfg.touch()
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
 
 
 @pytest.fixture

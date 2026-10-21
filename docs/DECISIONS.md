@@ -449,3 +449,12 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
   with their counts in hand. Brief: phase3-brief.md (source prep, bootstrap, batch driver).
 - Phase 2's path is staging (hosted), not local: V4 is in staging's image via #458/#462. The
   local stack was torn down for disk (6.5 GiB free) once its evidence was on the host.
+
+## 2026-10-21
+
+- Phase 2 fixes 1–4 decided and landed (local branches, not pushed): foreign-owned corpus
+  trusted, git `fatal:` cause in `errored[].reason`, `.wiki/ingest.lock` removed on exit,
+  `.wiki/last-run.json` round-trips (corpus-package clause 10).
+- Ownership is fixed on both sides by design — the resolver unpacks as the running user, V4
+  trusts its corpus via a process-scoped `safe.directory` (git's environment config, never
+  `~/.gitconfig`) — so neither depends on the other's version.

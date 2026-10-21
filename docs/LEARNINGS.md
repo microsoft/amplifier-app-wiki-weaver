@@ -673,3 +673,41 @@ directory's session logs with the same session-start attribution. A result withi
 of the cap can be miscounted (the exact serializer is amplifier-core's); pages.md reads are
 hundreds of KiB either side.
 **Status.** Recorded, model-free. Detection only: nothing holds a source for it.
+
+### A corpus unpacked foreign-owned stops git: V4 withheld the archive — 2026-10-21
+**Problem.** The first V4 job inside Resolve failed at checks with `kind: "engine"` and no
+cause; the recovery `init` failed the same way and the resolver withheld the archive.
+**How it showed.** The corpus tarball was packed on macOS by uid 501. The resolver unpacked it
+with `tar.extractall`, which keeps the archived uid/gid when the extractor is root (Python's
+default extraction filter before 3.14 does not strip owners). The worker runs as root, so
+`/project/.resolve/corpus` was owned by 501 and every git command refused it: `fatal:
+detected dubious ownership in repository at '/project/.resolve/corpus'`. The checks step's
+traceback carried that line into the engine's status.json, which never leaves the container;
+V4's run-level reason said only "engine run failed". V1 was immune: it never runs git. The
+same unpack also delivered macOS AppleDouble files (`_inbox/._*`); they were not ingested but
+travelled back in the archive. Reproduced locally without root via git's
+`GIT_TEST_ASSUME_DIFFERENT_OWNER=1`: same `errored: [{kind: engine}]`, same silence.
+**Fix.** Both sides, by design, so neither depends on the other's version. Resolver
+(`corpus.unpack`): every member is reset to uid/gid 0 with empty owner names before extraction,
+so files land owned by the running user; `._*` members are dropped. V4: `init`, `ingest` and
+the recovery path trust the corpus before any git call: `safe.directory=<corpus>` is set in the
+process environment (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, idempotent),
+which every git child inherits -- through dot-runner to the steps, verified on the real engine --
+and nothing is written to `~/.gitconfig`. And the cause now surfaces: a failed batch or recovery puts the first git `fatal:` line
+in `errored[].reason` (kind unchanged); recovery used to keep stderr's last line, which for
+this error is git's hint, not the cause.
+**Status.** Fixed on branches `fix/unpack-ownership` (resolver) and
+`fix/phase2-resolve-findings` (V4), local, not yet in staging's image.
+
+### The run lock and the run record were on the wrong side of the archive — 2026-10-21
+**Problem.** Two files crossed, or failed to cross, the Resolve boundary the wrong way.
+**How it showed.** `.wiki/ingest.lock` was released by truncation, not removal, so an empty
+lock file came back in every returned archive. `result.json` lives under `.wiki/runs/`, which
+the resolver excludes, so the archive carried no record of the run: Phase 3's per-batch
+analysis would have had nothing to read.
+**Fix.** The lock file is removed on release (every exit: success, hold, error, interrupt; init
+too). It is unlinked while still held, and `acquire` checks that the path still names the
+inode it locked, retrying otherwise, so deleting it cannot let two runs hold the lock. Every
+ingest's final `result.json` is also written to `.wiki/last-run.json` (overwritten each run,
+git-ignored in the corpus); corpus-package clause 10 now lists it as round-tripping.
+**Status.** Fixed, model-free tests in `tests/test_phase2_resolve.py`.

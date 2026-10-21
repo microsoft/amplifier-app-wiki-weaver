@@ -37,7 +37,7 @@ from .lib import (
     wiki_sources,
     wiki_work,
 )
-from .steps import GIT_ID, jlines
+from .steps import GIT_ID, git_fatal, jlines
 from .version import resolve_version
 
 PKG = Path(__file__).resolve().parent
@@ -48,6 +48,7 @@ CORPUS_IGNORES = (
     ".wiki/ask/",
     ".wiki/init/",
     ".wiki/ingest.lock",
+    ".wiki/last-run.json",
     ".DS_Store",
 )
 
@@ -125,6 +126,30 @@ def git(corpus: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
+def trust_corpus(corpus: Path) -> None:
+    """Trust the corpus for git in this process and every git child it starts, whoever owns
+    the directory. In Resolve a corpus packed by a non-root user arrives owned by that uid
+    while the worker runs as root; git then refuses every command ("detected dubious
+    ownership"). The trust is ``safe.directory=<corpus>`` passed through git's environment
+    config (GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n), which git honours as
+    command-line scope: nothing is written to ~/.gitconfig. Idempotent; appends to any
+    entries already in the environment."""
+    path = str(corpus.resolve())
+    env = os.environ
+    try:
+        n = int(env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        n = 0
+    for i in range(n):
+        if env.get(f"GIT_CONFIG_KEY_{i}", "").lower() == "safe.directory" and env.get(
+            f"GIT_CONFIG_VALUE_{i}"
+        ) in (path, "*"):
+            return
+    env[f"GIT_CONFIG_KEY_{n}"] = "safe.directory"
+    env[f"GIT_CONFIG_VALUE_{n}"] = path
+    env["GIT_CONFIG_COUNT"] = str(n + 1)
+
+
 def scaffold(corpus: Path) -> None:
     """Create the layout. Idempotent: never overwrites anything that exists."""
     for d in (
@@ -171,6 +196,7 @@ def recover(corpus: Path) -> tuple[bool, str]:
     scaffold or snapshot commit can stage it. Returns (ok, message)."""
     if not (corpus / ".git").exists():
         return True, ""
+    trust_corpus(corpus)
     r = subprocess.run(
         [sys.executable, "-m", "wiki_weaver.steps", "recover"],
         cwd=corpus,
@@ -179,7 +205,7 @@ def recover(corpus: Path) -> tuple[bool, str]:
         check=False,
     )
     if r.returncode != 0:
-        tail = (r.stderr.strip().splitlines() or ["no output"])[-1]
+        tail = git_fatal(r.stderr) or (r.stderr.strip().splitlines() or ["no output"])[-1]
         return False, f"recover failed (exit {r.returncode}): {tail}"
     return True, r.stderr.strip() if r.stdout.strip().endswith("recovered") else ""
 
@@ -198,6 +224,7 @@ def commit_pending(corpus: Path, message: str) -> None:
 def cmd_init(a: argparse.Namespace) -> int:
     corpus = Path(a.wiki_dir).expanduser().resolve()
     corpus.mkdir(parents=True, exist_ok=True)
+    trust_corpus(corpus)
     lock = pidlock.lock_path(corpus)
     if not pidlock.acquire(lock):
         print(
@@ -248,6 +275,31 @@ def _trace(logs_root: Path) -> list[dict]:
     return rows
 
 
+def _engine_git_fatal(engine_dir: Path, trace: list[dict]) -> str | None:
+    """The first git ``fatal:`` line from the batch's failed nodes, in trace order: the
+    engine records a tool node's stderr in <node>/status.json failure_reason and output.txt,
+    which never leave the container in Resolve."""
+    for t in trace:
+        if t.get("status") == "success" or not t.get("node_id"):
+            continue
+        d = engine_dir / str(t["node_id"])
+        texts = []
+        try:
+            st = json.loads((d / "status.json").read_text())
+            texts.append(str((st or {}).get("failure_reason") or ""))
+        except (OSError, ValueError, AttributeError):
+            pass
+        try:
+            texts.append((d / "output.txt").read_text(errors="replace"))
+        except OSError:
+            pass
+        for text in texts:
+            line = git_fatal(text)
+            if line:
+                return line
+    return None
+
+
 def _preflight(corpus: Path) -> list[str]:
     problems = []
     if not lens_path(corpus).exists():
@@ -269,6 +321,7 @@ def cmd_ingest(a: argparse.Namespace) -> int:
     if not corpus.is_dir():
         print(f"wiki-weaver: wiki dir not found: {corpus}", file=sys.stderr)
         return rs.EXIT_ERRORED
+    trust_corpus(corpus)
     lock = pidlock.lock_path(corpus)
     if not pidlock.acquire(lock):
         print(
@@ -328,6 +381,9 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         )
         if run_dir is not None:
             rs.write(run_dir / "result.json", data)
+            if status == "final":
+                # .wiki/runs/ never leaves Resolve; this copy does (corpus-package clause 10)
+                rs.write(corpus / ".wiki" / "last-run.json", data)
         return data
 
     try:
@@ -384,18 +440,24 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
             rows += brows
             btrace = _trace(bdir / "engine")
             trace += btrace
+            fatal = (
+                _engine_git_fatal(bdir / "engine", btrace)
+                if rc != 0 or any(t.get("status") != "success" for t in btrace)
+                else None
+            )
+            cause = f": {fatal}" if fatal else ""
             if rc != 0:
                 errored.append(
                     {
                         "kind": "engine",
-                        "reason": f"engine run failed in batch {batches} (exit {rc}); see {bdir}/engine.log",
+                        "reason": f"engine run failed in batch {batches} (exit {rc}){cause}; see {bdir}/engine.log",
                     }
                 )
             if any(t.get("node_id") == "index" and t.get("status") != "success" for t in btrace):
                 errored.append(
                     {
                         "kind": "engine",
-                        "reason": f"index step failed in batch {batches}; pages were committed, index.md/log.md may be stale",
+                        "reason": f"index step failed in batch {batches}{cause}; pages were committed, index.md/log.md may be stale",
                     }
                 )
             attempted = sum(1 for r in brows if r.get("status") != "skipped")
