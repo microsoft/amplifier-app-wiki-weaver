@@ -144,6 +144,15 @@ V4 runs **inside a Resolve worker container**, submitted the way Team Pulse subm
 - **[V4 ↔ Team Pulse]** We know whether V4 handles Team Pulse's partial-corpus job shape, and if not, which of the three remedies is in place.
 - **[V4 ↔ Resolve]** We know what ACA does to a multi-hour job, from having run one.
 
+### Status — 2026-10-21
+
+Four of five exit criteria met on staging Resolve (hosted, ACA); the fifth is answered and its fix is built.
+
+- **Criteria 1–3 — met.** Instance `api-df18e877c6a546c498b1`: `wiki_weaver_version "v4"`, CLI `2026.10.21-9c171b9`, converged 3/3; 14 pages with Current state, 65 `[sN]` citations; no `.git`, `.wiki/work` or `.wiki/runs` in the archive; `.wiki/last-run.json` round-trips. The first attempt (`api-d618c5a5…`) failed on git "dubious ownership" — the staging worker does not own the unpacked corpus — and recovery failed the same way; V4 `9c171b9` trusts the corpus through process-scoped git config (amplifier-resolve #467). Resolver-side fix: amplifier-resolver-weaver #13 (merged; reaches staging with the next resolver pin).
+- **Criterion 4 — answered; fix built, pin bump open.** A job shaped like Team Pulse's (5 of 14 pages, the ledger, one new source, no older sources) held its source (`api-2ba7bfbe…`): V4 re-verified every quote on each page it edited, and the sources the older quotes cite were not in the job. Rollback was clean. V4 `b7d97a8` verifies only the quotes and links a write adds or changes; ones already on the committed page stand on the ledger. Locally the same job converges 1/1. Closes when the pin bump deploys and the same job converges on staging.
+- **Criterion 5 — met.** Phase 3's first batch (`api-92767dc21bef45d582ff`) ran 76 minutes of engine time on staging with no platform interference: 25/25 converged, archive returned.
+- **Progress panel.** V4 updated its in-progress record per batch, so Resolve's panel showed 0/0 for the whole job. Fixed in `b7d97a8` (per source).
+
 ### What we need
 
 **From the Resolve team:** the re-pin reviewed, and the image built and deployed somewhere we can submit to; retention; access for us to submit jobs; the model budget; `fa01aa0` confirmed or explained.
@@ -181,6 +190,15 @@ V4 runs **inside a Resolve worker container**, submitted the way Team Pulse subm
 - **[V4 ↔ Team Pulse]** Every source in Team Pulse's history is converged, in order. If the rebuild stopped at a size hold, the splice landed and the rebuild resumed from that source to completion. Any remaining hold has a kind and a reason, and none is "unknown."
 - **[V4 ↔ Resolve]** The resulting zip is inside Resolve's size caps (50 MiB in, 64 MiB out).
 - **[V4]** The three questions answer from the wiki, and we have read enough pages to say the shape held at full scale — including Current state on the busiest pages.
+
+### Status — 2026-10-21
+
+- **Batch 1 converged on staging.** 25/25, 76 minutes of engine time (median 173 s per source, max 252 s), 64 model calls, 0 compactions, 0 ingress truncations; 52 pages, 1,967 citations; the seeded lens came back byte-identical (`63ffe648…`). Two things to read: `decisions.md` is not in date order and carries a 2026-05-24 section in a batch ending 2026-05-13; `decisions.md` (45 KB) and `weekly-commitments.md` (41 KB) are growing fast and will likely meet the writer-input wall within the first few batches — the splice trigger arriving early.
+- **The lens.** Not built from a purpose paragraph: the hand-written Team Pulse lens from Stage 1 (the one Stage 1's quality results were measured on), plus three lines (cite by quote; Current state is a snapshot; a running log). Corrections from Team Pulse apply from the next batch onward; they do not require repacking.
+- **The corpus is three times larger than the snapshot.** The live corpus (`amplifier-app-team-pulse-made`, `data/corpus/conversations/_sources/`) holds 953 sources; the Sept 9 snapshot held 359 (355 after dedupe), all of which are in live. Batch 1 was cut from the snapshot, so the batches are re-cut from live before batch 2 — and batch 1 is rerun if live holds any source dated before 2026-05-13 that batch 1 lacks. About 40 batches; several days of sequential compute. Known in the source set: 55 overlapping chat exports across 13 channels (accepted; Team Pulse's corpus as it is), and filenames whose IDs parse as dates (2043, 2079) that the dating rule must skip.
+- **The archive cap becomes real.** `_sources/` round-trips, so the archive grows every batch; at ~950 sources it will approach staging's 50 MiB input cap before the rebuild ends. Decide before then: raise the cap, or stop carrying `_sources/`.
+- **The driver is ready.** It submits through the Resolve smart tool where the tool can (upload, observe, download, list) and directly for job creation and the completion payload (no weaver guidance is published in the smart tool). Auth: `az login`, audience `api://amplifier-resolve`. It runs one batch at a time and stops on any hold, failure, version older than `9c171b9`, or lens change. Not yet run against staging.
+- **No parallelism within one wiki.** Each batch starts from the previous batch's returned wiki. One box for the rebuild, one for test jobs.
 
 ### What we need
 

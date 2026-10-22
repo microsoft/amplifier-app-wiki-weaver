@@ -475,3 +475,28 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
   `sam.md` → `amplifier.md` in the staging corpus; never selected by the brief, so never
   hit). Whether such a job should carry the linked pages stays with the platform owner; V4
   no longer depends on it.
+
+## 2026-10-21 — Phase 2 on staging; Phase 3 started; the live corpus is 3x
+
+- Phase 2 moved to staging Resolve. Criteria 1–3 met (instance api-df18e877…, 3/3 on
+  9c171b9). The first attempt failed on git "dubious ownership": root-packing the tarball
+  did not help because the staging worker is not root. Fixed in V4 by process-scoped trust
+  (#467, merged); the resolver-side fix #13 is merged too. Neither depends on the other.
+- Criterion 4 answered: Team Pulse's job shape fails on V4 as built, because V4 re-verified
+  every quote and link on each page it edited and TP jobs do not carry the older sources or
+  linked pages. Decided: verify only what a write adds or changes; what is already on the
+  committed page stands on the ledger (V4 c9d792c, b7d97a8). Chosen over asking Team Pulse
+  to send cited sources: no change on their side, and every quote is still verified once,
+  when written. Whether jobs should carry linked pages stays with the platform owner.
+- Criterion 5 met: a 76-minute job on staging, untouched by the platform.
+- Phase 3 started: batch 1 (25 sources) converged on staging with the seeded Stage 1 lens,
+  preserved byte-identical. Lens choice: the measured Stage 1 lens over a generated one.
+- Dating rule for chat-export slices: each slice's own header date, not the export's
+  filename range — the literal rule would have put late-July slices in May.
+- The live corpus is the source of truth: 953 conversation sources vs 355 in the snapshot.
+  Batches re-cut from live before batch 2. The repo trees (~4,800 per-commit sources across
+  ~690 repositories) remain a separate decision.
+- The driver uses the Resolve smart tool (Ken's direction). Staging has no budget limit; the
+  driver's 5,000-call stop is a runaway guard. Sequential by design.
+- Staging's V4 is pinned by commit; each V4 fix needs a pin bump in amplifier-resolve
+  (#462, #467, and now one for b7d97a8). The driver records the version per batch.
