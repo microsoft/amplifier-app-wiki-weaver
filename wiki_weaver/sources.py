@@ -38,6 +38,74 @@ def split_frontmatter(text: str) -> tuple[dict | None, str]:
     return (data if isinstance(data, dict) else None), text[m.end() :]
 
 
+_FM_KEY_RE = re.compile(r"^([A-Za-z_][\w.-]*)\s*:(?:\s+(.*?))?\s*$")
+_FM_ITEM_RE = re.compile(r"^\s*-(?:\s+(.*?))?\s*$")
+_NULLS = ("null", "Null", "NULL", "~")
+
+
+def _tolerant_value(raw: str) -> object:
+    """One frontmatter value as the writer meant it: YAML's reading when that is a plain
+    scalar, a quoted string or a flow list; otherwise the raw text, unchanged."""
+    if raw == "":
+        return None
+    try:
+        v = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return raw
+    if v is None:
+        return None if raw in _NULLS else raw  # e.g. "# 3 notes" read as a comment
+    if isinstance(v, dict):
+        return raw  # "Ada: Bo" - a colon in a title, not a mapping
+    if isinstance(v, list):
+        return v if raw.startswith("[") else raw  # "- Planning" is a title, not a list
+    if isinstance(v, str) and v != raw and raw[0] not in "'\"":
+        return raw  # YAML dropped part of it (a trailing " #comment")
+    return v
+
+
+def normalize_frontmatter(text: str) -> str:
+    """Make a page's frontmatter parse when a writer left a value unquoted.
+
+    Frontmatter that already parses to a mapping (or no frontmatter at all) is returned
+    unchanged, byte for byte. Otherwise the block is read line by line as top-level
+    ``key: value`` pairs and ``- item`` lists under an empty key, and re-serialized with
+    yaml.safe_dump, which quotes as needed. If a line cannot be read that way, or the
+    result does not round-trip, the text is returned unchanged and the frontmatter check
+    reports it as before. The body is never touched.
+    """
+    m = _FM_RE.match(text)
+    if not m or split_frontmatter(text)[0] is not None:
+        return text
+    data: dict = {}
+    key: str | None = None
+    for line in m.group(1).splitlines():
+        if not line.strip() or line.lstrip().startswith("#") and not line.startswith(" "):
+            continue
+        km = None if line[:1].isspace() else _FM_KEY_RE.match(line)
+        if km:
+            key = km.group(1)
+            data[key] = _tolerant_value(km.group(2) or "")
+            continue
+        im = _FM_ITEM_RE.match(line)
+        if im and key is not None and (data[key] is None or isinstance(data[key], list)):
+            if data[key] is None:
+                data[key] = []
+            data[key].append(_tolerant_value(im.group(1) or ""))
+            continue
+        return text  # not a shape we can read safely
+    if not data:
+        return text
+    dumped = yaml.safe_dump(
+        data, sort_keys=False, allow_unicode=True, default_flow_style=False, width=2**31 - 1
+    )
+    try:
+        if yaml.safe_load(dumped) != data:
+            return text
+    except yaml.YAMLError:
+        return text
+    return text[: m.start(1)] + dumped.rstrip("\n") + text[m.end(1) :]
+
+
 def source_meta(path: Path, text: str | None = None) -> dict:
     """Date, title and kind for a source: frontmatter, then header lines, then filename."""
     path = Path(path)

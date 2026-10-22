@@ -40,6 +40,7 @@ from .lib import (
     wiki_work,
 )
 from .sources import (
+    normalize_frontmatter,
     page_frontmatter,
     read_text,
     sha256_file,
@@ -792,6 +793,15 @@ def step_checks() -> str:
     if cur["summary_page"] not in changed:
         errs.append(f"source summary {cur['summary_page']} was not written")
     pages = [p for p in changed if p in selected]
+    # A writer may leave a frontmatter value unquoted ("title: Ada : Bo Planning"), which
+    # YAML rejects. Re-serialize only what fails to parse; the check below is unchanged.
+    for name in pages:
+        path = contained_file(WIKI, name)
+        if path is not None:
+            text = read_text(path)
+            fixed = normalize_frontmatter(text)
+            if fixed != text:
+                atomic_write_text(path, fixed)
     pages += [p for p in selected if p not in pages and (work / "before" / p).exists()]
     lens = contained_file(WIKI, "lens.md")
     types = parse_page_types(read_text(lens)) if lens else {}
