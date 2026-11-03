@@ -194,11 +194,16 @@ class TestCallSitesThreadTheirOwnLogsDir:
         wiki_dir.mkdir()
         captured: dict = {}
         _capture_run_pipeline(monkeypatch, captured)
+        monkeypatch.setenv("WIKI_WEAVER_INGEST_MAX_TURNS", "37")
 
         er.run_ingest(wiki_dir)
 
         logs_root = captured["logs_root"]
         assert _events_path_from_captured(captured) == str(logs_root / "events.jsonl")
+        resolved_synthesize_dot = (logs_root / "synthesize.dot").read_text(
+            encoding="utf-8"
+        )
+        assert resolved_synthesize_dot.count('max_agent_turns="37"') == 1
 
     def test_reweave_overview(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from wiki_weaver import reweave as rw

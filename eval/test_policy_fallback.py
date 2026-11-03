@@ -61,6 +61,7 @@ from wiki_weaver.engine_runner import (  # noqa: E402
     build_init_dot,
     build_init_dot_from_file,
     build_lint_dot,
+    ingest_max_turns,
     build_lint_dot_from_file,
 )
 from validate_wiki import (  # noqa: E402
@@ -358,6 +359,34 @@ class TestBuildDotByteIdentical:
         assert "--config" not in dot, (
             "Default policy must not inject --config into validate_cmd"
         )
+
+    def test_ingest_turn_budget_is_optional_and_injected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit positive env value maps to the engine-supported node attr."""
+        wiki = _make_wiki(tmp_path)
+        src = _make_source(tmp_path)
+        policy = load_policy(wiki)
+
+        monkeypatch.delenv("WIKI_WEAVER_INGEST_MAX_TURNS", raising=False)
+        assert ingest_max_turns() is None
+        assert 'max_agent_turns="' not in build_dot(src, wiki, policy)
+
+        monkeypatch.setenv("WIKI_WEAVER_INGEST_MAX_TURNS", "37")
+        assert ingest_max_turns() == 37
+        dot = build_dot(src, wiki, policy)
+        ingest = dot[
+            dot.index("    ingest [") : dot.index("\n    ]", dot.index("    ingest ["))
+        ]
+        assert 'max_agent_turns="37"' in ingest
+
+    @pytest.mark.parametrize("value", ["0", "-1", "many"])
+    def test_ingest_turn_budget_requires_positive_integer(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("WIKI_WEAVER_INGEST_MAX_TURNS", value)
+        with pytest.raises(ValueError, match="positive integer"):
+            ingest_max_turns()
 
     def test_project_policy_injects_config_in_validate_cmd(
         self, tmp_path: Path

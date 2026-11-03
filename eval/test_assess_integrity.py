@@ -55,6 +55,7 @@ pytest.importorskip("wiki_weaver.engine_runner")
 import wiki_weaver.engine_runner as er  # noqa: E402
 import wiki_weaver.retention as retention  # noqa: E402
 import wiki_weaver.reweave as reweave  # noqa: E402
+from wiki_weaver.policy import load_policy  # noqa: E402
 from wiki_weaver.lib import (  # noqa: E402
     FAILURE_KIND_JUDGED,
     FAILURE_KIND_NO_VERDICT,
@@ -182,9 +183,15 @@ def test_ingest_prompt_instructs_manifest_write() -> None:
     prompt = _node_prompt(dot, "ingest")
     assert "TOUCHED-PAGES MANIFEST" in prompt
     assert "$touched_manifest" in prompt
-    # One page path per line, overwritten each cycle, written LAST.
-    assert "one wiki-relative page path per line" in prompt
-    assert "OVERWRITE" in prompt
+    # Write each page as it changes, rather than risking an unreported final step.
+    assert "wiki-relative path to $touched_manifest" in prompt
+    assert "immediately after EVERY actual page creation or modification" in prompt
+    assert "APPEND" in prompt
+    assert "Skip the append when that path is already listed" in prompt
+    assert "never wait for a last step and never overwrite the file" in prompt
+    assert "OVERWRITE" not in prompt
+    assert "tool-turn budget is finite and invisible" in prompt
+    assert "Start from index.md and overview.md plus grep" in prompt
 
 
 def test_assess_prompt_bounded_scope_with_fail_open_fallback() -> None:
@@ -226,14 +233,14 @@ def test_build_dot_substitutes_touched_manifest(tmp_path: Path) -> None:
     from amplifier_module_loop_pipeline.dot_parser import parse_dot
     from amplifier_module_loop_pipeline.validation import validate_or_raise
 
-    from wiki_weaver.policy import load_policy
-
     wiki = _make_wiki(tmp_path)
     src = tmp_path / "s.md"
     src.write_text("# s\n\nbody\n", encoding="utf-8")
 
     dot = er.build_dot(src, wiki, load_policy(wiki), source_id=7)
     assert "$touched_manifest" not in dot
+    assert "$snapshot_cmd" not in dot
+    assert "$derive_manifest_cmd" not in dot
     assert str(touched_manifest_path(wiki)) in dot
     validate_or_raise(parse_dot(dot))
 
@@ -256,6 +263,12 @@ def test_ingest_setup_emits_manifest_key_and_clears_stale(
     out = json.loads(capsys.readouterr().out)
     assert out["has_source"] == "true"
     assert out["touched_manifest"] == str(manifest)
+    assert "snapshot" in out["snapshot_cmd"]
+    assert "derive" in out["derive_manifest_cmd"]
+    source = wiki / "_inbox" / "a.md"
+    direct_dot = er.build_dot(source, wiki, load_policy(wiki), source_id=1)
+    assert out["snapshot_cmd"] in direct_dot
+    assert out["derive_manifest_cmd"] in direct_dot
     assert not manifest.exists(), "stale manifest must be deleted per-source"
     # fail_cmd now carries source_id + started_at (classification inputs).
     fail_parts = out["fail_cmd"].split()

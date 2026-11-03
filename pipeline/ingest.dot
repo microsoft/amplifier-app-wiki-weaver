@@ -16,7 +16,8 @@
 // by subsequent nodes via $var references:
 //   has_source, source_path, source_id, wiki_dir, validation_report,
 //   schema_path, convergence_rubric, max_cycles,
-//   normalize_cmd, footnotes_cmd, validate_cmd,
+//   normalize_cmd, footnotes_cmd, validate_cmd, snapshot_cmd,
+//   derive_manifest_cmd,
 //   archive_cmd, fail_cmd, tamper_check_cmd
 //
 // Drain-loop semantics:
