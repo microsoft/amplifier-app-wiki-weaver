@@ -1980,28 +1980,36 @@ def ingest(
         # ---------------------------------------------------------------------- #
         from wiki_weaver.reweave import reweave_overview_if_needed
 
-        reweave_result = reweave_overview_if_needed(wiki)
-        if reweave_result.attempts:
-            if reweave_result.final_passed:
-                _ok(
-                    f"overview.md re-woven into a synthesized map "
-                    f"({reweave_result.attempts} attempt(s))"
-                )
-            else:
-                _fail(
-                    f"overview.md still fails grade_overview() after "
-                    f"{reweave_result.attempts} re-weave attempt(s):\n"
-                    f"{reweave_result.final_report}"
-                )
-                errored_drain.append(
-                    {
-                        "reason": (
-                            f"overview re-weave failed after "
-                            f"{reweave_result.attempts} attempt(s): "
-                            f"{reweave_result.final_report}"
-                        )
-                    }
-                )
+        try:
+            reweave_result = reweave_overview_if_needed(wiki)
+            if reweave_result.attempts:
+                if reweave_result.final_passed:
+                    _ok(
+                        f"overview.md re-woven into a synthesized map "
+                        f"({reweave_result.attempts} attempt(s))"
+                    )
+                else:
+                    _fail(
+                        f"overview.md still fails grade_overview() after "
+                        f"{reweave_result.attempts} re-weave attempt(s):\n"
+                        f"{reweave_result.final_report}"
+                    )
+                    errored_drain.append(
+                        {
+                            "reason": (
+                                f"overview re-weave failed after "
+                                f"{reweave_result.attempts} attempt(s): "
+                                f"{reweave_result.final_report}"
+                            )
+                        }
+                    )
+        except Exception as exc:
+            # Source checkpoints remain valid, but overview generation is part
+            # of this run. Finalize with an explicit engine error instead of
+            # leaving the last checkpoint marked in_progress.
+            reason = f"overview re-weave raised {type(exc).__name__}: {exc}"
+            _fail(reason)
+            errored_drain.append({"reason": reason})
 
         # Run-result contract: result.json + honest headline + documented exit
         # code (see wiki_weaver/run_result.py). Replaces the old binary
