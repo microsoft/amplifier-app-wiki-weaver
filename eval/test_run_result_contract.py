@@ -150,6 +150,37 @@ def test_all_converge_verdict_converged_exit_0(tmp_path: Path, capsys) -> None:
     assert "run result:" in out
 
 
+@pytest.mark.parametrize(
+    "error", [RuntimeError("module origin conflict"), OSError("overview unavailable")]
+)
+def test_overview_exception_finalizes_converged_drain(
+    tmp_path: Path, monkeypatch, capsys, error
+) -> None:
+    """A post-ingest error must not strand a successful source in an active run."""
+    wiki = _make_wiki(tmp_path)
+    _seed_inbox(wiki / INBOX, "a.md")
+
+    def fail_overview(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(reweave, "reweave_overview_if_needed", fail_overview)
+    with patch("wiki_weaver.engine_runner.run_inner", return_value=_fake_result()):
+        rc = lib.ingest(wiki)
+
+    assert rc == EXIT_ERRORED
+    result = _load_result(wiki)
+    assert result["status"] == "final"
+    assert result["verdict"] == "errored"
+    assert result["counts"]["total"] == 1
+    assert result["counts"]["converged"] == 1
+    assert result["sources"] == [{"name": "a.md", "status": "converged"}]
+    assert len(result["errored"]) == 1
+    assert "overview" in result["errored"][0]["reason"]
+    assert str(error) in result["errored"][0]["reason"]
+    assert (wiki / SOURCES / "a.md").is_file()
+    assert "ingest ERRORED" in capsys.readouterr().out
+
+
 def test_partial_verdict_partial_exit_0(tmp_path: Path, capsys) -> None:
     wiki = _make_wiki(tmp_path)
     _seed_inbox(wiki / INBOX, "a.md")
