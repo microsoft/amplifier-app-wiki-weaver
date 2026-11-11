@@ -10,10 +10,17 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
+from .lib import contained_file
+from .sections import fenced, pieces
 from .sources import normalize_ws, read_text, split_frontmatter
+
+if TYPE_CHECKING:
+    from .lens import KeptSection
 
 CITE_RE = re.compile(r'\[s(\d+): "([^"\n]+)"\]')
 BARE_CITE_RE = re.compile(r"\[s(\d+)\](?!\()")
@@ -27,36 +34,52 @@ REQUIRED_FM = ("title", "type", "sources", "last_updated")
 LOSS_THRESHOLD = 0.15
 
 
-def _without_current_state(body: str) -> str:
+def _name_key(heading: str) -> str:
+    """A heading, or a kept section's lens name, as the two are compared: superseded markers
+    dropped, `#`s and whitespace stripped, case folded."""
+    return normalize_ws(CLOSE_RE.sub("", MARKER_RE.sub("", heading))).lstrip("#").strip().lower()
+
+
+def _heading_line(piece: str) -> str:
+    """The first line of a section piece (`sections.pieces`): its heading, line end dropped."""
+    return piece.split("\n", 1)[0].rstrip("\r")
+
+
+def is_current_state(piece: str) -> bool:
+    """A section piece (`sections.pieces`) headed `## Current state`."""
+    return bool(CURRENT_STATE_RE.match(_heading_line(piece)))
+
+
+def _without_current_state(body: str, kept: Iterable[str] = ()) -> str:
     """Drop the `## Current state` section (heading included): the one section the
-    writer may rewrite, so it is outside the content-loss guard."""
-    out, inside = [], False
-    for line in body.splitlines():
-        st = line.strip()
-        if st.startswith(("## ", "# ")):
-            inside = bool(CURRENT_STATE_RE.match(st))
-        if not inside:
-            out.append(line)
-    return "\n".join(out)
+    writer may rewrite, so it is outside the content-loss guard. The sections named in
+    ``kept`` (the lens's `Keep:` lines) go too: the kept-list checks guard them instead.
+    Sections are cut as `sections.pieces` cuts them: a heading inside a code fence is text."""
+    return "".join(p for p in pieces(without_kept(body, kept)) if not is_current_state(p))
 
 
-def _body_lines(text: str) -> list[str]:
+def _body_lines(text: str, kept: Iterable[str] = ()) -> list[str]:
     _, body = split_frontmatter(text)
     out = []
-    for line in _without_current_state(body).splitlines():
+    for line in _without_current_state(body, kept).splitlines():
         s = normalize_ws(CLOSE_RE.sub("", MARKER_RE.sub("", line)))
         if s:
             out.append(s)
     return out
 
 
-def _headings(text: str, level: int | None = None, skip_current: bool = False) -> list[str]:
+def _headings(
+    text: str, level: int | None = None, skip_current: bool = False, kept: Iterable[str] = ()
+) -> list[str]:
+    """The headings of ``text`` - of ``level`` if given - lowercased; a line inside a code
+    fence (`sections.fenced`) is text, never a heading."""
     _, body = split_frontmatter(text)
     if skip_current:
-        body = _without_current_state(body)
+        body = _without_current_state(body, kept)
+    lines = body.splitlines()
     hs = []
-    for line in body.splitlines():
-        m = HEADING_RE.match(CLOSE_RE.sub("", MARKER_RE.sub("", line)).strip())
+    for line, code in zip(lines, fenced(lines)[0], strict=True):
+        m = None if code else HEADING_RE.match(CLOSE_RE.sub("", MARKER_RE.sub("", line)).strip())
         if m and (level is None or len(m.group(1)) == level):
             hs.append(normalize_ws(m.group(2)).lower())
     return hs
@@ -74,7 +97,15 @@ def check_frontmatter(name: str, text: str) -> list[str]:
 
 
 def check_duplicate_headings(name: str, text: str) -> list[str]:
-    dups = [h for h, n in Counter(_headings(text, level=2)).items() if n > 1]
+    """No `## ` heading twice. Headings are the sections `sections.pieces` cuts (column 0,
+    outside code fences): a `## ` line inside a fence is text."""
+    keys = [
+        normalize_ws(m.group(2)).lower()
+        for p in pieces(split_frontmatter(text)[1])
+        if p.startswith("## ")
+        and (m := HEADING_RE.match(CLOSE_RE.sub("", MARKER_RE.sub("", _heading_line(p))).strip()))
+    ]
+    dups = [h for h, n in Counter(keys).items() if n > 1]
     return [f"{name}: duplicate ## heading '{h}'" for h in dups]
 
 
@@ -224,12 +255,12 @@ CURRENT_STATE_FORMAT = re.compile(r"^## Current state \(as of \d{4}-\d{2}-\d{2}\
 
 def check_current_state(name: str, text: str) -> list[str]:
     """A page that has a `## Current state` section: the heading reads exactly
-    `## Current state (as of YYYY-MM-DD)` and it is the first `##` section. Source
-    summary pages are exempt."""
+    `## Current state (as of YYYY-MM-DD)` and it is the first `##` section, sections cut as
+    `sections.pieces` cuts them. Source summary pages are exempt."""
     if name.startswith("source-"):
         return []
     _, body = split_frontmatter(text)
-    h2 = [ln.strip() for ln in body.splitlines() if ln.startswith("## ")]
+    h2 = [_heading_line(p).strip() for p in pieces(body) if p.startswith("## ")]
     cs = [h for h in h2 if CURRENT_STATE_RE.match(h)]
     if not cs:
         return []
@@ -244,13 +275,45 @@ def check_current_state(name: str, text: str) -> list[str]:
     return errs
 
 
+def current_state_chars(text: str) -> int:
+    """Characters of a page's Current state, heading aside. Reported for each page a writer
+    writes (result.json `current_state_sizes`), never limited: a limit held sources on pages
+    already over it, and the never-move lists hold the durable facts (docs/DECISIONS.md)."""
+    from .rollover import STATE, parse_page
+
+    return sum(len(s.lead.strip()) for s in parse_page(text).sections if s.kind == STATE)
+
+
+def check_history_unchanged(name: str, before: str | None, after: str) -> list[str]:
+    """`## History` is code's: a write leaves it as it was (blank lines and spacing aside),
+    and adds none to a page that had none (``before`` None: a new page)."""
+    from .rollover import HISTORY, parse_page
+
+    def history(text: str | None) -> list[str]:
+        sections = parse_page(text).sections if text is not None else []
+        return [
+            normalize_ws(ln)
+            for s in sections
+            if s.kind == HISTORY
+            for ln in s.text.splitlines()
+            if ln.strip()
+        ]
+
+    return (
+        [f"{name}: History section is maintained by code"]
+        if history(after) != history(before)
+        else []
+    )
+
+
 def _h2(text: str) -> list[str]:
-    _, body = split_frontmatter(text)
-    out = []
-    for ln in body.splitlines():
-        if ln.startswith("## "):
-            out.append(normalize_ws(CLOSE_RE.sub("", MARKER_RE.sub("", ln[3:]))).strip())
-    return out
+    """The `## ` section headings of ``text``, as `sections.pieces` cuts them (column 0,
+    outside code fences): superseded markers dropped, whitespace collapsed."""
+    return [
+        normalize_ws(CLOSE_RE.sub("", MARKER_RE.sub("", _heading_line(p)[3:]))).strip()
+        for p in pieces(split_frontmatter(text)[1])
+        if p.startswith("## ")
+    ]
 
 
 def check_section_headings(name: str, before: str | None, after: str, types: dict) -> list[str]:
@@ -275,7 +338,8 @@ def check_section_headings(name: str, before: str | None, after: str, types: dic
                 errs.append(f"{name}: page type '{pt.name}' has no Current state; added '## {h}'")
             continue
         if pt.heading_rule() and not pt.allows(h):
-            allowed = " · ".join(pt.sections) if pt.sections else f"'{pt.pattern}'"
+            rule = pt.sections if pt.sections else [f"'{pt.pattern}'"]
+            allowed = " · ".join([*rule, *(k.name for k in pt.kept)])
             errs.append(
                 f"{name}: added '## {h}', not a section the lens names for '{pt.name}' ({allowed})"
             )
@@ -295,17 +359,20 @@ def _heading_marked_nearby(h: str, after: str) -> bool:
     return False
 
 
-def check_content_loss(name: str, before: str, after: str) -> list[str]:
+def check_content_loss(name: str, before: str, after: str, kept: Iterable[str] = ()) -> list[str]:
     """A rewritten page may not drop >15% of its lines (superseded text stays on the page,
     so marked lines are not deletions), nor a heading unless a superseded marker sits on or
-    next to the line that keeps its text. `## Current state` is outside both rules."""
-    b, a = _body_lines(before), _body_lines(after)
+    next to the line that keeps its text. `## Current state` is outside both rules, and so
+    are the sections named in ``kept``: `check_kept_loss` replaces them there."""
+    kept = list(kept)
+    b, a = _body_lines(before, kept), _body_lines(after, kept)
     if not b:
         return []
     lost = sum((Counter(b) - Counter(a)).values())
     frac = lost / len(b)
     lost_heads = sorted(
-        set(_headings(before, skip_current=True)) - set(_headings(after, skip_current=True))
+        set(_headings(before, skip_current=True, kept=kept))
+        - set(_headings(after, skip_current=True, kept=kept))
     )
     errs = []
     if frac > LOSS_THRESHOLD:
@@ -316,8 +383,196 @@ def check_content_loss(name: str, before: str, after: str) -> list[str]:
     return errs
 
 
+# Kept sections: the `Keep:` / `Keep current:` lines of a page type (lens.KeptSection).
+KEPT_LINE_MAX = 300  # characters in one line of a kept section
+HISTORY_FILE_RE = re.compile(r"history/([^\s/()\[\]<>\"'`]+\.md)")
+LEAD_DATE_RE = re.compile(r"(\d{4}-\d{2}(?:-\d{2})?)\s*(?:\u00b7\s*)?")
+
+
+def piece_key(piece: str) -> str | None:
+    """The name key of a section piece (`sections.pieces`) headed `## `; None for any other
+    piece."""
+    return _name_key(piece.split("\n", 1)[0]) if piece.startswith("## ") else None
+
+
+def kept_sections(text: str, names: Iterable[str]) -> dict[str, list[str]]:
+    """The body lines of each kept section on the page, by the name the lens gives it: from
+    its `## ` heading to the next section, as `sections.pieces` cuts them (column 0, outside
+    code fences). A name with no section on the page is absent."""
+    by_key = {_name_key(n): n for n in names}
+    out: dict[str, list[str]] = {}
+    for piece in pieces(split_frontmatter(text)[1]):
+        key = piece_key(piece)
+        if key is not None and key in by_key:
+            out.setdefault(by_key[key], []).extend(piece.splitlines()[1:])
+    return out
+
+
+def without_kept(body: str, names: Iterable[str]) -> str:
+    """Page body ``body`` with the kept sections ``names`` cut out, as `kept_sections` finds
+    them: the part of a page a list step may never change."""
+    keys = {_name_key(n) for n in names}
+    return "".join(p for p in pieces(body) if piece_key(p) not in keys)
+
+
+def kept_size(text: str, kept_names: Iterable[str]) -> int:
+    """Characters of the page's kept sections together, headings included. Soft: over half
+    the page's budget is reported, never a finding."""
+    keys = {_name_key(n) for n in kept_names}
+    return sum(len(p) for p in pieces(split_frontmatter(text)[1]) if piece_key(p) in keys)
+
+
+def check_kept_shape(name: str, text: str, kept: Iterable[KeptSection]) -> list[str]:
+    """Every non-blank line of a kept section is a `- ` item of at most KEPT_LINE_MAX
+    characters with at least one citation. Its quotes are verified like any other."""
+    errs = []
+    for sec, lines in kept_sections(text, [k.name for k in kept]).items():
+        for line in (ln.rstrip() for ln in lines if ln.strip()):
+            why = (
+                "is not a '- ' item"
+                if not line.startswith("- ")
+                else f"is over {KEPT_LINE_MAX} characters"
+                if len(line) > KEPT_LINE_MAX
+                else "is without a citation"
+                if not CITE_RE.search(line)
+                else ""
+            )
+            if why:
+                errs.append(f"{name}: kept list '{sec}': line {why}: {line[:80]!r}")
+    return errs
+
+
+# A history-file pointer on a kept line - `→ history/<file>.md` or a markdown link to
+# one - with any parentheses around it: not part of the line's subject.
+POINTER_RE = re.compile(
+    r"\(?\s*(?:→\s*)?(?:\[[^\]\n]*\]\(history/[^)\s]+\.md\)|history/[^\s()\[\]]+\.md)\s*\)?"
+)
+
+
+def _line_key(line: str) -> tuple[str, str]:
+    """What a status edit leaves alone: the leading date, if any, and the whole subject -
+    the text before the first ` · `, citations and history pointers dropped, whitespace
+    collapsed, case folded."""
+    item = normalize_ws(line).removeprefix("- ")
+    m = LEAD_DATE_RE.match(item)
+    day, rest = (m.group(1), item[m.end() :]) if m else ("", item)
+    rest = POINTER_RE.sub(" ", CITE_RE.sub(" ", rest))
+    return day, normalize_ws(rest.split(" · ")[0]).casefold()
+
+
+def _pair(old: list[str], new: list[str]) -> tuple[list[str], list[str]]:
+    """Pair a list's old and new lines one to one: an old line survives as the same line,
+    else as a line with its `_line_key` - itself with its status edited. Returns the old
+    lines left without a survivor and the new lines left unpaired: the ones this write
+    added."""
+    free = list(new)
+    unpaired = []
+    for ln in old:
+        if ln in free:
+            free.remove(ln)
+        else:
+            unpaired.append(ln)
+    keys = [_line_key(ln) for ln in free]
+    gone = []
+    for ln in unpaired:
+        key = _line_key(ln)
+        if key in keys:
+            i = keys.index(key)
+            del keys[i], free[i]
+        else:
+            gone.append(ln)
+    return gone, free
+
+
+def _named_history(lines: Iterable[str], wiki: Path | None) -> list[str]:
+    """The text, whitespace collapsed, of each history file ``lines`` name that exists under
+    ``wiki``'s `history/`; none without a wiki."""
+    if wiki is None:
+        return []
+    texts = []
+    for f in sorted({f for ln in lines for f in HISTORY_FILE_RE.findall(ln)}):
+        path = contained_file(wiki, f"history/{f}")
+        if path is not None:
+            texts.append(normalize_ws(read_text(path)))
+    return texts
+
+
+def _held(line: str, texts: list[str]) -> bool:
+    """Each citation ``line`` makes - its id with its exact quote, whitespace collapsed - is
+    in one of ``texts``. A line that cites nothing is never held."""
+    cites = CITE_RE.findall(line)
+    return bool(cites) and all(
+        any(f'[s{n}: "{normalize_ws(q)}"]' in t for t in texts) for n, q in cites
+    )
+
+
+def check_kept_loss(
+    name: str,
+    before: str | None,
+    after: str,
+    kept: Iterable[KeptSection],
+    wiki: Path | None = None,
+) -> list[str]:
+    """A `Keep:` list never loses a line. Old and new lines pair one to one (`_pair`): a line
+    with the same date and whole subject is the old one with its status, reason or pointer
+    edited. A line may leave only when lines this write adds to its list name history files
+    that hold it - each of its citations, id and exact quote, is in one of those files under
+    ``wiki``'s `history/` - as a condensing line does (`- 2026-05 to 2026-07 · 14 settled
+    decisions on X → history/<file>.md`). A line that cites nothing, or a check without
+    ``wiki``, has nothing to show it is held. `Keep current:` lists are exempt: their facts
+    change."""
+    if before is None:
+        return []
+    names = [k.name for k in kept if not k.current]
+    old, new = kept_sections(before, names), kept_sections(after, names)
+    errs = []
+    for sec, lines in old.items():
+        b = [normalize_ws(ln) for ln in lines if ln.strip()]
+        a = [normalize_ws(ln) for ln in new.get(sec, []) if ln.strip()]
+        gone, added = _pair(b, a)
+        texts = _named_history(added, wiki) if gone else []
+        lost = [ln for ln in gone if not _held(ln, texts)]
+        if lost:
+            errs.append(
+                f"{name}: kept list '{sec}' lost {len(lost)} line(s) with no condensing line "
+                f"naming a history/ file that holds them: {lost[0][:80]!r}"
+            )
+    return errs
+
+
+def coverage_problems(moved_entries_by_file: dict[str, list[str]], list_text: str) -> list[str]:
+    """Decision coverage (`covers: <Section>`): each entry that left the covered section for
+    history file F must have one of its citations in the list, or the list must name F. One
+    problem per entry with neither. ``moved_entries_by_file``: F (`history/<file>.md`, or
+    its file name) -> the entries' texts."""
+    have = {(int(n), normalize_ws(q)) for n, q in CITE_RE.findall(list_text)}
+    out = []
+    for f, entries in sorted(moved_entries_by_file.items()):
+        if Path(f).name in list_text:
+            continue
+        for e in entries:
+            if not {(int(n), normalize_ws(q)) for n, q in CITE_RE.findall(e)} & have:
+                out.append(
+                    f"{Path(f).name}: {normalize_ws(e)[:80]!r} has no citation in the list, "
+                    "and the list does not name the file"
+                )
+    return out
+
+
+def _kept_for(types: dict | None, text: str) -> list[KeptSection]:
+    """The sections the page's type keeps, per the lens; none without a lens or a type."""
+    if not types:
+        return []
+    from .lens import page_type_for
+
+    pt = page_type_for(types, (split_frontmatter(text)[0] or {}).get("type"))
+    return list(pt.kept) if pt else []
+
+
 # Check names, for counting which check caused a failed write.
 CHECK_KINDS = (
+    ("with no condensing line", "kept_loss"),  # first: their messages quote page text
+    ("kept list '", "kept_shape"),
     ("cites unknown source", "citations"),
     ("quote under 5 words", "short_quote"),
     ("not found verbatim", "citations"),
@@ -334,6 +589,7 @@ CHECK_KINDS = (
     ("duplicate ## heading", "duplicate_headings"),
     ("current state heading must read", "current_state"),
     ("current state is not the first", "current_state"),
+    ("History section is maintained by code", "history"),
     ("has no Current state; added", "sections"),
     ("not a section the lens names", "sections"),
     ("frontmatter", "frontmatter"),
@@ -376,11 +632,16 @@ def run_page_checks(
         errs += check_citations(name, text, sources, before, known)
         errs += check_links(name, text, wiki, before)
         errs += check_current_state(name, text)
+        errs += check_history_unchanged(name, before, text)
         errs += check_superseded_blocks(name, text, current_id)
         if types:
             errs += check_section_headings(
                 name, read_text(prior) if prior.exists() else None, text, types
             )
+        kept = _kept_for(types, text)
+        if kept:
+            errs += check_kept_shape(name, text, kept)
+            errs += check_kept_loss(name, before, text, kept, wiki)
         if prior.exists():
-            errs += check_content_loss(name, read_text(prior), text)
+            errs += check_content_loss(name, read_text(prior), text, [k.name for k in kept])
     return errs

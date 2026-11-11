@@ -18,13 +18,15 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import __version__, pidlock
+from . import __version__, lists, pidlock
 from . import checks as ck
 from . import result as rs
 from .dashboard import build_dashboard
 from .ledger import eligible, source_versions
 from .lens import describe, parse_page_types
 from .lib import (
+    ATOMIC_TEMP_EXCLUDE,
+    GIT_ID,
     atomic_copy,
     contained_file,
     feedback_log,
@@ -37,7 +39,8 @@ from .lib import (
     wiki_sources,
     wiki_work,
 )
-from .steps import GIT_ID, git_fatal, jlines
+from .rollover import ConservationError, history_without_keep, page_types, roll_wiki
+from .steps import git_fatal, jlines
 from .version import resolve_version
 
 PKG = Path(__file__).resolve().parent
@@ -213,7 +216,7 @@ def recover(corpus: Path) -> tuple[bool, str]:
 def commit_pending(corpus: Path, message: str) -> None:
     """Snapshot the owner's pending work. Stages explicitly and never .wiki/work/."""
     if git(corpus, "status", "--porcelain").stdout.strip():
-        git(corpus, "add", "-A", "--", ".", ":(exclude).wiki/work")
+        git(corpus, "add", "-A", "--", ".", ":(exclude).wiki/work", ATOMIC_TEMP_EXCLUDE)
         if git(corpus, "diff", "--cached", "--name-only").stdout.strip():
             git(corpus, "commit", "-q", "-m", message)
 
@@ -316,6 +319,16 @@ def _preflight(corpus: Path) -> list[str]:
 BATCH = 40  # sources per engine run; the engine caps steps at 50 x node count per run
 
 
+def _lists_pending(corpus: Path) -> int | None:
+    """`lists.pending_count`, for result.json; None (and why, on stderr) when the list
+    state cannot be read - the run record is written regardless."""
+    try:
+        return lists.pending_count(corpus)
+    except (OSError, ValueError, TypeError) as e:
+        print(f"wiki-weaver: lists_pending not counted: {e}", file=sys.stderr)
+        return None
+
+
 def cmd_ingest(a: argparse.Namespace) -> int:
     corpus = Path(a.wiki).expanduser().resolve()
     if not corpus.is_dir():
@@ -349,7 +362,8 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
 
     def snapshot(status: str) -> dict:
         per_node = {
-            n: sum(1 for t in trace if t.get("node_id") == n) for n in ("brief", "write", "index")
+            n: sum(1 for t in trace if t.get("node_id") == n)
+            for n in ("brief", "lists", "write", "index")
         }
         conv = [r for r in rows if r.get("converged")]
         touched = {p for r in conv for p in r.get("pages_touched", [])}
@@ -372,6 +386,12 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
                 "writer_chars_max": max(
                     (c for r in rows for c in r.get("writer_chars_per_call") or []), default=0
                 ),
+                # the rollover step: volumes it created, and pages still over their budget
+                # (the pages it refused, with why, are row-driven: result.build adds them)
+                "rollovers": sum(len(r.get("rolled_over") or []) for r in rows),
+                "over_budget_pages": sorted({p for r in rows for p in r.get("over_budget") or []}),
+                # history files the list step has still to read, over the whole wiki
+                "lists_pending": _lists_pending(corpus),
                 "batches": batches,
                 "max_cycles": a.max_cycles,
                 "limit": a.limit,
@@ -410,7 +430,8 @@ def _ingest_locked(corpus: Path, a: argparse.Namespace) -> int:
         print("wiki-weaver: lens page types as parsed:", file=sys.stderr)
         for t in lens_view or [{"type": "(none)", "rule": "-", "current_state": "-"}]:
             print(
-                f"  {t['type']}: {t['rule']}; Current state {t['current_state']}",
+                f"  {t['type']}: {t['rule']}; Current state {t['current_state']}"
+                + (f"; keep: {', '.join(t['kept'])}" if t.get("kept") else ""),
                 file=sys.stderr,
             )
         only = Path(a.source).name if a.source else None
@@ -500,6 +521,15 @@ def cmd_ask(a: argparse.Namespace) -> int:
     return 0
 
 
+def _keep_warnings(wiki: Path) -> list[str]:
+    """Pages with history volumes whose lens type keeps no sections: `lint` and `doctor`
+    warn about them, and never fail on them."""
+    return [
+        f"{p}: has history files but its type declares no Keep sections"
+        for p in history_without_keep(wiki, page_types(wiki))
+    ]
+
+
 def cmd_lint(a: argparse.Namespace) -> int:
     """Run the deterministic page checks over the whole wiki. No model."""
     corpus = Path(a.wiki).expanduser().resolve()
@@ -525,9 +555,62 @@ def cmd_lint(a: argparse.Namespace) -> int:
     cites = sum(len(ck.CITE_RE.findall(p.read_text(encoding="utf-8"))) for p in pages)
     for e in errs[:50]:
         print(e)
-    summary = {"pages": len(pages), "citations": cites, "errors": len(errs), "by_check": kinds}
+    warns = _keep_warnings(corpus)  # warnings only: the exit code stays the errors' own
+    for w in warns[:50]:
+        print(f"warning: {w}")
+    summary = {
+        "pages": len(pages),
+        "citations": cites,
+        "errors": len(errs),
+        "by_check": kinds,
+        "warnings": len(warns),
+    }
     print(json.dumps(summary))
     return 0 if not errs else 1
+
+
+def _budget(text: str) -> tuple[str, int]:
+    """`--budget TYPE=N`: a page type, as the lens or a page's frontmatter names it, and its
+    record budget in characters."""
+    kind, sep, n = text.partition("=")
+    if not (sep and kind.strip() and n.strip().isdigit() and int(n) > 0):
+        raise argparse.ArgumentTypeError(f"expected TYPE=N with N > 0, got {text!r}")
+    return kind.strip(), int(n)
+
+
+def cmd_rollover(a: argparse.Namespace) -> int:
+    """Move the oldest dated entries of every over-budget page into history volumes, under
+    the ingest lock. No model. Prints the JSON report."""
+    corpus = Path(a.wiki).expanduser().resolve()
+    if not corpus.is_dir():
+        print(f"wiki-weaver: wiki dir not found: {corpus}", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    trust_corpus(corpus)
+    lock = pidlock.lock_path(corpus)
+    if not pidlock.acquire(lock):
+        print(
+            f"wiki-weaver: an ingest holds {corpus} (PID {pidlock.holder(lock)}); not rolling over",
+            file=sys.stderr,
+        )
+        return rs.EXIT_LOCKED
+    prev = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(1)))
+    try:
+        if (wiki_work(corpus) / "journal.json").exists():
+            print(
+                "wiki-weaver: .wiki/work/journal.json exists - an ingest was interrupted; "
+                "`wiki-weaver ingest` recovers it first",
+                file=sys.stderr,
+            )
+            return rs.EXIT_ERRORED
+        report = roll_wiki(corpus, dry_run=a.dry_run, overrides=dict(a.budget))
+    except (ConservationError, OSError, RuntimeError) as e:
+        print(f"wiki-weaver: rollover stopped: {e}", file=sys.stderr)
+        return rs.EXIT_ERRORED
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+        pidlock.release(lock)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return rs.EXIT_OK
 
 
 def cmd_feedback(a: argparse.Namespace) -> int:
@@ -580,6 +663,8 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         report(wiki_inbox(w).is_dir(), f"{w}/_inbox present")
         report(wiki_ledger(w).parent.is_dir(), f"{w}/.wiki present")
         print(f"     pages: {len(page_files(w))}")
+        for warning in _keep_warnings(w):
+            print(f"[warn] {warning}")  # a warning: doctor's verdict is unchanged
     return 0 if ok else 1
 
 
@@ -673,6 +758,21 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("lint", help="run the deterministic checks over every page")
     s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
     s.set_defaults(func=cmd_lint)
+
+    s = sub.add_parser(
+        "rollover", help="move old dated entries of over-budget pages into history/ volumes"
+    )
+    s.add_argument("--wiki", default=".", help="wiki directory (default: .)")
+    s.add_argument("--dry-run", action="store_true", help="report what would move; write nothing")
+    s.add_argument(
+        "--budget",
+        action="append",
+        default=[],
+        type=_budget,
+        metavar="TYPE=N",
+        help="record budget in characters for a page type (repeatable)",
+    )
+    s.set_defaults(func=cmd_rollover)
 
     s = sub.add_parser("feedback", help="record feedback with a why")
     s.add_argument("--wiki", default=".", help="wiki directory (default: .)")

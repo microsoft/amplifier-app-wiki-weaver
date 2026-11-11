@@ -54,30 +54,47 @@ def _parse_attrs(body: str) -> dict[str, str]:
     return attrs
 
 
+def _attr_list(text: str, i: int) -> tuple[dict[str, str], int]:
+    """The attributes of the `[...]` list whose `[` ends just before ``i``, and the index
+    after its `]` (quoted strings may hold brackets)."""
+    j, depth, in_str, n = i, 1, False, len(text)
+    while j < n and depth:
+        c = text[j]
+        if in_str:
+            if c == "\\":
+                j += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+        j += 1
+    return _parse_attrs(text[i : j - 1]), j
+
+
 def nodes(path: Path) -> dict[str, dict[str, str]]:
     """Return {node_id: attrs} for node statements (edges and graph attrs skipped)."""
     text = _strip_comments(Path(path).read_text())
     found: dict[str, dict[str, str]] = {}
-    n = len(text)
     stmt = re.compile(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[")
     for m in stmt.finditer(text):
         if m.group(1) in ("graph", "node", "edge"):
             continue
-        j, depth, in_str = m.end(), 1, False
-        while j < n and depth:
-            c = text[j]
-            if in_str:
-                if c == "\\":
-                    j += 2
-                    continue
-                if c == '"':
-                    in_str = False
-            elif c == '"':
-                in_str = True
-            elif c == "[":
-                depth += 1
-            elif c == "]":
-                depth -= 1
-            j += 1
-        found[m.group(1)] = _parse_attrs(text[m.end() : j - 1])
+        found[m.group(1)] = _attr_list(text, m.end())[0]
     return found
+
+
+def edges(path: Path) -> list[tuple[str, str, dict[str, str]]]:
+    """(source, target, attrs) for every `a -> b [...]` statement, in file order."""
+    text = _strip_comments(Path(path).read_text())
+    stmt = re.compile(
+        r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*->\s*([A-Za-z_][A-Za-z0-9_]*)[ \t]*(\[)?"
+    )
+    return [
+        (m.group(1), m.group(2), _attr_list(text, m.end())[0] if m.group(3) else {})
+        for m in stmt.finditer(text)
+    ]

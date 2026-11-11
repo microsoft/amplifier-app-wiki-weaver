@@ -4,7 +4,14 @@ Rows use V1's keys exactly -- RepoWeaver reads this file:
     source, source_id, hash, status, converged, reason, failure_kind, failed_to, timestamp
 Done-ness is ``converged`` (bool), as in V1:
     {row["source"] for row in ledger if row.get("converged")}
-V4-only keys ride alongside: pages_touched, model_calls, archived_to.
+V4-only keys ride alongside: pages_touched, model_calls, archived_to, and from the rollover
+step rolled_over (volumes it created), over_budget (hub pages), refused (hub pages it
+skipped, each {page, reason}) and kept_over_half (pages whose kept sections exceed half
+their budget, each {page, chars, limit}: reported, never refused), and from the list loop
+lists_done, lists_failed and lists_deferred (history files, counted) and lists_failures
+(each failed file, {file, reason}), and on a commit current_state_chars ({page: characters
+of its Current state, heading aside} for each page written but source summaries) and
+history_pages (those of them with history files).
 """
 
 from __future__ import annotations

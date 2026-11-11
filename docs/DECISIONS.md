@@ -219,7 +219,8 @@ that's a signal.
 
 Deferred - fix only if it fires during the run (reviewer's file:line against 30c1b15):
 - Headings inside fenced code blocks, and closing-ATX `## X ##`, are judged as newly added
-  headings (checks.py:193-198). Out of scope: the writer emits neither in practice.
+  headings (checks.py:193-198). Out of scope: the writer emits neither in practice. Fenced
+  headings: DONE 2026-11-10 (`sections.py`, below); closing-ATX still open.
 - A declared-but-empty `Sections:` value disables the rule silently (lens.py:33-34). Out
   of scope: our two lenses declare non-empty sets; the ingest-start printout shows it.
 - Normalized page-type keys can collide (lens.py:55, 78). Out of scope: no collision in
@@ -500,3 +501,54 @@ the Stage 1 precondition allows; the corpus runs in Resolve only after Stage 2.
   driver's 5,000-call stop is a runaway guard. Sequential by design.
 - Staging's V4 is pinned by commit; each V4 fix needs a pin bump in amplifier-resolve
   (#462, #467, and now one for b7d97a8). The driver records the version per batch.
+
+## 2026-11-10 — Roll-over into history volumes
+
+- Problem: the writer's input grew with the wiki. Hub pages only ever gain dated entries,
+  and the Phase 3 holds came at 4.03M and 3.64M characters of writer input.
+- Before page selection, code alone cuts each chosen page that is over its budget at a
+  date: its oldest whole dates move verbatim into immutable volumes,
+  `history/<page>--<first>--<last>.md`, listed newest first under the page's `## History`.
+  No model is involved. (`rollover.py`; the `rollover` step and the `wiki-weaver rollover`
+  verb)
+- Each roll carries a conservation proof: every citation, link and line that leaves the
+  hub is in a volume, and the hub gains only its `## History` items; otherwise nothing is
+  written.
+- Fail closed: a page whose layout the parser cannot split safely (a malformed
+  `## History`, an unclosed fence, a `###` subsection, a numbered, `*` or `+` list, a
+  table, a multi-line comment) is refused and left as it is. The reason is in the verb's
+  JSON, the ledger row and `result.json` (`refused_pages`).
+- Summary carry: on a page with history the writer sees the previous Current state and
+  replaces it whole - in at most 4,000 characters until that limit went (below); it is the
+  only summary of what moved.
+  `## History` is maintained by code: a write that changes it, or adds one, holds.
+- Slim index: the brief and the writer read `index.md` without source and history lines
+  (batch 19: 263,843 → 26,411 characters).
+- Deviations from the Oct 30 design: budgets are code defaults (48k; weekly 96k; Current
+  state 4k, since removed); volumes live in `history/`, not the corpus root; the writer
+  stays tool-using.
+- OPEN, deferred: code-owned frontmatter; roll-over of pages added for changed sources.
+  DONE 2026-11-10 (below): fence-aware `strip_current_state` and checks.
+
+## 2026-11-10 — Never-move lists; the Current-state limit goes; fences; ordered roll-over
+
+- Never-move lists: a lens may declare `Keep:` / `Keep current:` sections per page type.
+  They sit after Current state, never move to history, and are outside the record and the
+  content-loss guard. After each roll a list step (`lists_prep` -> `lists` ->
+  `lists_apply`) fills them from each new history file, once, under checks: line shape,
+  citations, no loss but by a condensing line naming a history file that holds the item,
+  coverage, history pointers, and the page outside them unchanged byte for byte. Dormant
+  until a lens declares Keep sections: the Team Pulse lens ships unchanged, so no list step
+  runs. (`lists.py`; the spec is design/plans/2026-11-10-short-lists-spec.md)
+- The Current-state limit (4,000 characters on a page with history) gives way to
+  reporting: each written page's size goes to its ledger row (`current_state_chars`) and to
+  `result.json` (`current_state_sizes`: count, max, median, the ten largest). Why: it held
+  sources on pages already over the cap, and the never-move lists hold the durable facts.
+- Fence-aware checks: DONE. One section parser (`sections.py`, roll-over's fence rule) cuts
+  sections wherever Current state or headings are found or stripped: the content-loss
+  guard, the writer's input, the Current-state and heading checks, the lens and the list
+  step. `index_slim` keeps CommonMark's rules: index.md is not page structure, and its slim
+  copy is read-only.
+- Roll-over conservation is order-aware: under each heading, what stays and what moves
+  keeps the hub's order; each volume holds only the dates its History item gives it; one
+  roll's volumes come oldest first without overlap, and History lists them newest first.

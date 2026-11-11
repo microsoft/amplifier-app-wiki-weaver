@@ -21,6 +21,8 @@ NON_PAGE_FILES = {"index.md", "log.md", "lens.md", "READING.md"}
 RESERVED_SLUGS = {"_inbox", "_sources", "lens", "feedback", "index", "log", "reading"}
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 MAX_SOURCE_CHARS = 400_000
+# The identity every commit V4 makes in a corpus is made under.
+GIT_ID = ["-c", "user.name=wiki-weaver", "-c", "user.email=wiki-weaver@localhost"]
 
 
 def wiki_ledger(wiki: Path) -> Path:
@@ -99,9 +101,9 @@ def page_files(wiki: Path) -> list[Path]:
     return sorted(out)
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
     """Write via a temp file in the same directory and os.replace, so a reader or a crash
-    never sees a half-written file."""
+    never sees a half-written file. The file is 0600 (mkstemp's) unless ``mode`` is given."""
     import os
     import tempfile
 
@@ -109,6 +111,8 @@ def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
+        if mode is not None:
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
@@ -117,6 +121,24 @@ def atomic_write_text(path: Path, text: str) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+# A process killed between mkstemp and os.replace (atomic_write_text, atomic_copy) leaves its
+# temp file beside the target: `.<name>.<random>.tmp`. Snapshot commits never stage one.
+ATOMIC_TEMP_EXCLUDE = ":(exclude,glob)**/.*.*.tmp"
+
+
+def atomic_temp_files(path: Path) -> list[Path]:
+    """The temp files a killed atomic write of ``path`` left beside it, by that naming."""
+    import glob
+
+    path = Path(path)
+    named = re.compile(rf"\.{re.escape(path.name)}\.[A-Za-z0-9_]+\.tmp")
+    return sorted(
+        p
+        for p in path.parent.glob(f".{glob.escape(path.name)}.*.tmp")
+        if named.fullmatch(p.name) and p.is_file() and not p.is_symlink()
+    )
 
 
 def atomic_copy(src: Path, dest: Path) -> None:

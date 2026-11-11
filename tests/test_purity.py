@@ -86,8 +86,8 @@ def test_b_every_box_node_has_inline_prompt():
                 boxes += 1
                 if not attrs.get("prompt", "").strip():
                     missing.append(f"{g.name}:{nid}")
-    assert boxes == 6, (
-        f"expected 6 box nodes (brief, write, index, draft, pick, answer); got {boxes}"
+    assert boxes == 7, (
+        f"expected 7 box nodes (brief, lists, write, index, draft, pick, answer); got {boxes}"
     )
     assert not missing, missing
 

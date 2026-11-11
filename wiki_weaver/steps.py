@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -20,13 +21,17 @@ from pathlib import Path
 
 from . import checks as ck
 from . import ledger as lg
+from . import lists, rollover
 from . import result as rs
+from .index_slim import slim_index
 from .lens import parse_page_types
 from .lib import (
+    GIT_ID,
     MAX_SOURCE_CHARS,
     NON_PAGE_FILES,
     atomic_append_line,
     atomic_copy,
+    atomic_temp_files,
     atomic_write_text,
     contained_file,
     corrections_dir,
@@ -39,7 +44,9 @@ from .lib import (
     wiki_sources,
     wiki_work,
 )
+from .sections import pieces
 from .sources import (
+    FRONTMATTER_RE,
     normalize_frontmatter,
     page_frontmatter,
     read_text,
@@ -52,7 +59,6 @@ WIKI = Path(".")
 MAX_SLUGS = 8
 MAX_ASK_PAGES = 6
 LENS_HEADINGS = ("Purpose", "What matters", "People", "Question shapes", "Page types", "Owner")
-GIT_ID = ["-c", "user.name=wiki-weaver", "-c", "user.email=wiki-weaver@localhost"]
 
 
 # ---------------------------------------------------------------- helpers
@@ -186,6 +192,9 @@ def pages_citing(name: str) -> list[str]:
 
 
 JOURNAL = "journal.json"
+# Scratch that is only a copy of committed files, which any run makes again (assemble's slim
+# copy of index.md): recovery may drop it though no journal names it.
+DERIVED_SCRATCH = frozenset({"index.md"})
 
 
 class JournalError(Exception):
@@ -499,6 +508,9 @@ def step_assemble() -> str:
         "\n----- SOURCE TEXT ENDS -----\n",
     ]
     (wiki_work(WIKI) / "context.md").write_text("".join(parts))
+    idx = contained_file(WIKI, "index.md")
+    if idx is not None:  # the brief reads the wiki's pages, not every source and volume
+        (wiki_work(WIKI) / "index.md").write_text(slim_index(read_text(idx)))
     cur.update(stage="brief", model_calls=cur["model_calls"] + 1)
     save_current(cur)
     return "ok"
@@ -533,6 +545,24 @@ def _parse_slugs(text: str) -> list[str]:
         if s and not s.startswith("#"):
             out.append(s)
     return out
+
+
+def _chosen_slugs(text: str) -> tuple[list[str], list[str]]:
+    """The pages the brief chose (slugs.txt), as page_select takes them: no invalid,
+    reserved or source- slug, none resolving outside the corpus, no repeat, at most
+    MAX_SLUGS. Returns (slugs, notes on what was dropped)."""
+    slugs, notes = [], []
+    for s in _parse_slugs(text):
+        if not is_valid_slug(s) or s.startswith("source-"):
+            notes.append(f"dropped invalid or reserved slug: {s}")
+        elif _escapes(f"{s}.md"):
+            notes.append(f"refused slug resolving outside the corpus: {s}")
+        elif s not in slugs:
+            slugs.append(s)
+    if len(slugs) > MAX_SLUGS:
+        notes.append(f"dropped slugs beyond {MAX_SLUGS}: {', '.join(slugs[MAX_SLUGS:])}")
+        slugs = slugs[:MAX_SLUGS]
+    return slugs, notes
 
 
 # A compaction shows as a request smaller than the one before it in the same session:
@@ -672,24 +702,290 @@ def model_failure(run_dir: Path, node: str) -> tuple[str, str]:
     return lg.KIND_MODEL_STEP, f"{base} \u2014 {fr[:200]}"
 
 
-_FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*(?:\n|\Z)", re.DOTALL)
-
-
 def strip_current_state(text: str) -> str:
     """Drop the `## Current state` section, heading and body, from a page's text; every
     other byte is kept. The writer is asked for a fresh roll-up and never sees the old one:
-    under the never-delete rule it kept old roll-ups (LEARNINGS, 2026-10-13). Section
-    boundaries are the ones the loss guard uses (`checks._without_current_state`)."""
-    m = _FRONTMATTER_RE.match(text)
+    under the never-delete rule it kept old roll-ups (LEARNINGS, 2026-10-13). Sections are
+    cut as the loss guard cuts them (`sections.pieces`): a heading in a code fence is text."""
+    m = FRONTMATTER_RE.match(text)
     head, body = (text[: m.end()], text[m.end() :]) if m else ("", text)
-    out, inside = [], False
-    for line in body.splitlines(keepends=True):
-        st = line.strip()
-        if st.startswith(("## ", "# ")):
-            inside = bool(ck.CURRENT_STATE_RE.match(st))
-        if not inside:
-            out.append(line)
-    return head + "".join(out)
+    return head + "".join(p for p in pieces(body) if not ck.is_current_state(p))
+
+
+def step_rollover() -> str:
+    """After the brief, before page_select reads them: each page the brief chose that is
+    over its budget moves its oldest dates into history/ volumes (wiki_weaver.rollover).
+    Each roll is journaled, written and committed at once, so a later hold - which returns
+    this source's pages to HEAD - keeps it. A page the module will not roll is skipped and
+    recorded; a roll that would lose text, or a write or commit that fails, exits 1 and the
+    graph stops the run."""
+    cur = current()
+    sl = wiki_work(WIKI) / "slugs.txt"
+    slugs = _chosen_slugs(read_text(sl))[0] if sl.exists() else []  # none: page_select says so
+    types, known, taken = (
+        rollover.page_types(WIKI),
+        lg.known_sources(WIKI),
+        rollover.volumes_in(WIKI),
+    )
+    rolled, over, refused = [], [], []
+    for name in (f"{s}.md" for s in slugs):
+        if contained_file(WIKI, name) is None:
+            continue  # a page the writer will create
+        try:
+            plan = rollover.plan_page(WIKI, name, types=types, known=known, taken=taken)
+        except rollover.RolloverRefused as e:
+            refused.append({"page": name, "reason": str(e)})
+            print(f"rollover: not rolled: {e}", file=sys.stderr)
+            continue
+        except rollover.ConservationError as e:
+            print(f"rollover: {e}; nothing was written for it", file=sys.stderr)
+            sys.exit(1)
+        if plan is None:
+            continue
+        if plan.over_budget:
+            over.append(name)
+        if not plan.volumes:
+            continue
+        volumes = [p for p, _ in plan.volumes]
+        taken.update(volumes)
+        journal_update(paths=[name, *volumes])
+        try:
+            rollover.write_plan(WIKI, name, plan)
+            commit_paths([name, *volumes], rollover.commit_message(name, plan))
+        except (OSError, RuntimeError) as e:
+            print(f"rollover: writing {name} failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        rolled += volumes
+        print(
+            f"rollover: {name}: record {plan.record_before} -> {plan.record_after} chars, "
+            f"{len(volumes)} volume(s)",
+            file=sys.stderr,
+        )
+    # kept sections over half a page's budget: reported, never refused (they never move)
+    kept_over = [r for r in (rollover.kept_over_half(WIKI, f"{s}.md", types) for s in slugs) if r]
+    cur.update(rolled_over=rolled, over_budget=over, refused=refused, kept_over_half=kept_over)
+    save_current(cur)
+    return "ok"
+
+
+# The never-move lists (wiki_weaver.lists): after rollover, each pending history file of a
+# chosen page whose type keeps sections goes once to the `lists` model step.
+LISTS_MAX_SECONDS = 1800  # list work in one source before what is left is deferred
+# History files read in one job (one `wiki-weaver ingest`) before the rest are deferred. The
+# engine ends a run after 50 steps per graph node (dot-runner 0.4.0: 20 nodes, 1000 steps)
+# and reads no graph attribute to raise that. A file costs 3 steps; 40 sources take at most
+# 12 each, and the run's ends 6: 486 + 150 x 3 = 936 steps.
+LISTS_MAX_FILES_PER_JOB = 150
+
+
+def _list_work(cur: dict) -> dict:
+    """This source's list work, kept in current.json: when it began (``t0``, at the
+    source's first lists_prep), the file in flight (``file``, ``page``), and the files done,
+    failed ({file, reason}) and deferred."""
+    work = cur.setdefault("lists", {})
+    work.setdefault("t0", time.time())
+    for k in ("done", "failed", "deferred"):
+        work.setdefault(k, [])
+    return work
+
+
+def _lists_max_seconds() -> float:
+    try:
+        return float(os.environ.get("WIKI_WEAVER_LISTS_MAX_SECONDS") or LISTS_MAX_SECONDS)
+    except ValueError:
+        return LISTS_MAX_SECONDS
+
+
+def _lists_max_files() -> int:
+    try:
+        return int(os.environ.get("WIKI_WEAVER_LISTS_MAX_FILES_PER_JOB") or LISTS_MAX_FILES_PER_JOB)
+    except ValueError:
+        return LISTS_MAX_FILES_PER_JOB
+
+
+def _job_rows(run_dir: str) -> list[dict]:
+    """The rows this job (one `wiki-weaver ingest`) has written so far: those of batch
+    ``run_dir`` and of the job's other batches beside it."""
+    if not run_dir:
+        return []
+    batch = Path(run_dir)
+    others = [b for b in sorted(batch.parent.glob("batch-*")) if b.name != batch.name]
+    return [row for b in [*others, batch] for row in jlines(b / "changes.jsonl")]
+
+
+def _files_read_in_job(run_dir: str, work: dict) -> int:
+    """History files the `lists` step has read in this job, done or failed: in the sources
+    before this one (their ledger rows) and in this one."""
+    keys = ("lists_done", "lists_failed")
+    earlier = sum(r[k] for r in _job_rows(run_dir) for k in keys if isinstance(r.get(k), int))
+    return earlier + len(work["done"]) + len(work["failed"])
+
+
+def step_lists_prep(run_dir: str) -> str:
+    """Hand the next history file to the `lists` model step: the oldest pending one
+    (`lists.pending`) of the pages the brief chose that exist and whose type keeps sections,
+    not tried yet in this source. Its page, what one line of each kept section holds (the
+    lens), those sections as they stand and the whole file go to .wiki/work/lists_input.md
+    -> `item`. Nothing left -> `done`. Once WIKI_WEAVER_LISTS_MAX_SECONDS (1800) have passed
+    since this source's first lists_prep, or this job has read
+    WIKI_WEAVER_LISTS_MAX_FILES_PER_JOB (150) history files, the files still pending are
+    recorded deferred and committed, for the next time their page is chosen -> `done`."""
+    cur = current()
+    work = _list_work(cur)
+    sl = wiki_work(WIKI) / "slugs.txt"
+    slugs = _chosen_slugs(read_text(sl))[0] if sl.exists() else []
+    types, state = rollover.page_types(WIKI), lists.read_state(WIKI)
+    tried = {*work["done"], *(f["file"] for f in work["failed"]), *work["deferred"]}
+    waiting = [
+        (vol, name)
+        for vol, name in lists.pending(WIKI, [f"{s}.md" for s in slugs], types, state)
+        if vol not in tried
+    ]
+    limit, budget = _lists_max_seconds(), _lists_max_files()
+    read = _files_read_in_job(run_dir, work) if waiting else 0
+    why = (
+        f"deferred: {limit:g}s of list work in one source"
+        if waiting and time.time() - work["t0"] >= limit
+        else f"deferred: {read} history file(s) read in this job, its budget {budget}"
+        if waiting and read >= budget
+        else None
+    )
+    if why:
+        for vol, name in waiting:
+            lists.mark(state, vol, name, lists.DEFERRED, why)
+        journal_update(paths=[lists.STATE_REL])
+        lists.write_state(WIKI, state)
+        commit_paths([lists.STATE_REL], f"lists: deferred {len(waiting)} history file(s)")
+        work["deferred"] += [vol for vol, _ in waiting]
+        print(f"lists: deferred {[vol for vol, _ in waiting]}", file=sys.stderr)
+        waiting = []
+    if not waiting:
+        save_current(cur)
+        return "done"
+    vol, name = waiting[0]
+    got = lists.load(WIKI, name, types)
+    path = contained_file(WIKI, vol)
+    assert got is not None and path is not None  # lists.pending checked both
+    (wiki_work(WIKI) / lists.OUTPUT).unlink(missing_ok=True)  # never a stale answer
+    text = lists.render_input(name, got[1], got[0], vol, read_text(path))
+    (wiki_work(WIKI) / lists.INPUT).write_text(text)
+    work.update(file=vol, page=name)
+    cur["model_calls"] = cur.get("model_calls", 0) + 1
+    save_current(cur)
+    print(f"lists: {name} \u2190 {vol}", file=sys.stderr)
+    return "item"
+
+
+def _lists_step_failed(run_dir: str) -> str | None:
+    """Why the `lists` model step failed, when the engine recorded it failed in
+    <run_dir>/engine/lists/status.json; None when it did not, or left no record."""
+    if not run_dir:
+        return None
+    try:
+        st = jread(Path(run_dir) / "engine" / "lists" / "status.json", {})
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict) or st.get("status") != "fail":
+        return None
+    return model_failure(Path(run_dir), "lists")[1]
+
+
+def _summary(problems: list[str]) -> str:
+    more = f" (+{len(problems) - 3} more)" if len(problems) > 3 else ""
+    return "; ".join(problems[:3]) + more
+
+
+def step_lists_apply(run_dir: str) -> str:
+    """After the `lists` model step, failed or not, for the history file lists_prep handed
+    out. If .wiki/work/lists.md passes `lists.apply`'s checks, the lists go on the page and
+    the page is committed with the file's state, `done` - journaled first, so a run killed
+    in between leaves both as they were or both as they are now. Otherwise - the step
+    failed, wrote nothing or something invalid, or changed files itself (undone) - the page
+    is left as it is and the file is recorded `failed` (reason, one more attempt). Either
+    way -> `next`."""
+    cur = current()
+    work = _list_work(cur)
+    vol, name = work.get("file"), work.get("page")
+    if not vol or not name:
+        print("lists_apply: no history file in flight", file=sys.stderr)
+        return "next"
+    reason = _lists_step_failed(run_dir)
+    stray = changed_paths()  # the step writes only .wiki/work/, which git ignores
+    if stray:
+        journal_update(paths=stray)
+        _revert_writes(set(stray))
+        reason = reason or f"lists: the model step changed files itself: {', '.join(stray[:5])}"
+    out = wiki_work(WIKI) / lists.OUTPUT
+    if reason is None and not out.exists():
+        reason = "lists: no output (.wiki/work/lists.md was not written)"
+    types, text = rollover.page_types(WIKI), None
+    if reason is None:
+        try:
+            text, problems = lists.apply(
+                WIKI,
+                name,
+                vol,
+                read_text(out),
+                types,
+                lg.source_versions(WIKI),
+                lg.known_sources(WIKI),
+            )
+        except (OSError, ValueError, TypeError) as e:  # the step's output: recorded, not fatal
+            text, problems = None, [f"lists_apply: {type(e).__name__}: {e}"]
+        reason = _summary(problems) if problems else None
+    state = lists.read_state(WIKI)
+    if reason is None and text is not None:
+        lists.mark(state, vol, name, lists.DONE)
+        journal_update(paths=[name, lists.STATE_REL])  # before either is written
+        page = WIKI / name
+        atomic_write_text(page, text, mode=stat.S_IMODE(page.stat().st_mode))
+        lists.write_state(WIKI, state)
+        commit_paths([name, lists.STATE_REL], f"lists: {name} \u2190 {vol}")
+        work["done"].append(vol)
+        over = rollover.kept_over_half(WIKI, name, types)  # reported, never refused
+        cur["kept_over_half"] = [
+            r for r in cur.get("kept_over_half", []) if r.get("page") != name
+        ] + ([over] if over else [])
+    else:
+        reason = reason or "lists_apply: nothing to apply"
+        lists.mark(state, vol, name, lists.FAILED, reason)
+        journal_update(paths=[lists.STATE_REL])
+        lists.write_state(WIKI, state)
+        tries = state[vol]["attempts"]
+        commit_paths([lists.STATE_REL], f"lists: {name} \u2190 {vol} failed (attempt {tries})")
+        work["failed"].append({"file": vol, "reason": reason})
+        print(f"lists: {vol} not applied: {reason}", file=sys.stderr)
+    work.pop("file", None)
+    work.pop("page", None)
+    save_current(cur)
+    return "next"
+
+
+def _current_state_fields(pages: list[str]) -> dict:
+    """A ledger row's report of the Current state of each page written but source summaries:
+    its size, heading aside (`checks.current_state_chars`), and which of them have history.
+    Reported, never limited (docs/DECISIONS.md)."""
+    sizes, history = {}, []
+    for p in pages:
+        path = contained_file(WIKI, p)
+        if p.startswith("source-") or path is None:
+            continue
+        text = read_text(path)
+        sizes[p] = ck.current_state_chars(text)
+        if rollover.has_history(text):
+            history.append(p)
+    return {"current_state_chars": sizes, "history_pages": history}
+
+
+def _list_fields(cur: dict) -> dict:
+    """A ledger row's summary of the source's list work: counts, and each failure."""
+    work = cur.get("lists") or {}
+    return {
+        "lists_done": len(work.get("done", [])),
+        "lists_failed": len(work.get("failed", [])),
+        "lists_deferred": len(work.get("deferred", [])),
+        "lists_failures": list(work.get("failed", [])),
+    }
 
 
 def step_page_select() -> str:
@@ -699,18 +995,8 @@ def step_page_select() -> str:
     if not sl.exists():
         print("brief did not write .wiki/work/slugs.txt", file=sys.stderr)
         sys.exit(1)
-    slugs, notes = [], []
+    slugs, notes = _chosen_slugs(read_text(sl))
     root = WIKI.resolve()
-    for s in _parse_slugs(read_text(sl)):
-        if not is_valid_slug(s) or s.startswith("source-"):
-            notes.append(f"dropped invalid or reserved slug: {s}")
-        elif _escapes(f"{s}.md"):
-            notes.append(f"refused slug resolving outside the corpus: {s}")
-        elif s not in slugs:
-            slugs.append(s)
-    if len(slugs) > MAX_SLUGS:
-        notes.append(f"dropped slugs beyond {MAX_SLUGS}: {', '.join(slugs[MAX_SLUGS:])}")
-        slugs = slugs[:MAX_SLUGS]
     selected = [cur["summary_page"]] + [f"{s}.md" for s in slugs]
     if cur.get("changed"):
         citing = [n for n in pages_citing(cur["filename"]) if n not in selected]
@@ -732,14 +1018,22 @@ def step_page_select() -> str:
             ]
             as_of = _latest_source_date(srcs, this_date)
             head = f"existing, {len(srcs)} sources"
-            body = strip_current_state(read_text(p))
+            text = read_text(p)
+            # A page with history: its older entries are in volumes the writer cannot see,
+            # so the previous Current state is the only summary of them - shown, not stripped.
+            history = rollover.has_history(text)
+            body = text if history else strip_current_state(text)
         else:
-            as_of, head, body = this_date, "new page - does not exist yet", ""
+            as_of, head, body, history = this_date, "new page - does not exist yet", "", False
         if not name.startswith("source-") and as_of:
             head += f"; Current state as of {as_of} (the latest source date on the page)"
+        if history:
+            head += (
+                "; has history: previous Current state included - update it and replace it whole"
+            )
         out += [f"\n\n## {name} ({head})\n\n", body]
     idx = contained_file(WIKI, "index.md")
-    out += ["\n\n# index.md\n\n", read_text(idx) if idx else "(empty)\n"]
+    out += ["\n\n# index.md\n\n", slim_index(read_text(idx)) if idx else "(empty)\n"]
     (work / "pages.md").write_text("".join(out))
     (work / "selected.txt").write_text("\n".join(selected) + "\n")
     if _measure_writer_call(cur) == "oversized":
@@ -889,7 +1183,7 @@ def step_recover() -> str:
         )
         sys.exit(1)
     if j is None:
-        if work.exists() and any(work.iterdir()):
+        if work.exists() and any(p.name not in DERIVED_SCRATCH for p in work.iterdir()):
             print(
                 "recover: .wiki/work/ holds scratch from a run that died but no journal names "
                 "what it owned; touching nothing. Inspect .wiki/work/ and the uncommitted "
@@ -899,6 +1193,16 @@ def step_recover() -> str:
             sys.exit(1)
         clear_work()
         return "clean"
+    # A write killed before its rename left its temp file beside a path this operation owned;
+    # only those go - any other unknown file is reported below and left as it is.
+    temps = [t for rel in j["paths"] for t in atomic_temp_files(WIKI / rel)]
+    for t in temps:
+        t.unlink(missing_ok=True)
+    if temps:
+        print(
+            f"recover: removed interrupted writes' temp files: {[str(t) for t in temps]}",
+            file=sys.stderr,
+        )
     if j.get("committed"):
         print(
             f"recover: {j.get('op')} ({j.get('source') or 'no source'}) had committed; nothing to revert",
@@ -972,6 +1276,11 @@ def step_hold(run_dir: str) -> str:
             compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
             ingress_truncations=node_ingress_truncations(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
+            rolled_over=cur.get("rolled_over", []),
+            over_budget=cur.get("over_budget", []),
+            refused=cur.get("refused", []),
+            kept_over_half=cur.get("kept_over_half", []),
+            **_list_fields(cur),
         ),
     )
     commit_paths(owned_paths(), f"hold: {cur['filename']} ({kind})")
@@ -1004,6 +1313,7 @@ def step_commit(run_dir: str) -> str:
             status=lg.STATUS_CONVERGED,
             archived_to=str(dest.resolve()),
             pages_touched=pages,
+            **_current_state_fields(pages),
             model_calls=cur.get("model_calls", 0),
             failed_checks=cur.get("failed_checks", {}),
             writer_input_chars=cur.get("writer_input_chars", 0),
@@ -1011,6 +1321,11 @@ def step_commit(run_dir: str) -> str:
             compactions=node_compactions(Path(run_dir), cur.get("t0", 0.0)),
             ingress_truncations=node_ingress_truncations(Path(run_dir), cur.get("t0", 0.0)),
             wall_seconds=round(time.time() - cur.get("t0", time.time()), 1),
+            rolled_over=cur.get("rolled_over", []),
+            over_budget=cur.get("over_budget", []),
+            refused=cur.get("refused", []),
+            kept_over_half=cur.get("kept_over_half", []),
+            **_list_fields(cur),
         ),
     )
     journal_update(op="commit")
@@ -1197,6 +1512,9 @@ def step_ask_emit(ask_dir: str, fmt: str) -> str:
 STEPS = {
     "select": step_select,
     "assemble": step_assemble,
+    "rollover": step_rollover,
+    "lists_prep": step_lists_prep,
+    "lists_apply": step_lists_apply,
     "page_select": step_page_select,
     "checks": step_checks,
     "write_guard": step_write_guard,
@@ -1219,6 +1537,8 @@ STEPS = {
 # shell text: a source name like "Bob's chat $(...)" is data, not a command.
 STEP_ENV = {
     "select": ("RUN_DIR", "CAP", "ONLY"),
+    "lists_prep": ("RUN_DIR",),
+    "lists_apply": ("RUN_DIR",),
     "commit": ("RUN_DIR",),
     "hold": ("RUN_DIR",),
     "index_prep": ("RUN_DIR",),

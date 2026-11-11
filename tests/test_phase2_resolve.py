@@ -149,9 +149,10 @@ def _tool_engine(nodes: tuple[str, ...]):
     def run(graph, corpus, params, logs_root, **kw):
         env = {**os.environ, **{k.upper(): v for k, v in params.items()}}
         logs_root.mkdir(parents=True, exist_ok=True)
+        slugs = corpus / ".wiki/work/slugs.txt"
         for node in nodes:
-            if node == "page_select":  # the brief (a model step) by hand
-                fake_brief(corpus, ["orchard-rollout"])
+            if node in ("rollover", "lists_prep", "page_select") and not slugs.exists():
+                fake_brief(corpus, ["orchard-rollout"])  # the brief (a model step) by hand
             r = subprocess.run(
                 [sys.executable, "-m", "wiki_weaver.steps", node],
                 cwd=corpus, capture_output=True, text=True, check=False, env=env,
@@ -186,9 +187,8 @@ def test_engine_git_failure_reason_carries_the_fatal_line(
 ) -> None:
     _break_git(one)
     monkeypatch.setenv("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", "x"))
-    monkeypatch.setattr(
-        cli, "run_graph", _tool_engine(("select", "assemble", "page_select", "checks"))
-    )
+    nodes = ("select", "assemble", "rollover", "lists_prep", "page_select", "checks")
+    monkeypatch.setattr(cli, "run_graph", _tool_engine(nodes))
     a = cli.build_parser().parse_args(["ingest", "--wiki", str(one)])
     a.func(a)
     errored = _newest_result(one)["errored"]

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 from engine import needs_engine_and_key
-from test_steps import ORCHARD, cite, fake_brief, page, step
+from test_steps import ORCHARD, cite, fake_brief, lists_loop, page, step
 
 from wiki_weaver import checks as ck
 from wiki_weaver import cli
@@ -293,6 +293,8 @@ def _engine(observed: list[dict]):
             step(corpus, "assemble")
             cur = json.loads((corpus / ".wiki/work/current.json").read_text())
             fake_brief(corpus, ["orchard-rollout"])
+            assert step(corpus, "rollover") == (0, "ok")
+            lists_loop(corpus)
             step(corpus, "page_select")
             summary = (corpus / ".wiki/work/selected.txt").read_text().split()[0]
             body = (cite(corpus, QUOTE) if cur["filename"] == ORCHARD else "") + "\n"

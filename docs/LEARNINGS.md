@@ -758,3 +758,36 @@ a steered run of the same corpus (the graph's `brief` box replaced by a tool nod
 `resolve`, `sam`, `brian-krabach`; the real `write` and `index`, 3 calls): converged,
 `brian-krabach.md` keeps its three dangling links, which under the old rule would have been
 three `broken link` findings and a hold.
+
+### Conservation is necessary, not sufficient — 2026-11-10
+**Problem.** Roll-over proves that nothing is lost: every line, citation and link that leaves
+a hub lands in a volume, the lines compared as a multiset. It cannot show that each line
+still sits with the entry, label or section it belongs to.
+**How it showed.** An independent cross-provider review found six layouts that kept every
+line yet moved context: labels over a bullet group, code fences, blank-separated labels,
+indented continuations, wrapped lines, and `###` subsections. In each, a roll put a label, a
+continuation or a subsection heading with the wrong entries, and the proof still passed.
+**Fix.** The parser keeps each label with its bullet group and respects fences, column-0
+headings, and indented and wrapped continuations; a layout it cannot split safely refuses the
+page instead (fail closed, with the reason reported). Tests now assert association after a
+roll, not only conservation: on batch 19 all 175 labels keep the line that follows them. With
+the slim index, the worst-case writer input on batch 19 falls from 4.03M to ~540k characters,
+and the index the writer reads from 264k to 26k.
+**Status.** Adopted on `page-growth-phase1`; tests in `tests/test_rollover_structure.py`.
+
+### Never-move lists: old history must not overwrite current facts, nor failures vanish — 2026-11-10
+**Problem.** The list step writes from history files - the page's oldest material - into its
+never-move sections, which a reader takes as current.
+**How it showed.** Adversarial reviews of the list step, before any lens declared `Keep`
+sections, found two families. Old history overwriting current facts: a list rebuilt from an
+old history file could replace a current fact with an older one, and a fenced example read as
+a section let a list replace part of an entry. Failures disappearing: deletions that passed
+every check - a dropped line excused by any pointer to a history file, two decisions whose
+first 40 characters matched, a fenced `## Current state` example that hid a 50-entry
+deletion from the loss guard.
+**Fix.** Being fixed before the lens is applied: whole-subject, one-to-one loss matching,
+each dropped citation found in the named history file, fence-aware sections everywhere, an
+invariant that nothing outside the kept sections changes, checked history pointers, and every
+failed list file recorded with its reason in the ledger and `result.json`.
+**Status.** On `page-growth-phase1`. The lists stay dormant until a lens declares `Keep`
+sections; the Team Pulse lens ships unchanged.

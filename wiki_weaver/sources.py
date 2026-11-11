@@ -11,7 +11,8 @@ from pathlib import Path
 
 import yaml
 
-_FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.DOTALL)
+# A page's frontmatter block, fences included; group 1 is the YAML between the fences.
+FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.DOTALL)
 _DATE_RE = re.compile(r"(20\d\d-\d\d-\d\d)")
 _MDY_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(20\d\d)\b")
 _SLICE_RE = re.compile(r"^_Slice:\s*(20\d\d-\d\d-\d\d)\s+to\s+(20\d\d-\d\d-\d\d)")
@@ -28,7 +29,7 @@ def read_text(path: Path) -> str:
 
 def split_frontmatter(text: str) -> tuple[dict | None, str]:
     """Return (frontmatter dict or None, body). Unparseable frontmatter -> None."""
-    m = _FM_RE.match(text)
+    m = FRONTMATTER_RE.match(text)
     if not m:
         return None, text
     try:
@@ -73,7 +74,7 @@ def normalize_frontmatter(text: str) -> str:
     result does not round-trip, the text is returned unchanged and the frontmatter check
     reports it as before. The body is never touched.
     """
-    m = _FM_RE.match(text)
+    m = FRONTMATTER_RE.match(text)
     if not m or split_frontmatter(text)[0] is not None:
         return text
     data: dict = {}

@@ -8,6 +8,7 @@ counts.{total, converged, failed, blocked, errored, skipped}; ``total`` excludes
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
 from .lib import atomic_write_text
@@ -72,6 +73,65 @@ def _errors(row: dict) -> list[str]:
     return [str(e) for e in errs][:ERRORS_CAP]
 
 
+def _refused(rows: list[dict]) -> list[dict]:
+    """The rollover step's refusals across ``rows``, as {page, reason, source}: one per page
+    and reason - with the first source, in run order, that met it - sorted. A row from
+    before reasons were kept names its pages only."""
+    first: dict[tuple[str, str], str] = {}
+    for r in rows:
+        for x in r.get("refused") or []:
+            if isinstance(x, dict):
+                key = (str(x.get("page", "")), str(x.get("reason", "")))
+            else:
+                key = (str(x), "")
+            first.setdefault(key, str(r.get("source", "")))
+    return [{"page": p, "reason": why, "source": s} for (p, why), s in sorted(first.items())]
+
+
+def _lists_failed(rows: list[dict]) -> list[dict]:
+    """The list step's failures across ``rows`` (each row's `lists_failures`), as {file,
+    reason}: one per file and reason, sorted."""
+    seen = {
+        (str(x.get("file", "")), str(x.get("reason", "")))
+        for r in rows
+        for x in r.get("lists_failures") or []
+        if isinstance(x, dict)
+    }
+    return [{"file": f, "reason": why} for f, why in sorted(seen)]
+
+
+def _kept_over_half_pages(rows: list[dict]) -> list[str]:
+    """The pages whose kept sections some source found over half their budget."""
+    return sorted(
+        {
+            str(x["page"])
+            for r in rows
+            for x in r.get("kept_over_half") or []
+            if isinstance(x, dict) and x.get("page")
+        }
+    )
+
+
+def _current_state_sizes(rows: list[dict]) -> dict:
+    """The Current state sizes across ``rows``: each page's latest - from the last row that
+    wrote it - with whether it had history then; their count, max and median, and the ten
+    largest. Reported, never limited (docs/DECISIONS.md)."""
+    latest: dict[str, tuple[int, bool]] = {}
+    for r in rows:
+        history = set(r.get("history_pages") or [])
+        for page, n in (r.get("current_state_chars") or {}).items():
+            if isinstance(n, int):
+                latest[str(page)] = (n, page in history)
+    sizes = [n for n, _ in latest.values()]
+    top = sorted(latest.items(), key=lambda kv: (-kv[1][0], kv[0]))[:10]
+    return {
+        "count": len(sizes),
+        "max": max(sizes, default=0),
+        "median": statistics.median(sizes) if sizes else 0,
+        "top": [{"page": p, "chars": n, "has_history": h} for p, (n, h) in top],
+    }
+
+
 def build(
     *,
     run_id: str,
@@ -112,6 +172,14 @@ def build(
             }
             for r in rows
         ],
+        "refused_pages": _refused(rows),
+        # the list step (wiki_weaver.lists): files done, files that failed and why, and
+        # pages whose kept sections are over half their budget (reported, never refused)
+        "lists_done": sum(r["lists_done"] for r in rows if isinstance(r.get("lists_done"), int)),
+        "lists_failed": _lists_failed(rows),
+        "kept_over_half_pages": _kept_over_half_pages(rows),
+        # each written page's Current state size, heading aside: reported, never limited
+        "current_state_sizes": _current_state_sizes(rows),
     }
     res.update(extra or {})
     return res
@@ -136,15 +204,20 @@ BUILD_KEYS = frozenset(
         "errored",
         "failed",
         "sources",
+        "refused_pages",
+        "lists_done",
+        "lists_failed",
+        "kept_over_half_pages",
+        "current_state_sizes",
     }
 )
 
 
 def refresh(path: Path, rows: list[dict]) -> dict | None:
     """Re-derive the row-driven fields of the in-progress record at ``path`` - counts,
-    verdict, failed[], sources[] - from ``rows`` and rewrite it atomically, keeping the
-    rest of the record (started, model_calls, lens_page_types, ...) as the CLI last wrote
-    it. Called after every source, so a progress panel polling the file sees each source
+    verdict, failed[], sources[], refused_pages[], the list step's - from ``rows`` and rewrite it
+    atomically, keeping the rest of the record (started, model_calls, lens_page_types,
+    ...) as the CLI last wrote it. Called after every source, so a progress panel polling the file sees each source
     land, not only each batch. None, and nothing written, when there is no in-progress
     record there: a final record is never touched.
     """

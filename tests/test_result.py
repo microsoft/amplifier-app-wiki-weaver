@@ -136,3 +136,64 @@ def test_preflight_failure_is_exit_1_with_result(tmp_path: Path):
     assert ww("ingest", "--wiki", str(w)).returncode == 1
     data = json.loads(next((w / ".wiki/runs").glob("ingest-*/result.json")).read_text())
     assert data["verdict"] == "errored" and "lens.md" in data["errored"][0]["reason"]
+
+
+def test_refused_pages_are_listed_once_per_page_and_reason():
+    # Every source that picks a refused page meets the same refusal; the record names it
+    # once, with the first source (in run order) that met it.
+    table = {"page": "z.md", "reason": "z.md: line 9 is a table row ('| a |')"}
+    fence = {"page": "m.md", "reason": "m.md: the code fence opened at line 4 never closes"}
+    rows = [
+        {**row("b.md", "converged"), "refused": [table]},
+        {**row("a.md", "converged"), "refused": [table, fence]},
+        row("c.md", "converged"),
+    ]
+    out = rs.build(run_id="r", status="final", rows=rows, errored=[])
+    assert out["refused_pages"] == [{**fence, "source": "a.md"}, {**table, "source": "b.md"}]
+
+
+def test_refresh_rederives_refused_pages(tmp_path: Path):
+    path = tmp_path / "result.json"
+    stale = rs.build(run_id="r", status="in_progress", rows=[], errored=[], extra={"started": "t"})
+    stale["refused_pages"] = [{"page": "old.md", "reason": "gone", "source": "x.md"}]
+    rs.write(path, stale)
+    table = {"page": "z.md", "reason": "z.md: line 9 is a table row ('| a |')"}
+    out = rs.refresh(path, [{**row("a.md", "converged"), "refused": [table]}])
+    assert out is not None and out["refused_pages"] == [{**table, "source": "a.md"}]
+    assert json.loads(path.read_text()) == out and out["started"] == "t"
+
+
+def test_current_state_sizes_come_from_the_rows():
+    # Each page's latest size - the last row that wrote it - and whether it had history then.
+    rows = [
+        {
+            **row("a.md", "converged"),
+            "current_state_chars": {"p.md": 5000, "q.md": 100},
+            "history_pages": ["p.md"],
+        },
+        {
+            **row("b.md", "converged"),
+            "current_state_chars": {"p.md": 4200, "r.md": 300},
+            "history_pages": ["p.md"],
+        },
+        row("c.md", "failed"),
+    ]
+    out = rs.build(run_id="r", status="final", rows=rows, errored=[])
+    assert out["current_state_sizes"] == {
+        "count": 3,
+        "max": 4200,
+        "median": 300,
+        "top": [
+            {"page": "p.md", "chars": 4200, "has_history": True},
+            {"page": "r.md", "chars": 300, "has_history": False},
+            {"page": "q.md", "chars": 100, "has_history": False},
+        ],
+    }
+    many = [
+        {**row("d.md", "converged"), "current_state_chars": {f"p{i:02}.md": i for i in range(12)}}
+    ]
+    sizes = rs.build(run_id="r", status="final", rows=many, errored=[])["current_state_sizes"]
+    assert sizes["count"] == 12 and len(sizes["top"]) == 10 and sizes["top"][0]["page"] == "p11.md"
+    empty = rs.build(run_id="r", status="final", rows=[], errored=[])["current_state_sizes"]
+    assert empty == {"count": 0, "max": 0, "median": 0, "top": []}
+    assert "current_state_sizes" in rs.BUILD_KEYS  # refreshed after every source

@@ -4,6 +4,7 @@ whose file outputs are written by hand here."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -13,13 +14,14 @@ FIX = Path(__file__).parent / "fixtures"
 ORCHARD = "2031-03-02 Orchard Sync.md"
 
 
-def step(corpus: Path, *args: str) -> tuple[int, str]:
+def step(corpus: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str]:
     r = subprocess.run(
         [sys.executable, "-m", "wiki_weaver.steps", *args],
         cwd=corpus,
         capture_output=True,
         text=True,
         check=False,
+        env={**os.environ, **env} if env else None,
     )
     lines = r.stdout.strip().splitlines()
     return r.returncode, (lines[-1] if lines else "")
@@ -28,6 +30,53 @@ def step(corpus: Path, *args: str) -> tuple[int, str]:
 def fake_brief(c: Path, slugs: list[str]) -> None:
     (c / ".wiki/work/brief.md").write_text("brief")
     (c / ".wiki/work/slugs.txt").write_text("\n".join(slugs) + "\n")
+
+
+def fake_lists(c: Path, extra: dict[str, list[str]] | None = None) -> str:
+    """The `lists` model step by hand: every kept section of the page in flight as it
+    stands, the first one with a line naming the history file and quoting its first
+    citation, and ``extra`` lines by section name. Returns what it wrote to lists.md."""
+    import re
+
+    from wiki_weaver import checks as ck
+    from wiki_weaver import rollover
+    from wiki_weaver.lens import page_type_for
+    from wiki_weaver.sources import split_frontmatter
+
+    item = json.loads((c / ".wiki/work/current.json").read_text())["lists"]
+    vol, hub = item["file"], item["page"]
+    text = (c / hub).read_text()
+    pt = page_type_for(rollover.page_types(c), (split_frontmatter(text)[0] or {}).get("type"))
+    assert pt is not None and pt.kept, hub
+    names = [k.name for k in pt.kept]
+    have = ck.kept_sections(text, names)
+    quote = ck.CITE_RE.search((c / vol).read_text())
+    span = re.search(r"--(\d{4}-\d{2}-\d{2})--(\d{4}-\d{2}-\d{2})", vol)
+    assert quote is not None and span is not None, vol
+    blocks = []
+    for i, name in enumerate(names):
+        lines = [ln for ln in have.get(name, []) if ln.strip()]
+        if i == 0:
+            moved = f"{span.group(1)} to {span.group(2)} \u00b7 entries moved"
+            lines.append(f"- {moved} \u2192 {vol} {quote.group(0)}")
+        lines += (extra or {}).get(name, [])
+        blocks.append(f"## {name}\n\n" + "".join(f"{ln}\n" for ln in lines))
+    out = "\n".join(blocks)
+    (c / ".wiki/work/lists.md").write_text(out)
+    return out
+
+
+def lists_loop(c: Path, write=fake_lists) -> list[str]:
+    """The graph's list loop: lists_prep -> lists (``write``, by hand) -> lists_apply, until
+    lists_prep says done. Returns the history files it handed out, in order."""
+    files = []
+    while (got := step(c, "lists_prep")) == (0, "item"):
+        files.append(json.loads((c / ".wiki/work/current.json").read_text())["lists"]["file"])
+        if write is not None:
+            write(c)
+        assert step(c, "lists_apply") == (0, "next")
+    assert got == (0, "done"), got
+    return files
 
 
 def cite(corpus: Path, quote: str) -> str:

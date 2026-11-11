@@ -5,7 +5,9 @@
 2. A page opens with `## Current state (as of YYYY-MM-DD)`: a roll-up of where things stand,
    dated by the latest source on the page. For orientation it is often all you need.
 3. Below it are the sections the lens names for that page type (`lens.md`, Page types).
-   Entries inside a section are dated, newest first.
+   Entries inside a section are dated, newest first. A type may also keep never-move
+   sections right after Current state (`Keep` lines in `lens.md`): short lists, one cited
+   line per item, that stay on the page and never move to history.
 4. `source-*.md` pages carry the per-meeting view: what one source said, in its order.
 
 Citations read `[s<id>: "five or more words quoted from the source"]`. `s<id>` is
@@ -20,6 +22,11 @@ source for the quoted words to land on the passage.
 Text between `<!-- superseded: YYYY-MM-DD -->` and `<!-- /superseded -->` was true earlier
 and has since changed; what replaced it sits outside the block. Do not report it as current.
 (An older page may carry the opening marker alone; it covers the rest of that line.)
+
+A page that outgrew its size keeps its recent entries. Older ones were moved, word for word,
+to `history/<page>--<first>--<last>.md` and are listed, newest first, in the page's
+`## History` section. For older facts, follow those links or grep `history/<page>--*`.
+Volumes are never edited.
 
 If no page covers the question, say so rather than guessing.
 Never edit the corpus during an ingest: such an edit looks like writer output and is reverted.
